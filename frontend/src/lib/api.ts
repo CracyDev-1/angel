@@ -136,11 +136,18 @@ export type ScannerHit = {
   as_of: string;
 };
 
+// Old YES/NO/AVOID veto info — kept for backwards-compat with legacy decisions.
 export type LlmDecisionInfo = {
-  verdict: "YES" | "NO" | "AVOID";
-  allowed: boolean;
+  verdict?: "YES" | "NO" | "AVOID";
+  allowed?: boolean;
   reason: string;
   source: "openai" | "disabled" | "no_key" | "error" | "fail_closed";
+  // New classifier fields. When present, the runtime is using the 5m
+  // multi-candidate pipeline and treats `confidence` against
+  // LLM_DECISION_THRESHOLD as the gate.
+  decision?: "TAKE" | "SKIP";
+  confidence?: number;            // 0..1
+  type?: "breakout" | "pullback" | "continuation" | "other";
 };
 
 export type DecisionRow = {

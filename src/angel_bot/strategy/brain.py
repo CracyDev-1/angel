@@ -45,25 +45,43 @@ from angel_bot.market_data.candles import CandleAggregator
 
 @dataclass
 class BrainConfig:
-    # universe filters (early reject)
-    min_volatility_pct: float = 0.20      # intraday (high-low)/price * 100, % units
-    max_chop_score: float = 0.55          # 0..1, higher = choppier
-    require_breakout_in_range: bool = True
+    # Universe filters (very relaxed — let the LLM be the picky one)
+    min_volatility_pct: float = 0.10      # was 0.20; 0.10% intraday range = OK
+    max_chop_score: float = 0.80          # was 0.70; only the *very* sideways stuff is rejected
 
-    # entry timing thresholds
-    min_15m_trend_slope: float = 0.0007   # last-vs-first close pct over 15m window
-    min_5m_breakout_clearance: float = 0.0010  # how far past swing high/low (frac)
-    max_late_entry_pct: float = 0.0040    # reject CALL if last ret > this; mirrored for PUT
-    min_above_twap_pct: float = 0.0       # CALL needs price >= TWAP * (1+x)
+    # Entry timing thresholds — 5m PRIMARY, 15m bias-only.
+    # Lowered ~3× so a 100-200pt NIFTY push (≈ 0.04-0.08%) actually qualifies.
+    min_15m_trend_slope: float = 0.0002          # was 0.0003 — bias gate, very loose
+    min_5m_trend_slope: float = 0.0003           # was 0.0008 — PRIMARY gate, fires on small pushes
+    min_5m_breakout_clearance: float = 0.0003    # was 0.0006 — accept tiny clean break
+    near_breakout_clearance: float = 0.0030      # was 0.0020 — wider near-breakout band
+    max_late_entry_pct: float = 0.0200           # was 0.0080 — allow 2% late, exits do the protecting
+    min_above_twap_pct: float = 0.0
 
-    # score weights (normalized factors). volume_weight stays 0 until WS quote.
-    w_volatility: float = 0.30
-    w_momentum: float = 0.40
-    w_breakout: float = 0.30
+    # Pullback (uptrend retracement) — easier to satisfy
+    pullback_min_uptrend_bars: int = 2            # was 3
+    pullback_max_retracement_pct: float = 0.020   # was 0.012 — allow deeper pullbacks
+
+    # Continuation (consolidation after breakout) — easier to satisfy
+    continuation_consolidation_bars: int = 2
+    continuation_max_range_pct: float = 0.006     # was 0.004 — looser consolidation
+
+    # SCALP / MOMENTUM — the high-frequency path. Only 3 checks:
+    # 5m up-slope (any), 1m close in direction, 15m not against.
+    # Designed to catch 100-200pt NIFTY-style pushes without waiting for
+    # full breakout structure. The LLM classifier acts as the quality gate.
+    scalp_min_5m_slope: float = 0.0003
+
+    # score weights — 5m focused. volume_w stays 0 until WS quote.
+    w_volatility: float = 0.25
+    w_momentum: float = 0.45
+    w_breakout: float = 0.30      # 5m STRUCTURE slot
     w_volume: float = 0.00
 
     # ranking gate (used by runtime). 0..1 scale.
-    min_score_to_act: float = 0.45
+    # Lowered to 0.30 so brain produces many candidates → LLM classifier
+    # then decides which actually trade (LLM_DECISION_THRESHOLD enforces quality).
+    min_score_to_act: float = 0.30
 
 
 # ----------------------------------------------------------------------
@@ -100,6 +118,8 @@ class Signal:
     reason: str                     # short tag, e.g. "uptrend_breakout_confirmed"
     confidence: float               # 0..1, fraction of timing checks passed
     checks: list[EntryCheck] = field(default_factory=list)
+    pattern: str = "other"          # "breakout" | "pullback" | "continuation" | "other"
+    structure: dict[str, Any] = field(default_factory=dict)   # raw signals for LLM ctx
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +127,8 @@ class Signal:
             "reason": self.reason,
             "confidence": self.confidence,
             "checks": [c.to_dict() for c in self.checks],
+            "pattern": self.pattern,
+            "structure": self.structure,
         }
 
 
@@ -176,37 +198,72 @@ class BrainEngine:
         last_price: float | None,
         agg: CandleAggregator,
     ) -> ScoreBreakdown:
+        """5m-primary score.
+
+        weights: 0.25 volatility + 0.45 momentum(5m) + 0.30 structure(5m).
+        Structure = max(breakout proximity, pullback bounce, continuation tightness).
+        """
         cfg = self.config
         if last_price is None or last_price <= 0:
             return ScoreBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, {"reason": "no_price"})
 
         c1, c5, c15 = agg.all_candles_including_partial()
 
-        # 1) volatility — intraday session range / price (proxy for "movement potential")
+        # 1) volatility — intraday session range / price (movement potential)
         sess_range_pct = 0.0
         if agg.session_high is not None and agg.session_low is not None and last_price:
             sess_range_pct = (agg.session_high - agg.session_low) / last_price
         vol_norm = _scale(sess_range_pct * 100.0, 0.10, 1.50)  # 0.1% .. 1.5%
 
-        # 2) momentum — magnitude of 15m close-to-close move (multi-timeframe)
-        m15_closes = [b.c for b in c15[-5:]]
-        slope15 = abs(_slope(m15_closes) or 0.0)
-        mom_norm = _scale(slope15 * 100.0, 0.05, 1.50)  # 0.05% .. 1.5%
+        # 2) momentum — 5m close-to-close slope is now PRIMARY
+        m5_closes = [b.c for b in c5[-5:]]
+        slope5 = abs(_slope(m5_closes) or 0.0)
+        mom_norm = _scale(slope5 * 100.0, 0.05, 1.20)        # 0.05% .. 1.2%
 
-        # 3) breakout proximity — how close LTP is to the recent 5m swing
+        # 15m kept around as bias only — included in inputs, NOT in score.
+        m15_closes = [b.c for b in c15[-5:]]
+        slope15 = (_slope(m15_closes) or 0.0)
+
+        # 3) STRUCTURE (5m): max of three different setups
         sw5 = _swing([b.h for b in c5[-20:]], [b.low for b in c5[-20:]])
-        brk_norm = 0.0
         sw_hi = sw_lo = None
+        brk_score = 0.0       # closeness to / past breakout
+        pb_score = 0.0        # uptrend pullback to support
+        cont_score = 0.0      # consolidation after breakout
         if sw5 is not None:
             sw_hi, sw_lo = sw5
             rng = sw_hi - sw_lo
             if rng > 0:
-                # Distance from the nearer side; closer = better
                 d_up = (sw_hi - last_price) / rng
                 d_dn = (last_price - sw_lo) / rng
                 d = min(abs(d_up), abs(d_dn))
-                # invert: 0 distance = score 1
-                brk_norm = max(0.0, 1.0 - min(1.0, d * 4.0))
+                # Softer than before (was d*4) — being within 50% of the swing
+                # range still scores some credit, and being right at it scores 1.
+                brk_score = max(0.0, 1.0 - min(1.0, d * 2.0))
+
+        # Pullback bounce (CALL side): 3+ green 5m bars then a small red, now > open.
+        if len(c5) >= cfg.pullback_min_uptrend_bars + 1 and sw_hi is not None:
+            recent = c5[-(cfg.pullback_min_uptrend_bars + 1) :]
+            uptrend = sum(1 for b in recent[:-1] if b.c > b.o)
+            if uptrend >= cfg.pullback_min_uptrend_bars - 1:
+                pull = recent[-1]
+                retr = (sw_hi - pull.low) / max(sw_hi, 1e-9)
+                if 0 < retr <= cfg.pullback_max_retracement_pct:
+                    pb_score = 1.0 - (retr / cfg.pullback_max_retracement_pct) * 0.4
+
+        # Continuation: last N 5m bars all inside a tight range
+        cb = cfg.continuation_consolidation_bars
+        if len(c5) >= cb + 1 and sw_hi is not None:
+            cons = c5[-cb:]
+            hi = max(b.h for b in cons)
+            lo = min(b.low for b in cons)
+            mid = (hi + lo) / 2.0 if hi and lo else 0.0
+            if mid > 0 and (hi - lo) / mid <= cfg.continuation_max_range_pct:
+                # Only counts if we're consolidating ABOVE prior swing high (bullish)
+                if lo >= sw_hi * (1.0 - cfg.near_breakout_clearance):
+                    cont_score = 0.85
+
+        struct_norm = max(brk_score, pb_score, cont_score)
 
         # 4) volume — placeholder (REST has no vol). Wire later from WS QUOTE.
         vol_part = 0.0
@@ -214,7 +271,7 @@ class BrainEngine:
         total = (
             cfg.w_volatility * vol_norm
             + cfg.w_momentum * mom_norm
-            + cfg.w_breakout * brk_norm
+            + cfg.w_breakout * struct_norm     # weight slot reused for STRUCTURE
             + cfg.w_volume * vol_part
         )
 
@@ -222,13 +279,19 @@ class BrainEngine:
             total=round(total, 4),
             volatility=round(vol_norm, 4),
             momentum=round(mom_norm, 4),
-            breakout=round(brk_norm, 4),
+            breakout=round(struct_norm, 4),     # field kept for backward compat
             volume=round(vol_part, 4),
             inputs={
                 "session_range_pct": round(sess_range_pct * 100.0, 4),
+                "slope_5m_pct": round(slope5 * 100.0, 4),
                 "slope_15m_pct": round(slope15 * 100.0, 4),
                 "swing_high_5m": sw_hi,
                 "swing_low_5m": sw_lo,
+                "structure_components": {
+                    "breakout": round(brk_score, 3),
+                    "pullback": round(pb_score, 3),
+                    "continuation": round(cont_score, 3),
+                },
                 "candles": {"1m": len(c1), "5m": len(c5), "15m": len(c15)},
             },
         )
@@ -333,30 +396,32 @@ class BrainEngine:
             }
         )
 
-        # ---- CALL checks ----
-        call_checks = [
+        # ---- pattern detection (CALL side) -------------------------------
+        # 5m PRIMARY trend gate; 15m bias-only ("not against").
+        c5_recent = c5[-(cfg.pullback_min_uptrend_bars + 1) :]
+        uptrend_bars = sum(1 for b in c5_recent[:-1] if b.c > b.o)
+        downtrend_bars = sum(1 for b in c5_recent[:-1] if b.c < b.o)
+
+        # CALL — breakout (now allows near-breakout, not just strict cross)
+        breakout_floor_call = prev_swing_hi * (1.0 - cfg.near_breakout_clearance)
+        call_breakout_checks = [
             *filters,
             EntryCheck(
-                "trend_15m_up",
-                slope_15m >= cfg.min_15m_trend_slope,
-                f"15m slope {slope_15m * 100.0:.3f}% (min {cfg.min_15m_trend_slope * 100.0:.3f}%)",
+                "trend_5m_up",
+                slope_5m >= cfg.min_5m_trend_slope,
+                f"5m slope {slope_5m * 100.0:.3f}% (min {cfg.min_5m_trend_slope * 100.0:.3f}%)",
             ),
             EntryCheck(
-                "trend_5m_up",
-                slope_5m > 0,
-                f"5m slope {slope_5m * 100.0:.3f}%",
+                "trend_15m_not_against",
+                slope_15m >= -cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
             ),
             EntryCheck(
                 "breakout_5m",
-                last_price > prev_swing_hi * (1.0 + cfg.min_5m_breakout_clearance),
-                f"price {last_price:.2f} vs swingHi {prev_swing_hi:.2f}",
+                last_price >= breakout_floor_call,
+                f"price {last_price:.2f} vs swingHi {prev_swing_hi:.2f} (near-breakout band)",
             ),
             EntryCheck("bullish_1m_close", bullish_1m, "last 1m candle bullish + body>=45%"),
-            EntryCheck(
-                "above_twap",
-                twap is None or last_price >= twap * (1.0 + cfg.min_above_twap_pct),
-                f"price {last_price:.2f} vs twap {twap:.2f}" if twap else "twap n/a",
-            ),
             EntryCheck(
                 "not_late",
                 ret_1 <= cfg.max_late_entry_pct,
@@ -364,82 +429,232 @@ class BrainEngine:
             ),
         ]
 
-        # ---- PUT checks (mirror) ----
-        put_checks = [
+        # CALL — pullback (entering on a bounce within an established uptrend)
+        retracement = (
+            (prev_swing_hi - last_price) / prev_swing_hi if prev_swing_hi else 0.0
+        )
+        call_pullback_checks = [
             *filters,
             EntryCheck(
-                "trend_15m_down",
-                slope_15m <= -cfg.min_15m_trend_slope,
-                f"15m slope {slope_15m * 100.0:.3f}% (max -{cfg.min_15m_trend_slope * 100.0:.3f}%)",
+                "uptrend_5m_established",
+                uptrend_bars >= cfg.pullback_min_uptrend_bars - 1
+                and slope_5m >= cfg.min_5m_trend_slope * 0.5,
+                f"{uptrend_bars} green 5m bars + slope {slope_5m * 100.0:.3f}%",
             ),
             EntryCheck(
-                "trend_5m_down",
-                slope_5m < 0,
-                f"5m slope {slope_5m * 100.0:.3f}%",
+                "pullback_within_band",
+                0 < retracement <= cfg.pullback_max_retracement_pct,
+                f"retraced {retracement * 100.0:.2f}% from swingHi (max {cfg.pullback_max_retracement_pct * 100.0:.2f}%)",
             ),
             EntryCheck(
-                "breakdown_5m",
-                last_price < prev_swing_lo * (1.0 - cfg.min_5m_breakout_clearance),
-                f"price {last_price:.2f} vs swingLo {prev_swing_lo:.2f}",
-            ),
-            EntryCheck("bearish_1m_close", bearish_1m, "last 1m candle bearish + body>=45%"),
-            EntryCheck(
-                "below_twap",
-                twap is None or last_price <= twap * (1.0 - cfg.min_above_twap_pct),
-                f"price {last_price:.2f} vs twap {twap:.2f}" if twap else "twap n/a",
+                "bounce_candle_1m",
+                bullish_1m,
+                "last 1m candle bullish + body>=45% (bounce confirm)",
             ),
             EntryCheck(
-                "not_late",
-                ret_1 >= -cfg.max_late_entry_pct,
-                f"1m return {ret_1 * 100.0:.3f}%",
+                "trend_15m_not_against",
+                slope_15m >= -cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}%",
             ),
         ]
 
-        call_pass = sum(1 for c in call_checks if c.ok)
-        put_pass = sum(1 for c in put_checks if c.ok)
-        # require ALL checks (strict, profit-preserving stance)
-        if call_pass == len(call_checks):
-            return BrainOutput(
-                score,
-                Signal(
-                    "BUY_CALL",
-                    "uptrend_breakout_confirmed",
-                    1.0,
-                    call_checks,
-                ),
-                diag,
+        # CALL — continuation (consolidation above prior swing high then resume)
+        cont_recent = c5[-cfg.continuation_consolidation_bars :]
+        if cont_recent:
+            cons_hi = max(b.h for b in cont_recent)
+            cons_lo = min(b.low for b in cont_recent)
+            cons_range_pct = (
+                (cons_hi - cons_lo) / cons_hi if cons_hi else 0.0
             )
-        if put_pass == len(put_checks):
-            return BrainOutput(
-                score,
-                Signal(
-                    "BUY_PUT",
-                    "downtrend_breakdown_confirmed",
-                    1.0,
-                    put_checks,
-                ),
-                diag,
-            )
+        else:
+            cons_hi = cons_lo = 0.0
+            cons_range_pct = 0.0
+        call_continuation_checks = [
+            *filters,
+            EntryCheck(
+                "broke_out_earlier",
+                cons_lo >= prev_swing_hi * (1.0 - cfg.near_breakout_clearance),
+                f"consolidation low {cons_lo:.2f} vs prior swingHi {prev_swing_hi:.2f}",
+            ),
+            EntryCheck(
+                "tight_consolidation",
+                cons_range_pct > 0
+                and cons_range_pct <= cfg.continuation_max_range_pct,
+                f"consolidation range {cons_range_pct * 100.0:.2f}% (max {cfg.continuation_max_range_pct * 100.0:.2f}%)",
+            ),
+            EntryCheck(
+                "resume_up",
+                bullish_1m and last_price >= cons_hi,
+                f"price {last_price:.2f} reclaiming consolidation hi {cons_hi:.2f}",
+            ),
+            EntryCheck(
+                "trend_15m_not_against",
+                slope_15m >= -cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}%",
+            ),
+        ]
 
-        # Soft NO_TRADE — emit the side that came closest, for transparency
-        if call_pass >= put_pass:
-            return BrainOutput(
-                score,
-                Signal(
-                    "NO_TRADE",
-                    f"call_partial_{call_pass}/{len(call_checks)}",
-                    call_pass / len(call_checks),
-                    call_checks,
-                ),
-                diag,
-            )
+        # PUT — breakdown (mirror; now allows near-breakdown band too)
+        breakdown_ceiling_put = prev_swing_lo * (1.0 + cfg.near_breakout_clearance)
+        put_breakdown_checks = [
+            *filters,
+            EntryCheck(
+                "trend_5m_down",
+                slope_5m <= -cfg.min_5m_trend_slope,
+                f"5m slope {slope_5m * 100.0:.3f}% (max -{cfg.min_5m_trend_slope * 100.0:.3f}%)",
+            ),
+            EntryCheck(
+                "trend_15m_not_against",
+                slope_15m <= cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+            ),
+            EntryCheck(
+                "breakdown_5m",
+                last_price <= breakdown_ceiling_put,
+                f"price {last_price:.2f} vs swingLo {prev_swing_lo:.2f} (near-breakdown band)",
+            ),
+            EntryCheck("bearish_1m_close", bearish_1m, "last 1m candle bearish + body>=45%"),
+            EntryCheck(
+                "not_late",
+                ret_1 >= -cfg.max_late_entry_pct,
+                f"1m return {ret_1 * 100.0:.3f}% (max -{cfg.max_late_entry_pct * 100.0:.3f}%)",
+            ),
+        ]
+
+        # PUT — pullback (rally back to resistance in a downtrend)
+        retracement_dn = (
+            (last_price - prev_swing_lo) / prev_swing_lo if prev_swing_lo else 0.0
+        )
+        put_pullback_checks = [
+            *filters,
+            EntryCheck(
+                "downtrend_5m_established",
+                downtrend_bars >= cfg.pullback_min_uptrend_bars - 1
+                and slope_5m <= -cfg.min_5m_trend_slope * 0.5,
+                f"{downtrend_bars} red 5m bars + slope {slope_5m * 100.0:.3f}%",
+            ),
+            EntryCheck(
+                "pullback_within_band",
+                0 < retracement_dn <= cfg.pullback_max_retracement_pct,
+                f"rallied {retracement_dn * 100.0:.2f}% from swingLo",
+            ),
+            EntryCheck(
+                "rejection_candle_1m",
+                bearish_1m,
+                "last 1m candle bearish + body>=45% (rejection confirm)",
+            ),
+            EntryCheck(
+                "trend_15m_not_against",
+                slope_15m <= cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}%",
+            ),
+        ]
+
+        # SCALP / MOMENTUM — fastest path. Just 3 checks, designed to catch
+        # 100-200pt index pushes (or proportional move on stocks/commodities).
+        # Survival relies on tight stop + quick target in PaperConfig / live exits.
+        call_scalp_checks = [
+            EntryCheck(
+                "trend_5m_up_any",
+                slope_5m >= cfg.scalp_min_5m_slope,
+                f"5m slope {slope_5m * 100.0:.3f}% (min {cfg.scalp_min_5m_slope * 100.0:.3f}%)",
+            ),
+            EntryCheck(
+                "bullish_1m_close",
+                bullish_1m,
+                "last completed 1m candle bullish + body>=45%",
+            ),
+            EntryCheck(
+                "trend_15m_not_against",
+                slope_15m >= -cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+            ),
+        ]
+        put_scalp_checks = [
+            EntryCheck(
+                "trend_5m_down_any",
+                slope_5m <= -cfg.scalp_min_5m_slope,
+                f"5m slope {slope_5m * 100.0:.3f}%",
+            ),
+            EntryCheck(
+                "bearish_1m_close",
+                bearish_1m,
+                "last completed 1m candle bearish + body>=45%",
+            ),
+            EntryCheck(
+                "trend_15m_not_against",
+                slope_15m <= cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+            ),
+        ]
+
+        # Build the candidate set of (pattern, side, checks, reason).
+        # NOTE order matters as a tiebreaker — structural setups first
+        # (breakout > pullback > continuation > scalp) so when multiple fire
+        # we prefer the cleaner setup, but the scalp keeps the bot active
+        # when nothing structural is happening.
+        candidates: list[tuple[str, str, list[EntryCheck], str]] = [
+            ("breakout",     "BUY_CALL", call_breakout_checks,     "uptrend_breakout_confirmed"),
+            ("pullback",     "BUY_CALL", call_pullback_checks,     "uptrend_pullback_bounce"),
+            ("continuation", "BUY_CALL", call_continuation_checks, "uptrend_continuation_resume"),
+            ("scalp",        "BUY_CALL", call_scalp_checks,        "scalp_call_5m_momentum"),
+            ("breakout",     "BUY_PUT",  put_breakdown_checks,     "downtrend_breakdown_confirmed"),
+            ("pullback",     "BUY_PUT",  put_pullback_checks,      "downtrend_pullback_rejection"),
+            ("scalp",        "BUY_PUT",  put_scalp_checks,         "scalp_put_5m_momentum"),
+        ]
+
+        # Rank each candidate by # of passing checks; require ALL to fire.
+        scored = []
+        for pat, side, checks, reason in candidates:
+            passed = sum(1 for c in checks if c.ok)
+            scored.append((pat, side, checks, reason, passed))
+        scored.sort(key=lambda t: (-t[4], t[0]))   # most-passes first, stable
+
+        for pat, side, checks, reason, passed in scored:
+            if passed == len(checks):
+                structure_blob = {
+                    "pattern": pat,
+                    "uptrend_bars_5m": uptrend_bars,
+                    "downtrend_bars_5m": downtrend_bars,
+                    "retracement_pct": round(retracement * 100.0, 3),
+                    "consolidation_range_pct": round(cons_range_pct * 100.0, 3),
+                    "near_breakout": last_price > prev_swing_hi * (1.0 - cfg.near_breakout_clearance)
+                    and last_price <= prev_swing_hi * (1.0 + cfg.min_5m_breakout_clearance),
+                    "late_entry_1m_pct": round(ret_1 * 100.0, 3),
+                    "twap": twap,
+                    "swing_hi": prev_swing_hi,
+                    "swing_lo": prev_swing_lo,
+                }
+                return BrainOutput(
+                    score,
+                    Signal(
+                        side=side,
+                        reason=reason,
+                        confidence=1.0,
+                        checks=checks,
+                        pattern=pat,
+                        structure=structure_blob,
+                    ),
+                    diag,
+                )
+
+        # Nothing fired — surface the closest candidate so the UI shows progress.
+        best = scored[0]
+        pat, side, checks, reason, passed = best
         return BrainOutput(
             score,
             Signal(
-                "NO_TRADE",
-                f"put_partial_{put_pass}/{len(put_checks)}",
-                put_pass / len(put_checks),
-                put_checks,
+                side="NO_TRADE",
+                reason=f"{pat}_{side.lower()}_partial_{passed}/{len(checks)}",
+                confidence=passed / max(1, len(checks)),
+                checks=checks,
+                pattern=pat,
+                structure={
+                    "uptrend_bars_5m": uptrend_bars,
+                    "downtrend_bars_5m": downtrend_bars,
+                    "retracement_pct": round(retracement * 100.0, 3),
+                    "late_entry_1m_pct": round(ret_1 * 100.0, 3),
+                },
             ),
             diag,
         )

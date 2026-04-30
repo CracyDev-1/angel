@@ -47,23 +47,43 @@ class Settings(BaseSettings):
 
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_MODEL")
-    # When true, the LLM is asked YES/NO/AVOID *after* the rule-based brain has
-    # decided to trade. The LLM can only veto, never create trades. Auto-on
-    # whenever OPENAI_API_KEY is set; flip to false to disable temporarily.
+    # The LLM acts as a probabilistic *classifier* over each candidate the
+    # rule-based brain produces. It returns {decision, confidence, type} and
+    # is consulted ONLY after all cheap gates pass (signal, market, funds).
+    # It cannot create trades — it can only allow or skip the brain's choice.
     llm_filter_enabled: bool = Field(default=True, validation_alias="LLM_FILTER_ENABLED")
-    # If the LLM call times out / errors / returns garbage:
-    #   true  → treat as veto (safe: skip the trade, log the reason)
+    # If OpenAI is unreachable / returns garbage / times out:
+    #   true  → skip the trade (safe, default)
     #   false → fall through and let the trade go (faster, riskier)
     llm_filter_fail_closed: bool = Field(default=True, validation_alias="LLM_FILTER_FAIL_CLOSED")
     llm_filter_timeout_s: float = Field(default=8.0, validation_alias="LLM_FILTER_TIMEOUT_S")
+    # Minimum classifier confidence (0..1) required to actually take the
+    # trade. Lower = more trades + lower quality; higher = fewer + higher.
+    llm_decision_threshold: float = Field(
+        default=0.65, validation_alias="LLM_DECISION_THRESHOLD"
+    )
+    # How many top-scoring candidates per loop the LLM may classify. The
+    # bot will iterate them in score order and stop at max-concurrent.
+    llm_top_n_candidates: int = Field(
+        default=3, validation_alias="LLM_TOP_N_CANDIDATES"
+    )
 
     # 0 = auto: use live broker available cash. Any positive value overrides.
     risk_capital_rupees: float = Field(default=0.0, validation_alias="RISK_CAPITAL_RUPEES")
-    risk_per_trade_pct: float = Field(default=0.75, validation_alias="RISK_PER_TRADE_PCT")
+    risk_per_trade_pct: float = Field(default=1.0, validation_alias="RISK_PER_TRADE_PCT")
     risk_max_daily_loss_pct: float = Field(default=2.5, validation_alias="RISK_MAX_DAILY_LOSS_PCT")
-    risk_max_trades_per_day: int = Field(default=4, validation_alias="RISK_MAX_TRADES_PER_DAY")
+    risk_max_trades_per_day: int = Field(default=12, validation_alias="RISK_MAX_TRADES_PER_DAY")
     risk_one_position_at_a_time: bool = Field(
-        default=True, validation_alias="RISK_ONE_POSITION_AT_A_TIME"
+        default=False, validation_alias="RISK_ONE_POSITION_AT_A_TIME"
+    )
+    # Trades-per-hour cap (rolling 60-minute window). 0 disables the cap.
+    risk_max_trades_per_hour: int = Field(
+        default=3, validation_alias="RISK_MAX_TRADES_PER_HOUR"
+    )
+    # Cooldown after a losing close: refuse new entries for this many
+    # minutes. 0 disables the cooldown.
+    risk_loss_cooldown_minutes: int = Field(
+        default=10, validation_alias="RISK_LOSS_COOLDOWN_MINUTES"
     )
 
     # Legacy name — still respected for backwards-compat. Prefer
@@ -106,7 +126,7 @@ class Settings(BaseSettings):
 
     trading_enabled: bool = Field(default=False, validation_alias="TRADING_ENABLED")
     bot_loop_interval_s: float = Field(default=5.0, validation_alias="BOT_LOOP_INTERVAL_S")
-    bot_max_concurrent_positions: int = Field(default=1, validation_alias="BOT_MAX_CONCURRENT_POSITIONS")
+    bot_max_concurrent_positions: int = Field(default=3, validation_alias="BOT_MAX_CONCURRENT_POSITIONS")
     bot_use_capital_pct: float = Field(default=70.0, validation_alias="BOT_USE_CAPITAL_PCT")
     bot_min_signal_strength: float = Field(default=0.0, validation_alias="BOT_MIN_SIGNAL_STRENGTH")
     bot_default_product: str = Field(default="INTRADAY", validation_alias="BOT_DEFAULT_PRODUCT")
@@ -131,34 +151,69 @@ class Settings(BaseSettings):
         validation_alias="SCANNER_WATCHLIST_JSON",
     )
 
-    # ------------------------- BRAIN STRATEGY ---------------------------
-    # Universe filters
+    # ------------------------- BRAIN STRATEGY (5m-primary) ---------------
+    # Primary timeframe used for momentum/structure decisions.
+    # 5m is the new default; 1m drives entry triggers and 15m is bias only.
+    strategy_primary_timeframe: str = Field(
+        default="5m", validation_alias="STRATEGY_PRIMARY_TIMEFRAME"
+    )
+    # Universe filters — very relaxed; LLM does the quality filtering.
     strategy_min_volatility_pct: float = Field(
-        default=0.20, validation_alias="STRATEGY_MIN_VOLATILITY_PCT"
+        default=0.10, validation_alias="STRATEGY_MIN_VOLATILITY_PCT"
     )
     strategy_max_chop_score: float = Field(
-        default=0.55, validation_alias="STRATEGY_MAX_CHOP_SCORE"
+        default=0.80, validation_alias="STRATEGY_MAX_CHOP_SCORE"
     )
-    # Entry timing
+    # Entry timing — 15m kept only as a *bias* check (very loose).
     strategy_min_15m_trend_slope: float = Field(
-        default=0.0007, validation_alias="STRATEGY_MIN_15M_TREND_SLOPE"
+        default=0.0002, validation_alias="STRATEGY_MIN_15M_TREND_SLOPE"
+    )
+    # 5m slope = PRIMARY trend gate. Sized so a 100-200pt NIFTY push qualifies.
+    strategy_min_5m_trend_slope: float = Field(
+        default=0.0003, validation_alias="STRATEGY_MIN_5M_TREND_SLOPE"
     )
     strategy_min_breakout_clearance: float = Field(
-        default=0.0010, validation_alias="STRATEGY_MIN_BREAKOUT_CLEARANCE"
+        default=0.0003, validation_alias="STRATEGY_MIN_BREAKOUT_CLEARANCE"
     )
+    # Allow "near breakout" entries up to this fraction below the swing.
+    strategy_near_breakout_clearance: float = Field(
+        default=0.0030, validation_alias="STRATEGY_NEAR_BREAKOUT_CLEARANCE"
+    )
+    # Relaxed: lets the bot enter mid-move; quick exits cap the downside.
     strategy_max_late_entry_pct: float = Field(
-        default=0.0040, validation_alias="STRATEGY_MAX_LATE_ENTRY_PCT"
+        default=0.0200, validation_alias="STRATEGY_MAX_LATE_ENTRY_PCT"
     )
     strategy_min_above_twap_pct: float = Field(
         default=0.0, validation_alias="STRATEGY_MIN_ABOVE_TWAP_PCT"
     )
-    # Score weights (must sum to ~1.0; volume_w stays 0 until WS QUOTE wired)
-    score_w_volatility: float = Field(default=0.30, validation_alias="SCORE_W_VOLATILITY")
-    score_w_momentum: float = Field(default=0.40, validation_alias="SCORE_W_MOMENTUM")
+    # Score weights (5m-focused). Sum ~= 1.0; volume_w stays 0 until WS QUOTE.
+    score_w_volatility: float = Field(default=0.25, validation_alias="SCORE_W_VOLATILITY")
+    score_w_momentum: float = Field(default=0.45, validation_alias="SCORE_W_MOMENTUM")
     score_w_breakout: float = Field(default=0.30, validation_alias="SCORE_W_BREAKOUT")
     score_w_volume: float = Field(default=0.00, validation_alias="SCORE_W_VOLUME")
-    # Minimum score to even consider acting
-    strategy_min_score: float = Field(default=0.45, validation_alias="STRATEGY_MIN_SCORE")
+    # Minimum brain score to even consider acting. Lowered to 0.30 so the
+    # brain produces lots of candidates → LLM classifier picks the cleanest
+    # via LLM_DECISION_THRESHOLD. Brain = scout, LLM = sniper.
+    strategy_min_score: float = Field(default=0.30, validation_alias="STRATEGY_MIN_SCORE")
+    # Pullback / continuation / scalp pattern detection thresholds
+    strategy_pullback_min_uptrend_bars: int = Field(
+        default=2, validation_alias="STRATEGY_PULLBACK_MIN_UPTREND_BARS"
+    )
+    strategy_pullback_max_retracement_pct: float = Field(
+        default=0.020, validation_alias="STRATEGY_PULLBACK_MAX_RETRACEMENT_PCT"
+    )
+    strategy_continuation_consolidation_bars: int = Field(
+        default=2, validation_alias="STRATEGY_CONTINUATION_CONSOLIDATION_BARS"
+    )
+    strategy_continuation_max_range_pct: float = Field(
+        default=0.006, validation_alias="STRATEGY_CONTINUATION_MAX_RANGE_PCT"
+    )
+    # SCALP / MOMENTUM — fastest path, fires on any visible 5m push +
+    # 1m close in the same direction. Survival is enforced by exit_management
+    # (tight stop + quick target), not by entry rigidity.
+    strategy_scalp_min_5m_slope: float = Field(
+        default=0.0003, validation_alias="STRATEGY_SCALP_MIN_5M_SLOPE"
+    )
     # Hard capital range per trade (per-lot notional). 0 disables the bound.
     strategy_min_trade_value: float = Field(
         default=0.0, validation_alias="STRATEGY_MIN_TRADE_VALUE"
@@ -175,9 +230,12 @@ class Settings(BaseSettings):
     dryrun_capital_override: float = Field(
         default=0.0, validation_alias="DRYRUN_CAPITAL_OVERRIDE"
     )
-    paper_stop_loss_pct: float = Field(default=0.01, validation_alias="PAPER_STOP_LOSS_PCT")
-    paper_take_profit_pct: float = Field(default=0.02, validation_alias="PAPER_TAKE_PROFIT_PCT")
-    paper_max_hold_minutes: int = Field(default=90, validation_alias="PAPER_MAX_HOLD_MINUTES")
+    # Tight scalp-friendly exits. Each LOSS is bounded at ~0.6% of the
+    # premium paid; winners exit at ~1.2% (2:1 reward:risk). Max hold
+    # cuts dead trades fast so capital cycles into the next setup.
+    paper_stop_loss_pct: float = Field(default=0.006, validation_alias="PAPER_STOP_LOSS_PCT")
+    paper_take_profit_pct: float = Field(default=0.012, validation_alias="PAPER_TAKE_PROFIT_PCT")
+    paper_max_hold_minutes: int = Field(default=25, validation_alias="PAPER_MAX_HOLD_MINUTES")
     paper_max_open_positions: int = Field(
         default=5, validation_alias="PAPER_MAX_OPEN_POSITIONS"
     )

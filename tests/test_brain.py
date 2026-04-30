@@ -62,6 +62,60 @@ def test_brain_no_trade_in_chop():
     assert out.signal.side == "NO_TRADE"
 
 
+def test_scalp_pattern_fires_on_small_5m_push():
+    """A small monotonic push that DOESN'T break the prior swing high should
+    still fire the SCALP pattern (no breakout/pullback structure required)."""
+    agg = CandleAggregator()
+    brain = BrainEngine(
+        BrainConfig(
+            min_volatility_pct=0.02,        # very forgiving
+            min_15m_trend_slope=0.00005,
+            scalp_min_5m_slope=0.0002,
+            min_score_to_act=0.0,
+        )
+    )
+    base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
+    # 25 minutes of *very* gentle drift up, then a clean bullish 1m candle.
+    # Total move ~ 0.3% — not big enough for a swing-high breakout.
+    n = 300
+    prices = [100.0 + (0.30 * i / n) for i in range(n)]   # 100.00 → 100.30
+    # Final bullish 1m candle: dip then sharp close.
+    prices += [100.28, 100.27, 100.32, 100.36, 100.40, 100.42]
+    _push_path(agg, base, prices)
+
+    out = brain.evaluate(last_price=prices[-1], agg=agg)
+    # The brain should now produce a CALL — either via scalp or any of the
+    # structural patterns. The point is that the rigid behavior is gone.
+    assert out.signal.side == "BUY_CALL", (
+        f"expected BUY_CALL, got {out.signal.side} ({out.signal.reason})"
+    )
+
+
+def test_scalp_pattern_skips_when_15m_strongly_against():
+    """SCALP must respect the 15m bias gate — won't long against a strong
+    15m downtrend even if 5m is ticking up momentarily."""
+    agg = CandleAggregator()
+    brain = BrainEngine(
+        BrainConfig(
+            min_volatility_pct=0.02,
+            min_15m_trend_slope=0.0003,     # active bias gate
+            scalp_min_5m_slope=0.0002,
+            min_score_to_act=0.0,
+        )
+    )
+    base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
+    # 25 minutes of strong downtrend (-1.5%) — sets 15m slope clearly negative.
+    n = 300
+    prices = [100.0 - (1.5 * i / n) for i in range(n)]
+    # Tiny 1m bounce at the end.
+    prices += [98.45, 98.50, 98.55]
+    _push_path(agg, base, prices)
+
+    out = brain.evaluate(last_price=prices[-1], agg=agg)
+    # Either NO_TRADE, or PUT (downtrend) — but never BUY_CALL.
+    assert out.signal.side in ("NO_TRADE", "BUY_PUT")
+
+
 def test_score_breakdown_keys():
     agg = CandleAggregator()
     brain = BrainEngine()

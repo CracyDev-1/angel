@@ -10,13 +10,7 @@ function signalPill(s: DecisionRow["signal"]): string {
 
 function LlmBadge({ llm }: { llm: LlmDecisionInfo | undefined }) {
   if (!llm) return <span className="text-xs text-slate-500">—</span>;
-  // Source explains *why* we got this verdict (real openai vs disabled vs error).
-  const cls =
-    llm.verdict === "YES"
-      ? "pill-green"
-      : llm.verdict === "NO"
-      ? "pill-red"
-      : "pill-amber";
+
   const sourceLabel =
     llm.source === "openai"
       ? "AI"
@@ -27,6 +21,45 @@ function LlmBadge({ llm }: { llm: LlmDecisionInfo | undefined }) {
       : llm.source === "no_key"
       ? "no key"
       : "AI err";
+
+  // NEW classifier shape: {decision, confidence, type, reason}
+  if (llm.decision !== undefined) {
+    const conf = typeof llm.confidence === "number" ? llm.confidence : 0;
+    const cls =
+      llm.decision === "TAKE" && conf >= 0.65
+        ? "pill-green"
+        : llm.decision === "TAKE"
+        ? "pill-amber"
+        : "pill-red";
+    return (
+      <div className="flex flex-col gap-0.5">
+        <span className={cls} title={llm.reason}>
+          {sourceLabel}: {llm.decision} {Math.round(conf * 100)}%
+        </span>
+        {llm.type ? (
+          <span className="text-[10px] uppercase tracking-wider text-slate-400">
+            {llm.type}
+          </span>
+        ) : null}
+        {llm.reason ? (
+          <span
+            className="max-w-[220px] truncate text-[10px] text-slate-500"
+            title={llm.reason}
+          >
+            {llm.reason}
+          </span>
+        ) : null}
+      </div>
+    );
+  }
+
+  // OLD veto shape: {verdict, allowed, reason} — kept for legacy decisions.
+  const cls =
+    llm.verdict === "YES"
+      ? "pill-green"
+      : llm.verdict === "NO"
+      ? "pill-red"
+      : "pill-amber";
   return (
     <div className="flex flex-col gap-0.5">
       <span className={cls} title={llm.reason}>
@@ -64,7 +97,7 @@ export default function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
             <th className="table-th">Qty (lots)</th>
             <th className="table-th">Capital</th>
             <th className="table-th">Reason</th>
-            <th className="table-th">AI veto</th>
+            <th className="table-th">AI verdict</th>
             <th className="table-th">Mode</th>
             <th className="table-th">Order id</th>
           </tr>

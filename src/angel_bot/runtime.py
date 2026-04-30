@@ -15,7 +15,12 @@ from angel_bot.execution.orders import DuplicateOrderGuard, build_order_payload,
 from angel_bot.instruments.loader import MasterStatus, ensure_local_master
 from angel_bot.instruments.master import Instrument, InstrumentMaster
 from angel_bot.instruments.universe import BuildReport, UniverseBuilder, UniverseSpec
-from angel_bot.llm import LlmDecision, llm_filter_setup
+from angel_bot.llm import (
+    LlmClassification,
+    LlmDecision,
+    llm_classify_setup,
+    llm_filter_setup,
+)
 from angel_bot.orders.tracker import OrderTracker, extract_place_order_id
 from angel_bot.market_hours import all_market_status, kind_market_status
 from angel_bot.paper import PaperConfig, PaperOpenRequest, PaperTrader
@@ -841,11 +846,28 @@ class TradingRuntime:
                                 dry_run=True,
                             )
                         )
+                        # Feed the post-loss cooldown timer.
+                        self.risk.record_close(realized_pnl=float(ev.realized_pnl or 0.0))
 
                     self._record_scan_summary(hits, positions, available, deployable)
 
-                    selected = self._pick_candidate(hits, positions)
-                    await self._consider_trade(api, selected, deployable)
+                    # NEW: rank → take TOP-N → process each independently. The
+                    # max-concurrent + per-hour caps inside _consider_trade
+                    # naturally short-circuit further attempts when full.
+                    candidates = self._select_top_candidates(
+                        hits, positions, n=s.llm_top_n_candidates
+                    )
+                    if not candidates:
+                        # Still log a NO_TRADE skip so the dashboard doesn't go silent.
+                        await self._consider_trade(api, None, deployable)
+                    else:
+                        for cand in candidates:
+                            # Recompute open count after each placement so the
+                            # gate inside _consider_trade sees fresh state.
+                            self.risk.set_open_count(self._current_open_count())
+                            if self.risk.state.open_position_count >= s.bot_max_concurrent_positions:
+                                break
+                            await self._consider_trade(api, cand, deployable)
                 except Exception as e:
                     self.last_error = str(e)
                     log.exception("auto_trader_iter_error")
@@ -866,43 +888,58 @@ class TradingRuntime:
     # brain on the *underlying* drive trade decisions instead.
     _SIGNAL_SOURCE_KINDS: frozenset[str] = frozenset({"INDEX", "EQUITY", "COMMODITY"})
 
-    def _pick_candidate(self, hits: list[ScannerHit], positions: dict[str, Any]) -> ScannerHit | None:
-        """Pick the highest-scoring underlying that the brain has actually
-        signalled BUY_CALL / BUY_PUT on, subject to capital + risk filters.
+    def _current_open_count(self) -> int:
+        """Live = broker open positions; dry-run = open paper positions."""
+        if self._runtime_trading_enabled:
+            return int((self.last_positions or {}).get("open_positions", 0) or 0)
+        return int(self.paper.open_positions_summary().get("open_positions", 0) or 0)
 
-        Same checks for live and dry-run so the dry-run sim mirrors live.
-        Live mode counts broker positions; dry-run counts open paper positions.
+    def _select_top_candidates(
+        self, hits: list[ScannerHit], positions: dict[str, Any], *, n: int = 3
+    ) -> list[ScannerHit]:
+        """Return up to N best-ranked candidates that the brain has signalled
+        BUY_CALL / BUY_PUT on, in score order.
+
+        Cheap filters (kind, signal exists, score floor, lot-fit for cash
+        instruments) are applied here. Heavier gates (market hours, funds,
+        risk, LLM) are applied per-candidate inside _consider_trade.
         """
         if not hits:
-            return None
+            return []
         s = self.settings
         live_open = int(positions.get("open_positions", 0) or 0)
         paper_open = int(self.paper.open_positions_summary().get("open_positions", 0))
         open_now = live_open if self._runtime_trading_enabled else paper_open
         if open_now >= s.bot_max_concurrent_positions:
-            return None
+            return []
+
+        min_score = max(s.strategy_min_score, s.bot_min_signal_strength)
+        keep: list[ScannerHit] = []
         for h in hits:
             if h.kind not in self._SIGNAL_SOURCE_KINDS:
-                continue   # informational option rows — handled at exec time
+                continue
             if h.last_price is None or h.last_price <= 0:
                 continue
-            if h.score < max(s.strategy_min_score, s.bot_min_signal_strength):
+            if h.score < min_score:
                 continue
             if h.signal_side not in ("BUY_CALL", "BUY_PUT"):
                 continue
-            # Funds / lot-fit guards happen against the *executable* instrument
-            # (the option), not the underlying — so we DO NOT block on
-            # h.affordable_lots / h.in_trade_value_range here. _consider_trade
-            # will re-check using the resolved option's lot_size + premium LTP.
             if h.kind != "INDEX":
-                # For stocks/commodities the executable IS the underlying, so
-                # the existing guards apply.
                 if not h.lot_size or not h.affordable_lots or h.affordable_lots < 1:
                     continue
                 if not h.in_trade_value_range:
                     continue
-            return h
-        return None
+            keep.append(h)
+
+        keep.sort(key=lambda h: h.score, reverse=True)
+        # Cap the slate. The runtime breaks out early once max-concurrent fills.
+        slots = max(1, min(int(n or 1), s.bot_max_concurrent_positions))
+        return keep[:slots]
+
+    # Kept for backwards-compat with any external callers (tests etc.)
+    def _pick_candidate(self, hits: list[ScannerHit], positions: dict[str, Any]) -> ScannerHit | None:
+        cands = self._select_top_candidates(hits, positions, n=1)
+        return cands[0] if cands else None
 
     # ------------------------------------------------------------------
     # Execution-instrument resolution (signal → tradeable instrument)
@@ -1046,6 +1083,104 @@ class TradingRuntime:
                 )
             return LlmDecision(
                 verdict="YES", allowed=True,
+                reason=f"unexpected_error:{type(e).__name__} (fail-open)",
+                source="error",
+            )
+
+    async def _run_llm_classifier(
+        self,
+        *,
+        hit: ScannerHit,
+        exec_inst: Instrument,
+        signal: str,
+        side: str,
+        exec_price: float,
+        lot_size: int,
+        chosen_lots: int,
+        capital_used: float,
+        deployable: float,
+    ) -> LlmClassification:
+        """Classifier replacement for the YES/NO/AVOID veto.
+
+        Same sanitization + timeout + fail-closed semantics as the veto, but
+        returns {decision, confidence, type} which the runtime then thresholds
+        against LLM_DECISION_THRESHOLD.
+        """
+        # Pull pattern + structure from the brain so the LLM ranks the *setup*
+        # rather than guessing it.
+        brain_pattern = "other"
+        structure: dict[str, Any] = {}
+        for h in self.scanner.last_hits:
+            if h.exchange == hit.exchange and h.token == hit.token:
+                # ScannerHit.to_dict already includes the brain blob via
+                # signal_side/reason. We reach into the cached BrainOutput too.
+                structure = (h.diagnostics or {}).get("score_inputs", {}) or {}
+                # The pattern was stamped onto Signal — runtime exposes it
+                # via the scanner cache: structure_components has it indirectly.
+                comps = structure.get("structure_components") or {}
+                if comps.get("breakout", 0) >= max(comps.get("pullback", 0), comps.get("continuation", 0)):
+                    brain_pattern = "breakout"
+                elif comps.get("pullback", 0) >= comps.get("continuation", 0):
+                    brain_pattern = "pullback"
+                elif comps.get("continuation", 0) > 0:
+                    brain_pattern = "continuation"
+                break
+
+        ctx: dict[str, Any] = {
+            "mode": self.mode,
+            "now_utc": datetime.now(UTC).isoformat(),
+            "underlying": {
+                "name": hit.name,
+                "kind": hit.kind,
+                "spot": hit.last_price,
+                "change_pct": hit.change_pct,
+                "candles_1m": hit.candles_1m,
+                "candles_5m": hit.candles_5m,
+                "candles_15m": hit.candles_15m,
+            },
+            "brain": {
+                "score": hit.score,
+                "score_breakdown": hit.score_breakdown,
+                "signal": hit.signal_side,
+                "signal_reason": hit.signal_reason,
+                "confidence": hit.signal_confidence,
+                "checks": hit.checks,
+                "pattern": brain_pattern,
+                "structure": structure,
+            },
+            "execution": {
+                "underlying": hit.name,
+                "option_symbol": exec_inst.tradingsymbol,
+                "option_side": side,
+                "option_premium": exec_price,
+                "lot_size": lot_size,
+                "lots": chosen_lots,
+                "capital_used": capital_used,
+                "deployable_cash": deployable,
+                "capital_pct": (capital_used / deployable) if deployable else None,
+            },
+        }
+        proposed = (
+            f"{signal} {exec_inst.tradingsymbol} "
+            f"@ ₹{exec_price:.2f} × {chosen_lots} lots × {lot_size}"
+        )
+        try:
+            return await llm_classify_setup(
+                market_context=ctx,
+                proposed_signal=proposed,
+                proposed_pattern=brain_pattern,
+                settings=self.settings,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("llm_classifier_unexpected_error", error=str(e))
+            if self.settings.llm_filter_fail_closed:
+                return LlmClassification(
+                    decision="SKIP", confidence=0.0, pattern_type="other",
+                    reason=f"unexpected_error:{type(e).__name__} (fail-closed)",
+                    source="fail_closed",
+                )
+            return LlmClassification(
+                decision="TAKE", confidence=0.5, pattern_type="other",
                 reason=f"unexpected_error:{type(e).__name__} (fail-open)",
                 source="error",
             )
@@ -1208,21 +1343,25 @@ class TradingRuntime:
         side = "CE" if signal == "BUY_CALL" else "PE"
 
         # ------------------------------------------------------------------
-        # OPTIONAL LLM VETO — last gate before placement.
-        # The LLM only ever vetoes; it never creates trades. If
-        # OPENAI_API_KEY is unset or LLM_FILTER_ENABLED=false, this
-        # short-circuits to ALLOW. If OpenAI is unreachable and
-        # LLM_FILTER_FAIL_CLOSED=true (default) the trade is skipped.
+        # LLM CLASSIFIER — primary decision-quality filter (5m pipeline).
+        # Returns {decision, confidence, type}. We require:
+        #   decision == TAKE  AND  confidence >= LLM_DECISION_THRESHOLD.
+        # When the LLM is disabled or no key is set, this short-circuits to
+        # TAKE@1.0 so the trade flows through. Fail-closed/open is honored.
         # ------------------------------------------------------------------
-        llm_dec = await self._run_llm_filter(
+        llm_dec = await self._run_llm_classifier(
             hit=hit, exec_inst=exec_inst, signal=signal, side=side,
             exec_price=exec_price, lot_size=lot_size, chosen_lots=chosen_lots,
             capital_used=capital_used, deployable=deployable,
         )
-        if not llm_dec.allowed:
+        threshold = float(s.llm_decision_threshold)
+        if not llm_dec.passes(threshold):
             self._record_skip(
                 hit=hit, signal=signal,
-                reason=f"llm_veto:{llm_dec.verdict} — {llm_dec.reason}",
+                reason=(
+                    f"llm:{llm_dec.decision} conf={llm_dec.confidence:.2f}"
+                    f"<{threshold:.2f} — {llm_dec.reason}"
+                ),
                 price=exec_price,
                 extra={"llm": llm_dec.to_dict(), "exec_symbol": exec_inst.tradingsymbol},
             )
@@ -1283,6 +1422,8 @@ class TradingRuntime:
                 placed=True, dry_run=True, broker_order_id=f"PAPER-{pid}",
                 extra={"llm": llm_dec.to_dict(), "underlying": hit.name},
             )
+            # Update risk-engine entry count for the per-hour cap.
+            self.risk.record_entry()
             return
 
         # ------------------------------------------------------------------
@@ -1324,6 +1465,8 @@ class TradingRuntime:
             placed=bool(oid), dry_run=False, broker_order_id=oid,
             extra={"resp": _redact(resp), "underlying": hit.name, "llm": llm_dec.to_dict()},
         )
+        if oid:
+            self.risk.record_entry()
 
     def _record_skip(
         self,
