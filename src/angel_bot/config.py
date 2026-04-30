@@ -61,6 +61,30 @@ class Settings(BaseSettings):
     dashboard_host: str = Field(default="127.0.0.1", validation_alias="DASHBOARD_HOST")
     dashboard_port: int = Field(default=9812, validation_alias="DASHBOARD_PORT")
     dashboard_token: SecretStr | None = Field(default=None, validation_alias="DASHBOARD_TOKEN")
+    dashboard_cors_origins: str = Field(
+        default="http://localhost:5173,http://127.0.0.1:5173",
+        validation_alias="DASHBOARD_CORS_ORIGINS",
+    )
+
+    trading_enabled: bool = Field(default=False, validation_alias="TRADING_ENABLED")
+    bot_loop_interval_s: float = Field(default=5.0, validation_alias="BOT_LOOP_INTERVAL_S")
+    bot_max_concurrent_positions: int = Field(default=1, validation_alias="BOT_MAX_CONCURRENT_POSITIONS")
+    bot_use_capital_pct: float = Field(default=70.0, validation_alias="BOT_USE_CAPITAL_PCT")
+    bot_min_signal_strength: float = Field(default=0.0, validation_alias="BOT_MIN_SIGNAL_STRENGTH")
+    bot_default_product: str = Field(default="INTRADAY", validation_alias="BOT_DEFAULT_PRODUCT")
+    bot_default_variety: str = Field(default="NORMAL", validation_alias="BOT_DEFAULT_VARIETY")
+    bot_autostart: bool = Field(default=False, validation_alias="BOT_AUTOSTART")
+    auto_connect_on_startup: bool = Field(default=True, validation_alias="AUTO_CONNECT_ON_STARTUP")
+    auto_relogin_interval_s: float = Field(default=900.0, validation_alias="AUTO_RELOGIN_INTERVAL_S")
+
+    scanner_watchlist_json: str = Field(
+        default=(
+            '{"NSE":[{"name":"NIFTY","token":"99926000","kind":"INDEX","lot_size":50},'
+            '{"name":"BANKNIFTY","token":"99926009","kind":"INDEX","lot_size":15},'
+            '{"name":"FINNIFTY","token":"99926037","kind":"INDEX","lot_size":40}]}'
+        ),
+        validation_alias="SCANNER_WATCHLIST_JSON",
+    )
 
     log_format: str = Field(default="console", validation_alias="LOG_FORMAT")
 
@@ -81,6 +105,20 @@ class Settings(BaseSettings):
             if not isinstance(k, str) or not isinstance(v, list):
                 raise ValueError("LTP_EXCHANGE_TOKENS_JSON must map string -> list")
             out[k] = [str(x) for x in v]
+        return out
+
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.dashboard_cors_origins.split(",") if o.strip()]
+
+    def scanner_watchlist(self) -> dict[str, list[dict[str, Any]]]:
+        raw: Any = json.loads(self.scanner_watchlist_json)
+        if not isinstance(raw, dict):
+            raise ValueError("SCANNER_WATCHLIST_JSON must be a JSON object {exchange:[entries]}")
+        out: dict[str, list[dict[str, Any]]] = {}
+        for ex, items in raw.items():
+            if not isinstance(items, list):
+                continue
+            out[str(ex).upper()] = [dict(it) for it in items if isinstance(it, dict)]
         return out
 
 

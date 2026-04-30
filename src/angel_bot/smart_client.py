@@ -14,6 +14,9 @@ LTP_PATH = "/rest/secure/angelbroking/order/v1/getLtpData"
 PLACE_ORDER_PATH = "/rest/secure/angelbroking/order/v1/placeOrder"
 ORDER_BOOK_PATH = "/rest/secure/angelbroking/order/v1/getOrderBook"
 TRADE_BOOK_PATH = "/rest/secure/angelbroking/order/v1/getTradeBook"
+RMS_PATH = "/rest/secure/angelbroking/user/v1/getRMS"
+POSITION_PATH = "/rest/secure/angelbroking/order/v1/getPosition"
+HOLDING_PATH = "/rest/secure/angelbroking/portfolio/v1/getHolding"
 
 
 class SmartApiClient:
@@ -54,6 +57,18 @@ class SmartApiClient:
     async def trade_book(self) -> dict[str, Any]:
         await self.session.ensure_login()
         return await self._get_with_auth_retry(TRADE_BOOK_PATH)
+
+    async def get_rms(self) -> dict[str, Any]:
+        await self.session.ensure_login()
+        return await self._get_with_auth_retry(RMS_PATH)
+
+    async def get_position(self) -> dict[str, Any]:
+        await self.session.ensure_login()
+        return await self._get_with_auth_retry(POSITION_PATH)
+
+    async def get_holding(self) -> dict[str, Any]:
+        await self.session.ensure_login()
+        return await self._get_with_auth_retry(HOLDING_PATH)
 
     async def _post_with_auth_retry(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
         try:

@@ -189,3 +189,15 @@ class StateStore:
             if not row:
                 return (0, 0.0)
             return (int(row["trades"]), float(row["pnl"]))
+
+    def recent_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def all_daily_stats(self) -> list[dict[str, Any]]:
+        with self._connect() as con:
+            rows = con.execute("SELECT day, trades, pnl FROM daily_stats ORDER BY day DESC").fetchall()
+            return [dict(r) for r in rows]

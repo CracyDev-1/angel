@@ -54,11 +54,26 @@ def resolve_totp_from_settings(settings: Settings) -> str:
 
 
 def totp_configured_in_env(settings: Settings) -> bool:
-    if settings.angel_totp and settings.angel_totp.get_secret_value().strip():
+    """True only when env TOTP can actually be used to log in.
+
+    A static ANGEL_TOTP is one-shot (only useful for a single login), so it
+    does NOT count as "auto mode" — only a valid base32 ANGEL_TOTP_SECRET does.
+    """
+    secret = (
+        settings.angel_totp_secret.get_secret_value().strip()
+        if settings.angel_totp_secret
+        else ""
+    )
+    if not secret:
+        return False
+    try:
+        import pyotp
+
+        pyotp.TOTP(secret).now()
         return True
-    if settings.angel_totp_secret and settings.angel_totp_secret.get_secret_value().strip():
-        return True
-    return False
+    except Exception as e:  # noqa: BLE001 — invalid secret should not crash startup
+        log.warning("invalid_angel_totp_secret", error=str(e))
+        return False
 
 
 class AngelSession:
@@ -91,15 +106,12 @@ class AngelSession:
             await self._client.aclose()
 
     async def login(self) -> dict[str, Any]:
-        try:
-            body = {
-                "clientcode": self.settings.angel_client_code,
-                "password": self.settings.angel_pin.get_secret_value(),
-                "totp": self._totp_for_login(),
-            }
-            return await self._post_json(LOGIN_PATH, body, auth=False)
-        finally:
-            self.clear_runtime_totp()
+        body = {
+            "clientcode": self.settings.angel_client_code,
+            "password": self.settings.angel_pin.get_secret_value(),
+            "totp": self._totp_for_login(),
+        }
+        return await self._post_json(LOGIN_PATH, body, auth=False)
 
     async def refresh(self) -> dict[str, Any]:
         if not self.refresh_token:
@@ -121,10 +133,31 @@ class AngelSession:
     async def ensure_login(self, *, force: bool = False) -> None:
         if self.jwt and self.refresh_token and not force:
             return
-        resp = await self._with_retries(self.login)
+        # loginByPassword consumes a one-time TOTP — DO NOT retry on broker auth
+        # rejections (status:false / 4xx); only retry on transport hiccups.
+        try:
+            resp = await self._login_with_transport_retries()
+        finally:
+            # consume the runtime code so it can't be reused by accident.
+            self.clear_runtime_totp()
         if not resp.get("status"):
             raise AngelHttpError("Login failed", body=resp)
         self.apply_login_payload(resp["data"])
+
+    async def _login_with_transport_retries(
+        self, attempts: int = 3, base_delay: float = 0.5
+    ) -> dict[str, Any]:
+        last: Exception | None = None
+        for i in range(attempts):
+            try:
+                return await self.login()
+            except httpx.TransportError as e:
+                last = e
+                delay = base_delay * (2**i)
+                log.warning("login_transport_retry", attempt=i + 1, error=str(e), sleep_s=delay)
+                await asyncio.sleep(delay)
+        assert last is not None
+        raise last
 
     async def refresh_tokens(self) -> None:
         """Call generateTokens; on failure fall back to full login (e.g. session expired at midnight)."""
