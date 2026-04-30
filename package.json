@@ -1,0 +1,22 @@
+{
+  "name": "angel-trader",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Angel One SmartAPI auto-trading bot — single command launches backend (FastAPI) + frontend (React/Vite).",
+  "scripts": {
+    "start": "bash scripts/start.sh",
+    "dev": "bash scripts/dev.sh",
+    "stop": "bash scripts/stop.sh",
+    "build": "yarn --cwd frontend build",
+    "test": "./.venv/bin/python -m pytest -q",
+    "lint": "./.venv/bin/ruff check src tests && yarn --cwd frontend lint",
+    "install:all": "yarn install && yarn --cwd frontend install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "yarn@1.22.22"
+}
