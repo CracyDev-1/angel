@@ -55,9 +55,13 @@ class TradingRuntime:
         self.last_positions: dict[str, Any] | None = None
         self.last_scanner: list[ScannerHit] = []
         self.last_loop_at: str | None = None
+        self.last_scan_summary: dict[str, Any] | None = None
         self.bot_started_at: str | None = None
         self.auto_mode: bool = totp_configured_in_env(self.settings)
         self._watchdog_task: asyncio.Task | None = None
+        # runtime mode override — flipped by the dashboard "Go Live" toggle
+        # without restarting the process. Initialized from .env (TRADING_ENABLED).
+        self._runtime_trading_enabled: bool = bool(self.settings.trading_enabled)
 
     @classmethod
     def instance(cls) -> TradingRuntime:
@@ -80,6 +84,33 @@ class TradingRuntime:
         if not self.session:
             return None
         return SmartApiClient(self.session, self.settings)
+
+    @property
+    def trading_enabled(self) -> bool:
+        return self._runtime_trading_enabled
+
+    def set_trading_enabled(self, enabled: bool) -> dict[str, Any]:
+        prev = self._runtime_trading_enabled
+        self._runtime_trading_enabled = bool(enabled)
+        log.info("trading_mode_changed", from_=prev, to=self._runtime_trading_enabled)
+        self.decisions.add(
+            Decision(
+                ts=DecisionLog.now_iso(),
+                name="-",
+                exchange="-",
+                token="-",
+                signal="MODE",
+                reason=f"trading_{'live' if enabled else 'dry_run'}",
+                last_price=None,
+                quantity=0,
+                lots=0,
+                capital_used=0.0,
+                side="-",
+                placed=False,
+                dry_run=not self._runtime_trading_enabled,
+            )
+        )
+        return {"trading_enabled": self._runtime_trading_enabled}
 
     async def connect_with_totp(self, totp: str) -> dict:
         """Login with a one-time TOTP from the dashboard (not stored in .env)."""
@@ -232,21 +263,111 @@ class TradingRuntime:
             return 0
 
     def snapshot(self) -> dict[str, Any]:
+        positions = self.last_positions or {}
         return {
             "connected": self.connected(),
             "bot_running": self.bot_running(),
-            "trading_enabled": self.settings.trading_enabled,
+            "trading_enabled": self._runtime_trading_enabled,
             "auto_mode": self.auto_mode,
             "last_loop_at": self.last_loop_at,
+            "last_scan_summary": self.last_scan_summary,
             "bot_started_at": self.bot_started_at,
             "last_error": self.last_error,
             "clientcode": self.connected_clientcode,
             "funds": self.last_funds,
             "positions": self.last_positions,
             "scanner": [h.to_dict() for h in self.last_scanner[:25]],
+            "scanner_by_kind": self._scanner_by_kind(),
+            "ce_pe_summary": self._ce_pe_summary(positions),
+            "bot_today": self._bot_today_summary(positions),
             "recent_orders": summarize_orders_for_ui(self.store.recent_orders(50)),
-            "decisions": [d.to_dict() for d in self.decisions.recent(80)],
+            "decisions": [d.to_dict() for d in self.decisions.recent(120)],
             "daily": self._daily_stats(),
+        }
+
+    def _scanner_by_kind(self) -> dict[str, Any]:
+        """Group scanner hits by kind (EQUITY / INDEX / COMMODITY) so the simple UI
+        can show one card per category with how many are *tradable* with current cash.
+        """
+        buckets: dict[str, dict[str, Any]] = {}
+        for h in self.last_scanner:
+            kind = (h.kind or "EQUITY").upper()
+            b = buckets.setdefault(
+                kind,
+                {"kind": kind, "count": 0, "tradable": 0, "names": [], "top_name": None, "top_score": 0.0},
+            )
+            b["count"] += 1
+            if (h.affordable_lots or 0) >= 1:
+                b["tradable"] += 1
+                if len(b["names"]) < 4:
+                    b["names"].append(h.name)
+            if abs(h.score or 0) > b["top_score"]:
+                b["top_score"] = abs(h.score or 0)
+                b["top_name"] = h.name
+        # Stable order so the UI cards don't shuffle.
+        order = ["EQUITY", "INDEX", "COMMODITY"]
+        ordered: list[dict[str, Any]] = []
+        for k in order:
+            if k in buckets:
+                ordered.append(buckets[k])
+        for k, v in buckets.items():
+            if k not in order:
+                ordered.append(v)
+        return {"buckets": ordered}
+
+    def _ce_pe_summary(self, positions: dict[str, Any]) -> dict[str, Any]:
+        rows = positions.get("rows") or []
+        ce_open = pe_open = 0
+        ce_pnl = pe_pnl = 0.0
+        for r in rows:
+            if (r.get("net_qty") or 0) == 0:
+                continue
+            side = r.get("side")
+            pnl = float(r.get("pnl") or 0.0)
+            if side == "CE":
+                ce_open += 1
+                ce_pnl += pnl
+            elif side == "PE":
+                pe_open += 1
+                pe_pnl += pnl
+        return {
+            "ce_open": ce_open,
+            "pe_open": pe_open,
+            "capital_ce": float(positions.get("capital_used_ce") or 0.0),
+            "capital_pe": float(positions.get("capital_used_pe") or 0.0),
+            "pnl_ce": ce_pnl,
+            "pnl_pe": pe_pnl,
+        }
+
+    def _bot_today_summary(self, positions: dict[str, Any]) -> dict[str, Any]:
+        """Roll-up of trades placed by THIS bot since UTC midnight."""
+        rows = self.store.bot_orders_today()
+        trades_placed = len(rows)
+        unrealized = float(positions.get("pnl_total") or 0.0)
+        realized_today = float(self._daily_stats().get("realized_pnl") or 0.0)
+        return {
+            "trades_placed": trades_placed,
+            "pending": len([r for r in rows if (r.get("lifecycle_status") or "").lower() not in ("executed", "complete", "cancelled", "rejected")]),
+            "filled": len([r for r in rows if (r.get("lifecycle_status") or "").lower() in ("executed", "complete")]),
+            "rejected": len([r for r in rows if (r.get("lifecycle_status") or "").lower() == "rejected"]),
+            "unrealized_pnl": unrealized,
+            "realized_pnl": realized_today,
+            "net_pnl": realized_today + unrealized,
+        }
+
+    def history(self, *, orders_limit: int = 200) -> dict[str, Any]:
+        rows = self.store.recent_orders(orders_limit)
+        all_days = self.store.all_daily_stats()
+        total_pnl = sum(float(d.get("pnl") or 0.0) for d in all_days)
+        total_trades = sum(int(d.get("trades") or 0) for d in all_days)
+        return {
+            "orders": summarize_orders_for_ui(rows),
+            "all_days": all_days,
+            "totals": {
+                "trades": total_trades,
+                "realized_pnl": total_pnl,
+                "days_traded": len(all_days),
+            },
         }
 
     def _daily_stats(self) -> dict[str, Any]:
@@ -265,7 +386,11 @@ class TradingRuntime:
         s = self.settings
         api = self.smart_client()
         assert api is not None
-        log.info("auto_trader_started", interval_s=s.bot_loop_interval_s, trading_enabled=s.trading_enabled)
+        log.info(
+            "auto_trader_started",
+            interval_s=s.bot_loop_interval_s,
+            trading_enabled=self._runtime_trading_enabled,
+        )
         try:
             while not self._stop.is_set():
                 self.last_loop_at = datetime.now(UTC).isoformat()
@@ -281,6 +406,8 @@ class TradingRuntime:
 
                     hits = await self.scanner.poll_once(api, available_funds=deployable)
                     self.last_scanner = hits
+
+                    self._record_scan_summary(hits, positions, available, deployable)
 
                     selected = self._pick_candidate(hits, positions)
                     await self._consider_trade(api, selected, deployable)
@@ -300,6 +427,9 @@ class TradingRuntime:
             log.info("auto_trader_stopped")
 
     def _pick_candidate(self, hits: list[ScannerHit], positions: dict[str, Any]) -> ScannerHit | None:
+        """Pick the highest-scoring instrument that the brain has actually
+        signalled BUY_CALL / BUY_PUT on, subject to capital + risk filters.
+        """
         if not hits:
             return None
         s = self.settings
@@ -312,17 +442,74 @@ class TradingRuntime:
                 continue
             if h.affordable_lots < 1:
                 continue
-            if abs(h.score) < s.bot_min_signal_strength:
+            if h.score < max(s.strategy_min_score, s.bot_min_signal_strength):
+                continue
+            if h.signal_side not in ("BUY_CALL", "BUY_PUT"):
                 continue
             return h
         return None
 
+    def _record_scan_summary(
+        self,
+        hits: list[ScannerHit],
+        positions: dict[str, Any],
+        available: float,
+        deployable: float,
+    ) -> None:
+        """Log a per-cycle "what the bot saw" entry so the UI shows continuous activity."""
+        s = self.settings
+        top: list[dict[str, Any]] = []
+        for h in hits[:5]:
+            top.append(
+                {
+                    "name": h.name,
+                    "kind": h.kind,
+                    "ltp": h.last_price,
+                    "change_pct": h.change_pct,
+                    "score": h.score,
+                    "score_breakdown": h.score_breakdown,
+                    "signal_side": h.signal_side,
+                    "signal_reason": h.signal_reason,
+                    "signal_confidence": h.signal_confidence,
+                    "affordable_lots": h.affordable_lots,
+                    "candles_15m": h.candles_15m,
+                    "candles_5m": h.candles_5m,
+                }
+            )
+        open_n = int(positions.get("open_positions") or 0)
+        min_score = max(s.strategy_min_score, s.bot_min_signal_strength)
+        if not hits:
+            reason = "watchlist_empty_or_ltp_failed"
+        elif open_n >= s.bot_max_concurrent_positions:
+            reason = f"max_positions_open ({open_n}/{s.bot_max_concurrent_positions})"
+        elif not any((h.affordable_lots or 0) >= 1 for h in hits):
+            reason = "no_affordable_lots_for_capital"
+        elif not any(h.score >= min_score for h in hits):
+            reason = f"all_scores_below_min ({min_score:.2f})"
+        elif not any(h.signal_side in ("BUY_CALL", "BUY_PUT") for h in hits):
+            reason = "no_brain_entry_signal_yet"
+        else:
+            reason = "candidates_available"
+        self.last_scan_summary = {
+            "ts": DecisionLog.now_iso(),
+            "instruments_scanned": len(hits),
+            "available_cash": available,
+            "deployable_cash": deployable,
+            "open_positions": open_n,
+            "reason": reason,
+            "top": top,
+            "min_score": min_score,
+        }
+
     async def _consider_trade(self, api: SmartApiClient, hit: ScannerHit | None, deployable: float) -> None:
         s = self.settings
         if hit is None:
-            self._record_skip(hit=None, signal="NO_TRADE", reason="no_candidate", price=None)
+            scan_reason = (self.last_scan_summary or {}).get("reason", "no_candidate")
+            self._record_skip(hit=None, signal="NO_TRADE", reason=f"no_candidate ({scan_reason})", price=None)
             return
-        signal, reason = self._signal_from_hit(hit)
+        # The brain already produced a side; runtime trusts it but still applies risk + capital caps.
+        signal = hit.signal_side
+        reason = hit.signal_reason
         if signal == "NO_TRADE":
             self._record_skip(hit=hit, signal=signal, reason=reason, price=hit.last_price)
             return
@@ -349,9 +536,9 @@ class TradingRuntime:
         side = "CE" if signal == "BUY_CALL" else "PE"
 
         # NOTE: hit.token here is the *underlying* (index/equity) token. Real placement requires the
-        # specific option strike token (from the instrument master). When TRADING_ENABLED=false,
+        # specific option strike token (from the instrument master). When trading is in dry-run mode,
         # we always log a dry-run decision so the dashboard can show what the bot WOULD do.
-        if not s.trading_enabled:
+        if not self._runtime_trading_enabled:
             self._record_decision(
                 hit=hit, signal=signal, reason="dry_run", price=entry, qty=chosen_qty,
                 lots=chosen_lots, capital=capital_used, side=side, placed=False, dry_run=True,
@@ -388,23 +575,15 @@ class TradingRuntime:
             return
         oid = extract_place_order_id(resp) if isinstance(resp, dict) else None
         if oid:
-            self.store.log_order(payload, oid, status="placed", lifecycle_status="placed")
+            self.store.log_order(
+                payload, oid, status="placed", lifecycle_status="placed",
+                placed_by_bot=True, intent="open",
+            )
         self._record_decision(
             hit=hit, signal=signal, reason="placed", price=entry, qty=chosen_qty,
             lots=chosen_lots, capital=capital_used, side=side,
             placed=bool(oid), dry_run=False, broker_order_id=oid, extra={"resp": _redact(resp)},
         )
-
-    def _signal_from_hit(self, hit: ScannerHit) -> tuple[str, str]:
-        change = hit.change_pct or 0.0
-        mom = hit.momentum_5 or 0.0
-        if abs(change) < 0.0015 and abs(mom) < 0.0010:
-            return ("NO_TRADE", "no_thrust")
-        if change > 0 and mom > 0:
-            return ("BUY_CALL", "uptrend_thrust")
-        if change < 0 and mom < 0:
-            return ("BUY_PUT", "downtrend_thrust")
-        return ("NO_TRADE", "mixed_signals")
 
     def _record_skip(self, *, hit: ScannerHit | None, signal: str, reason: str, price: float | None) -> None:
         self.decisions.add(
@@ -421,7 +600,7 @@ class TradingRuntime:
                 capital_used=0.0,
                 side="-",
                 placed=False,
-                dry_run=not self.settings.trading_enabled,
+                dry_run=not self._runtime_trading_enabled,
             )
         )
 
@@ -460,6 +639,155 @@ class TradingRuntime:
                 extra=extra or {},
             )
         )
+
+    async def kill_switch(
+        self,
+        *,
+        cancel_pending: bool = True,
+        square_off: bool = True,
+    ) -> dict[str, Any]:
+        """One-call panic stop:
+          1. stop the bot loop
+          2. flip to dry-run so no further orders can go out
+          3. (optional) cancel every still-pending order placed by THIS bot
+          4. (optional) square-off every open position by sending a market reverse order
+        Returns a structured report of what was done.
+        """
+        report: dict[str, Any] = {
+            "stopped_bot": False,
+            "set_dry_run": False,
+            "cancelled": [],
+            "cancel_failures": [],
+            "squared_off": [],
+            "squareoff_failures": [],
+        }
+        await self.stop_bot()
+        report["stopped_bot"] = True
+        self.set_trading_enabled(False)
+        report["set_dry_run"] = True
+
+        api = self.smart_client()
+        if api is None:
+            return report
+
+        if cancel_pending:
+            for o in self.store.pending_bot_orders():
+                oid = o.get("broker_order_id")
+                variety = (o.get("variety") or self.settings.bot_default_variety or "NORMAL").upper()
+                if not oid:
+                    continue
+                try:
+                    await api.cancel_order(variety=variety, orderid=str(oid))
+                    report["cancelled"].append(str(oid))
+                except Exception as e:  # noqa: BLE001 — collect, don't abort
+                    report["cancel_failures"].append({"orderid": str(oid), "error": str(e)})
+                    log.warning("kill_cancel_failed", orderid=oid, error=str(e))
+
+        if square_off:
+            await self.refresh_positions()
+            for r in (self.last_positions or {}).get("rows", []):
+                qty = int(r.get("net_qty") or 0)
+                if qty == 0:
+                    continue
+                try:
+                    res = await self._close_position_row(api, r)
+                    report["squared_off"].append(res)
+                except Exception as e:  # noqa: BLE001
+                    report["squareoff_failures"].append({"symbol": r.get("tradingsymbol"), "error": str(e)})
+                    log.warning("kill_squareoff_failed", symbol=r.get("tradingsymbol"), error=str(e))
+
+        self.decisions.add(
+            Decision(
+                ts=DecisionLog.now_iso(),
+                name="-",
+                exchange="-",
+                token="-",
+                signal="MODE",
+                reason=(
+                    f"kill_switch: cancelled={len(report['cancelled'])} "
+                    f"squared_off={len(report['squared_off'])} "
+                    f"cancel_failures={len(report['cancel_failures'])} "
+                    f"squareoff_failures={len(report['squareoff_failures'])}"
+                ),
+                last_price=None,
+                quantity=0,
+                lots=0,
+                capital_used=0.0,
+                side="-",
+                placed=False,
+                dry_run=True,
+            )
+        )
+        return report
+
+    async def close_position(
+        self,
+        *,
+        tradingsymbol: str,
+        exchange: str,
+        symboltoken: str,
+        net_qty: int,
+        producttype: str | None = None,
+    ) -> dict[str, Any]:
+        """Send a market reverse order for a single broker position."""
+        api = self.smart_client()
+        if api is None:
+            raise RuntimeError("Not connected.")
+        row = {
+            "tradingsymbol": tradingsymbol,
+            "exchange": exchange,
+            "symboltoken": symboltoken,
+            "net_qty": net_qty,
+            "producttype": producttype,
+        }
+        return await self._close_position_row(api, row)
+
+    async def _close_position_row(self, api: SmartApiClient, r: dict[str, Any]) -> dict[str, Any]:
+        qty = int(r.get("net_qty") or 0)
+        if qty == 0:
+            return {"symbol": r.get("tradingsymbol"), "skipped": "flat"}
+        side = "SELL" if qty > 0 else "BUY"
+        inst = Instrument(
+            exchange=str(r.get("exchange") or "").upper(),
+            tradingsymbol=str(r.get("tradingsymbol") or ""),
+            symboltoken=str(r.get("symboltoken") or ""),
+        )
+        product = (r.get("producttype") or self.settings.bot_default_product or "INTRADAY").upper()
+        payload = build_order_payload(
+            inst,
+            variety=self.settings.bot_default_variety,
+            transactiontype=side,
+            ordertype="MARKET",
+            producttype=product,
+            quantity=abs(qty),
+        )
+        validate_order_payload(payload)
+        resp = await api.place_order(payload)
+        oid = extract_place_order_id(resp) if isinstance(resp, dict) else None
+        if oid:
+            self.store.log_order(
+                payload, oid, status="placed", lifecycle_status="placed",
+                placed_by_bot=True, intent="close",
+            )
+        self.decisions.add(
+            Decision(
+                ts=DecisionLog.now_iso(),
+                name=inst.tradingsymbol,
+                exchange=inst.exchange,
+                token=inst.symboltoken,
+                signal="MODE",
+                reason=f"manual_close_{side.lower()}",
+                last_price=None,
+                quantity=abs(qty),
+                lots=0,
+                capital_used=0.0,
+                side="-",
+                placed=bool(oid),
+                dry_run=False,
+                broker_order_id=oid,
+            )
+        )
+        return {"symbol": inst.tradingsymbol, "side": side, "qty": abs(qty), "broker_order_id": oid}
 
     async def shutdown(self) -> None:
         await self.disconnect()

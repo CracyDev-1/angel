@@ -72,7 +72,7 @@ def create_app() -> FastAPI:
             "bot_running": rt.bot_running(),
             "last_error": rt.last_error,
             "clientcode": rt.connected_clientcode,
-            "trading_enabled": rt.settings.trading_enabled,
+            "trading_enabled": rt.trading_enabled,
             "auto_mode": rt.auto_mode,
         }
 
@@ -167,7 +167,7 @@ def create_app() -> FastAPI:
         rt = TradingRuntime.instance()
         try:
             await rt.start_bot()
-            return {"started": True}
+            return {"started": True, "trading_enabled": rt.trading_enabled}
         except RuntimeError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -176,6 +176,99 @@ def create_app() -> FastAPI:
         _check_dashboard_token(x_dashboard_token)
         await TradingRuntime.instance().stop_bot()
         return {"stopped": True}
+
+    @app.post("/api/trading/enable")
+    async def trading_enable(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Flip the bot from dry-run → live placement at runtime.
+
+        Body MUST include {"confirm": "I_UNDERSTAND_LIVE_TRADING"} so a UI bug
+        cannot accidentally turn live mode on. The bot still respects every
+        risk cap from .env (RISK_*) and refuses live index option trades.
+        """
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if str(body.get("confirm", "")).strip() != "I_UNDERSTAND_LIVE_TRADING":
+            raise HTTPException(
+                status_code=400,
+                detail='Live trading requires confirmation. Send {"confirm":"I_UNDERSTAND_LIVE_TRADING"}.',
+            )
+        return TradingRuntime.instance().set_trading_enabled(True)
+
+    @app.post("/api/trading/disable")
+    async def trading_disable(x_dashboard_token: str | None = Header(default=None)) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        return TradingRuntime.instance().set_trading_enabled(False)
+
+    @app.get("/api/history")
+    async def api_history(x_dashboard_token: str | None = Header(default=None)) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        return TradingRuntime.instance().history(orders_limit=200)
+
+    @app.post("/api/kill-switch")
+    async def api_kill_switch(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Stop the bot, flip to dry-run, optionally cancel pending bot orders and
+        square-off open positions. Body: {"confirm": "STOP_EVERYTHING",
+        "cancel_pending": true, "square_off": true}.
+        """
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if str(body.get("confirm", "")).strip() != "STOP_EVERYTHING":
+            raise HTTPException(
+                status_code=400,
+                detail='Kill switch requires confirmation. Send {"confirm":"STOP_EVERYTHING"}.',
+            )
+        cancel_pending = bool(body.get("cancel_pending", True))
+        square_off = bool(body.get("square_off", True))
+        rt = TradingRuntime.instance()
+        try:
+            return await rt.kill_switch(cancel_pending=cancel_pending, square_off=square_off)
+        except Exception as e:  # noqa: BLE001 — surface to UI
+            log.exception("kill_switch_error")
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    @app.post("/api/positions/close")
+    async def api_close_position(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Square-off ONE position. Body must include tradingsymbol, exchange,
+        symboltoken, net_qty (signed). Optional: producttype.
+        """
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        required = ("tradingsymbol", "exchange", "symboltoken", "net_qty")
+        missing = [k for k in required if body.get(k) in (None, "")]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"missing fields: {missing}")
+        rt = TradingRuntime.instance()
+        try:
+            return await rt.close_position(
+                tradingsymbol=str(body["tradingsymbol"]),
+                exchange=str(body["exchange"]),
+                symboltoken=str(body["symboltoken"]),
+                net_qty=int(body["net_qty"]),
+                producttype=body.get("producttype"),
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:  # noqa: BLE001
+            log.exception("close_position_error")
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
     @app.post("/api/disconnect")
     async def disconnect(x_dashboard_token: str | None = Header(default=None)) -> Any:

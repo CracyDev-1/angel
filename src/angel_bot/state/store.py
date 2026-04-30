@@ -69,6 +69,13 @@ class StateStore:
                 ("avg_price", "ALTER TABLE orders ADD COLUMN avg_price REAL"),
                 ("raw_last_json", "ALTER TABLE orders ADD COLUMN raw_last_json TEXT"),
                 ("updated_at", "ALTER TABLE orders ADD COLUMN updated_at TEXT"),
+                ("placed_by_bot", "ALTER TABLE orders ADD COLUMN placed_by_bot INTEGER DEFAULT 0"),
+                ("intent", "ALTER TABLE orders ADD COLUMN intent TEXT"),  # "open" | "close"
+                ("tradingsymbol", "ALTER TABLE orders ADD COLUMN tradingsymbol TEXT"),
+                ("exchange", "ALTER TABLE orders ADD COLUMN exchange TEXT"),
+                ("symboltoken", "ALTER TABLE orders ADD COLUMN symboltoken TEXT"),
+                ("transactiontype", "ALTER TABLE orders ADD COLUMN transactiontype TEXT"),
+                ("variety", "ALTER TABLE orders ADD COLUMN variety TEXT"),
             ]
             for name, ddl in migrations:
                 if name not in cols:
@@ -81,6 +88,8 @@ class StateStore:
         status: str,
         *,
         lifecycle_status: str | None = None,
+        placed_by_bot: bool = False,
+        intent: str | None = None,
     ) -> None:
         now = datetime.now(UTC).isoformat()
         ls = lifecycle_status or status
@@ -89,8 +98,11 @@ class StateStore:
                 """
                 INSERT INTO orders (
                   broker_order_id, payload_json, status, created_at,
-                  lifecycle_status, updated_at
-                ) VALUES (?,?,?,?,?,?)
+                  lifecycle_status, updated_at,
+                  placed_by_bot, intent,
+                  tradingsymbol, exchange, symboltoken,
+                  transactiontype, variety
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     broker_order_id,
@@ -99,6 +111,13 @@ class StateStore:
                     now,
                     ls,
                     now,
+                    1 if placed_by_bot else 0,
+                    intent,
+                    payload.get("tradingsymbol"),
+                    payload.get("exchange"),
+                    payload.get("symboltoken"),
+                    payload.get("transactiontype"),
+                    payload.get("variety"),
                 ),
             )
 
@@ -194,6 +213,36 @@ class StateStore:
         with self._connect() as con:
             rows = con.execute(
                 "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def bot_orders_today(self) -> list[dict[str, Any]]:
+        """All orders placed by the bot since UTC midnight today."""
+        start = datetime.now(UTC).date().isoformat()
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM orders
+                WHERE placed_by_bot = 1 AND created_at >= ?
+                ORDER BY id DESC
+                """,
+                (start,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def pending_bot_orders(self) -> list[dict[str, Any]]:
+        """Bot-placed orders that are still open (not filled / cancelled / rejected)."""
+        terminal = ("executed", "complete", "cancelled", "rejected")
+        with self._connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT * FROM orders
+                WHERE placed_by_bot = 1
+                  AND broker_order_id IS NOT NULL
+                  AND COALESCE(LOWER(lifecycle_status), '') NOT IN ({",".join("?" * len(terminal))})
+                ORDER BY id DESC
+                """,
+                terminal,
             ).fetchall()
             return [dict(r) for r in rows]
 

@@ -98,18 +98,38 @@ export type PositionsResponse = {
   error?: string;
 };
 
+export type ScoreBreakdown = {
+  total: number;
+  volatility: number;
+  momentum: number;
+  breakout: number;
+  volume: number;
+  inputs: Record<string, unknown>;
+};
+
+export type EntryCheck = { name: string; ok: boolean; detail: string };
+
 export type ScannerHit = {
   name: string;
   exchange: string;
   token: string;
   kind: string;
   last_price: number | null;
+  prev_close: number | null;
   change_pct: number | null;
-  momentum_5: number | null;
-  score: number;
   lot_size: number | null;
   notional_per_lot: number | null;
   affordable_lots: number | null;
+  score: number;
+  score_breakdown: ScoreBreakdown;
+  signal_side: "BUY_CALL" | "BUY_PUT" | "NO_TRADE";
+  signal_reason: string;
+  signal_confidence: number;
+  checks: EntryCheck[];
+  diagnostics: Record<string, unknown>;
+  candles_1m: number;
+  candles_5m: number;
+  candles_15m: number;
   as_of: string;
 };
 
@@ -118,7 +138,7 @@ export type DecisionRow = {
   name: string;
   exchange: string;
   token: string;
-  signal: "BUY_CALL" | "BUY_PUT" | "NO_TRADE";
+  signal: "BUY_CALL" | "BUY_PUT" | "NO_TRADE" | "MODE";
   reason: string;
   last_price: number | null;
   quantity: number;
@@ -167,19 +187,94 @@ export type ConfigResponse = {
   };
 };
 
+export type ScanSummaryTop = {
+  name: string;
+  kind: string;
+  ltp: number | null;
+  change_pct: number | null;
+  score: number;
+  score_breakdown: ScoreBreakdown;
+  signal_side: "BUY_CALL" | "BUY_PUT" | "NO_TRADE";
+  signal_reason: string;
+  signal_confidence: number;
+  affordable_lots: number | null;
+  candles_15m: number;
+  candles_5m: number;
+};
+
+export type ScanSummary = {
+  ts: string;
+  instruments_scanned: number;
+  available_cash: number;
+  deployable_cash: number;
+  open_positions: number;
+  reason: string;
+  top: ScanSummaryTop[];
+  min_score?: number;
+};
+
+export type ScannerBucket = {
+  kind: string;
+  count: number;
+  tradable: number;
+  names: string[];
+  top_name: string | null;
+  top_score: number;
+};
+
+export type ScannerByKind = { buckets: ScannerBucket[] };
+
+export type CePeSummary = {
+  ce_open: number;
+  pe_open: number;
+  capital_ce: number;
+  capital_pe: number;
+  pnl_ce: number;
+  pnl_pe: number;
+};
+
+export type BotToday = {
+  trades_placed: number;
+  pending: number;
+  filled: number;
+  rejected: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  net_pnl: number;
+};
+
 export type Snapshot = {
   connected: boolean;
   bot_running: boolean;
   trading_enabled: boolean;
   auto_mode: boolean;
   last_loop_at: string | null;
+  last_scan_summary: ScanSummary | null;
   bot_started_at: string | null;
   last_error: string | null;
   clientcode: string | null;
   funds: FundsResponse | null;
   positions: PositionsResponse | null;
   scanner: ScannerHit[];
+  scanner_by_kind: ScannerByKind;
+  ce_pe_summary: CePeSummary;
+  bot_today: BotToday;
   recent_orders: OrderRow[];
   decisions: DecisionRow[];
   daily: StatsResponse;
+};
+
+export type KillSwitchReport = {
+  stopped_bot: boolean;
+  set_dry_run: boolean;
+  cancelled: string[];
+  cancel_failures: { orderid: string; error: string }[];
+  squared_off: { symbol: string; side?: string; qty?: number; broker_order_id?: string | null; skipped?: string }[];
+  squareoff_failures: { symbol: string; error: string }[];
+};
+
+export type HistoryResponse = {
+  orders: OrderRow[];
+  all_days: { day: string; trades: number; pnl: number }[];
+  totals: { trades: number; realized_pnl: number; days_traded: number };
 };

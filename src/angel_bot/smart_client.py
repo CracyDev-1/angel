@@ -12,6 +12,7 @@ log = structlog.get_logger(__name__)
 
 LTP_PATH = "/rest/secure/angelbroking/order/v1/getLtpData"
 PLACE_ORDER_PATH = "/rest/secure/angelbroking/order/v1/placeOrder"
+CANCEL_ORDER_PATH = "/rest/secure/angelbroking/order/v1/cancelOrder"
 ORDER_BOOK_PATH = "/rest/secure/angelbroking/order/v1/getOrderBook"
 TRADE_BOOK_PATH = "/rest/secure/angelbroking/order/v1/getTradeBook"
 RMS_PATH = "/rest/secure/angelbroking/user/v1/getRMS"
@@ -49,6 +50,11 @@ class SmartApiClient:
     async def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
         await self.session.ensure_login()
         return await self._post_with_auth_retry(PLACE_ORDER_PATH, order)
+
+    async def cancel_order(self, *, variety: str, orderid: str) -> dict[str, Any]:
+        await self.session.ensure_login()
+        body = {"variety": variety, "orderid": orderid}
+        return await self._post_with_auth_retry(CANCEL_ORDER_PATH, body)
 
     async def order_book(self) -> dict[str, Any]:
         await self.session.ensure_login()

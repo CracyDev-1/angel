@@ -79,12 +79,48 @@ class Settings(BaseSettings):
 
     scanner_watchlist_json: str = Field(
         default=(
-            '{"NSE":[{"name":"NIFTY","token":"99926000","kind":"INDEX","lot_size":50},'
+            '{"NSE":['
+            '{"name":"NIFTY","token":"99926000","kind":"INDEX","lot_size":50},'
             '{"name":"BANKNIFTY","token":"99926009","kind":"INDEX","lot_size":15},'
-            '{"name":"FINNIFTY","token":"99926037","kind":"INDEX","lot_size":40}]}'
+            '{"name":"FINNIFTY","token":"99926037","kind":"INDEX","lot_size":40},'
+            '{"name":"RELIANCE","token":"2885","kind":"EQUITY","lot_size":250},'
+            '{"name":"HDFCBANK","token":"1333","kind":"EQUITY","lot_size":550},'
+            '{"name":"INFY","token":"1594","kind":"EQUITY","lot_size":400},'
+            '{"name":"TCS","token":"11536","kind":"EQUITY","lot_size":175},'
+            '{"name":"ICICIBANK","token":"4963","kind":"EQUITY","lot_size":700}'
+            ']}'
         ),
         validation_alias="SCANNER_WATCHLIST_JSON",
     )
+
+    # ------------------------- BRAIN STRATEGY ---------------------------
+    # Universe filters
+    strategy_min_volatility_pct: float = Field(
+        default=0.20, validation_alias="STRATEGY_MIN_VOLATILITY_PCT"
+    )
+    strategy_max_chop_score: float = Field(
+        default=0.55, validation_alias="STRATEGY_MAX_CHOP_SCORE"
+    )
+    # Entry timing
+    strategy_min_15m_trend_slope: float = Field(
+        default=0.0007, validation_alias="STRATEGY_MIN_15M_TREND_SLOPE"
+    )
+    strategy_min_breakout_clearance: float = Field(
+        default=0.0010, validation_alias="STRATEGY_MIN_BREAKOUT_CLEARANCE"
+    )
+    strategy_max_late_entry_pct: float = Field(
+        default=0.0040, validation_alias="STRATEGY_MAX_LATE_ENTRY_PCT"
+    )
+    strategy_min_above_twap_pct: float = Field(
+        default=0.0, validation_alias="STRATEGY_MIN_ABOVE_TWAP_PCT"
+    )
+    # Score weights (must sum to ~1.0; volume_w stays 0 until WS QUOTE wired)
+    score_w_volatility: float = Field(default=0.30, validation_alias="SCORE_W_VOLATILITY")
+    score_w_momentum: float = Field(default=0.40, validation_alias="SCORE_W_MOMENTUM")
+    score_w_breakout: float = Field(default=0.30, validation_alias="SCORE_W_BREAKOUT")
+    score_w_volume: float = Field(default=0.00, validation_alias="SCORE_W_VOLUME")
+    # Minimum score to even consider acting
+    strategy_min_score: float = Field(default=0.45, validation_alias="STRATEGY_MIN_SCORE")
 
     log_format: str = Field(default="console", validation_alias="LOG_FORMAT")
 

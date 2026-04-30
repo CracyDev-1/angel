@@ -15,12 +15,8 @@ class Candle:
     v: float = 0.0
 
 
-def _floor_minute(ts: datetime) -> datetime:
-    return ts.replace(second=0, microsecond=0)
-
-
-def _floor_5m(ts: datetime) -> datetime:
-    m = ts.minute - (ts.minute % 5)
+def _floor_minute(ts: datetime, step_minutes: int) -> datetime:
+    m = ts.minute - (ts.minute % step_minutes)
     return ts.replace(minute=m, second=0, microsecond=0)
 
 
@@ -35,86 +31,117 @@ class _BarState:
 
 
 class CandleAggregator:
-    """Rolling 1m / 5m OHLC from last traded prices (volume unknown → 0)."""
+    """Rolling 1m / 5m / 15m OHLC from last traded prices.
 
-    def __init__(self, *, max_1m: int = 300, max_5m: int = 200):
+    Volume is 0 unless a tick source provides it (Angel REST LTP doesn't).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_1m: int = 300,
+        max_5m: int = 200,
+        max_15m: int = 96,
+    ) -> None:
         self.max_1m = max_1m
         self.max_5m = max_5m
+        self.max_15m = max_15m
         self._1m: deque[Candle] = deque(maxlen=max_1m)
         self._5m: deque[Candle] = deque(maxlen=max_5m)
+        self._15m: deque[Candle] = deque(maxlen=max_15m)
         self._cur_1m: _BarState | None = None
         self._cur_5m: _BarState | None = None
+        self._cur_15m: _BarState | None = None
+        # session high/low/twap accumulator (since first push of the calendar day)
+        self._session_day: str | None = None
+        self.session_high: float | None = None
+        self.session_low: float | None = None
+        self._twap_sum: float = 0.0
+        self._twap_n: int = 0
 
+    # ------------------------------------------------------------------
+    # ingest
+    # ------------------------------------------------------------------
     def push_ltp(self, price: float, ts: datetime | None = None) -> None:
         ts = ts or datetime.now(UTC)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
-        b1 = _floor_minute(ts)
-        b5 = _floor_5m(ts)
 
-        if self._cur_1m is None or self._cur_1m.bucket_start != b1:
-            if self._cur_1m is not None:
-                self._1m.append(
+        # Reset session aggregates at calendar-day boundary (UTC).
+        day = ts.date().isoformat()
+        if day != self._session_day:
+            self._session_day = day
+            self.session_high = price
+            self.session_low = price
+            self._twap_sum = price
+            self._twap_n = 1
+        else:
+            self.session_high = price if self.session_high is None else max(self.session_high, price)
+            self.session_low = price if self.session_low is None else min(self.session_low, price)
+            self._twap_sum += price
+            self._twap_n += 1
+
+        self._update_bucket(price, ts, step=1, deck=self._1m, attr="_cur_1m")
+        self._update_bucket(price, ts, step=5, deck=self._5m, attr="_cur_5m")
+        self._update_bucket(price, ts, step=15, deck=self._15m, attr="_cur_15m")
+
+    def _update_bucket(
+        self,
+        price: float,
+        ts: datetime,
+        *,
+        step: int,
+        deck: deque[Candle],
+        attr: str,
+    ) -> None:
+        bucket_start = _floor_minute(ts, step)
+        cur: _BarState | None = getattr(self, attr)
+        if cur is None or cur.bucket_start != bucket_start:
+            if cur is not None:
+                deck.append(
                     Candle(
-                        ts=self._cur_1m.bucket_start,
-                        o=self._cur_1m.o,
-                        h=self._cur_1m.h,
-                        low=self._cur_1m.low,
-                        c=self._cur_1m.c,
-                        v=self._cur_1m.v,
+                        ts=cur.bucket_start, o=cur.o, h=cur.h, low=cur.low, c=cur.c, v=cur.v
                     )
                 )
-            self._cur_1m = _BarState(bucket_start=b1, o=price, h=price, low=price, c=price, v=0.0)
+            setattr(
+                self,
+                attr,
+                _BarState(bucket_start=bucket_start, o=price, h=price, low=price, c=price, v=0.0),
+            )
         else:
-            self._cur_1m.h = max(self._cur_1m.h, price)
-            self._cur_1m.low = min(self._cur_1m.low, price)
-            self._cur_1m.c = price
+            cur.h = max(cur.h, price)
+            cur.low = min(cur.low, price)
+            cur.c = price
 
-        if self._cur_5m is None or self._cur_5m.bucket_start != b5:
-            if self._cur_5m is not None:
-                self._5m.append(
-                    Candle(
-                        ts=self._cur_5m.bucket_start,
-                        o=self._cur_5m.o,
-                        h=self._cur_5m.h,
-                        low=self._cur_5m.low,
-                        c=self._cur_5m.c,
-                        v=self._cur_5m.v,
-                    )
-                )
-            self._cur_5m = _BarState(bucket_start=b5, o=price, h=price, low=price, c=price, v=0.0)
-        else:
-            self._cur_5m.h = max(self._cur_5m.h, price)
-            self._cur_5m.low = min(self._cur_5m.low, price)
-            self._cur_5m.c = price
+    # ------------------------------------------------------------------
+    # snapshots
+    # ------------------------------------------------------------------
+    def snapshot_lists(self) -> tuple[list[Candle], list[Candle], list[Candle]]:
+        """Closed candles only (in-progress bar excluded)."""
+        return (list(self._1m), list(self._5m), list(self._15m))
 
-    def snapshot_lists(self) -> tuple[list[Candle], list[Candle]]:
-        """Completed candles only (current in-progress bar excluded)."""
-        return (list(self._1m), list(self._5m))
+    def all_candles_including_partial(
+        self,
+    ) -> tuple[list[Candle], list[Candle], list[Candle]]:
+        return (
+            self._with_partial(self._1m, self._cur_1m),
+            self._with_partial(self._5m, self._cur_5m),
+            self._with_partial(self._15m, self._cur_15m),
+        )
 
-    def all_candles_including_partial(self) -> tuple[list[Candle], list[Candle]]:
-        one = list(self._1m)
-        five = list(self._5m)
-        if self._cur_1m is not None:
-            one = one + [
+    @staticmethod
+    def _with_partial(deck: deque[Candle], cur: _BarState | None) -> list[Candle]:
+        out = list(deck)
+        if cur is not None:
+            out.append(
                 Candle(
-                    ts=self._cur_1m.bucket_start,
-                    o=self._cur_1m.o,
-                    h=self._cur_1m.h,
-                    low=self._cur_1m.low,
-                    c=self._cur_1m.c,
-                    v=self._cur_1m.v,
+                    ts=cur.bucket_start, o=cur.o, h=cur.h, low=cur.low, c=cur.c, v=cur.v
                 )
-            ]
-        if self._cur_5m is not None:
-            five = five + [
-                Candle(
-                    ts=self._cur_5m.bucket_start,
-                    o=self._cur_5m.o,
-                    h=self._cur_5m.h,
-                    low=self._cur_5m.low,
-                    c=self._cur_5m.c,
-                    v=self._cur_5m.v,
-                )
-            ]
-        return (one, five)
+            )
+        return out
+
+    @property
+    def session_twap(self) -> float | None:
+        if self._twap_n <= 0:
+            return None
+        return self._twap_sum / self._twap_n

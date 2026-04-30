@@ -2,7 +2,9 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { apiGet, type StatusResponse } from "./lib/api";
 import LoginPage from "./pages/LoginPage";
-import DashboardPage from "./pages/DashboardPage";
+import DashboardLayout from "./pages/DashboardLayout";
+import LivePage from "./pages/LivePage";
+import HistoryPage from "./pages/HistoryPage";
 
 function useStatus(intervalMs = 4000) {
   return useQuery({
@@ -22,7 +24,7 @@ function RequireConnected({ children }: { children: JSX.Element }) {
 function RedirectIfConnected({ children }: { children: JSX.Element }) {
   const { data, isLoading } = useStatus(5000);
   if (isLoading) return <FullScreenLoader />;
-  if (data?.connected) return <Navigate to="/dashboard" replace />;
+  if (data?.connected) return <Navigate to="/dashboard/live" replace />;
   return children;
 }
 
@@ -49,11 +51,15 @@ export default function App() {
         path="/dashboard"
         element={
           <RequireConnected>
-            <DashboardPage />
+            <DashboardLayout />
           </RequireConnected>
         }
-      />
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      >
+        <Route index element={<Navigate to="live" replace />} />
+        <Route path="live" element={<LivePage />} />
+        <Route path="history" element={<HistoryPage />} />
+      </Route>
+      <Route path="*" element={<Navigate to="/dashboard/live" replace />} />
     </Routes>
   );
 }

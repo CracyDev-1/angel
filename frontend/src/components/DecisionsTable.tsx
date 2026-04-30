@@ -4,6 +4,7 @@ import { formatINR, formatTime } from "../lib/format";
 function signalPill(s: DecisionRow["signal"]): string {
   if (s === "BUY_CALL") return "pill-green";
   if (s === "BUY_PUT") return "pill-red";
+  if (s === "MODE") return "pill-blue";
   return "pill-slate";
 }
 

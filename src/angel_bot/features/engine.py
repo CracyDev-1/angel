@@ -74,7 +74,7 @@ def compute_features(
     if last_price is None:
         return FeatureSnapshot(last_price=None)
 
-    c1, c5 = agg.all_candles_including_partial()
+    c1, c5, _c15 = agg.all_candles_including_partial()
     snap = FeatureSnapshot(last_price=last_price, candles_1m=list(c1[-swing_lookback:]), candles_5m=list(c5[-swing_lookback:]))
 
     base = prev_close_for_ret or (c1[-2].c if len(c1) >= 2 else None)
