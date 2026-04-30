@@ -38,11 +38,14 @@ class ScannerHit:
 
     # capacity
     lot_size: int | None
-    notional_per_lot: float | None
+    notional_per_lot: float | None       # cost of ONE lot at current LTP
     affordable_lots: int | None
+    capital_short_for_one_lot: float | None = None  # how much MORE cash you need to buy 1 lot
+    in_trade_value_range: bool = True              # honors STRATEGY_MIN/MAX_TRADE_VALUE
+    capital_range_reason: str | None = None        # human reason if outside range
 
     # brain output
-    score: float                     # 0..1, ranking
+    score: float = 0.0               # 0..1, ranking
     score_breakdown: dict[str, Any] = field(default_factory=dict)
     signal_side: str = "NO_TRADE"
     signal_reason: str = "warmup"
@@ -72,13 +75,25 @@ class ScannerEngine:
         # caller still wants change_pct etc; brain itself uses the candles).
         self._series_count: dict[str, int] = defaultdict(int)
         self.brain = brain or BrainEngine(self._brain_config_from_settings())
+        # Dynamic watchlist override. When set (by the runtime via the
+        # universe builder), it takes precedence over SCANNER_WATCHLIST_JSON.
+        self._dynamic_watchlist: dict[str, list[dict[str, Any]]] | None = None
+
+    def set_watchlist(self, watchlist: dict[str, list[dict[str, Any]]] | None) -> None:
+        """Replace the active watchlist. Pass None to revert to the .env value."""
+        self._dynamic_watchlist = watchlist or None
+
+    def active_watchlist(self) -> dict[str, list[dict[str, Any]]]:
+        if self._dynamic_watchlist is not None:
+            return self._dynamic_watchlist
+        return self.settings.scanner_watchlist()
 
     @property
     def last_hits(self) -> list[ScannerHit]:
         return list(self._last_hits)
 
     def watchlist_meta_lookup(self) -> dict[tuple[str, str], dict[str, Any]]:
-        wl = self.settings.scanner_watchlist()
+        wl = self.active_watchlist()
         out: dict[tuple[str, str], dict[str, Any]] = {}
         for ex, items in wl.items():
             for it in items:
@@ -88,10 +103,22 @@ class ScannerEngine:
                 out[(ex.upper(), tok)] = it
         return out
 
+    def latest_prices(self) -> dict[tuple[str, str], float]:
+        """Snapshot of the most recent LTP for every symbol the scanner has seen.
+
+        Used by the paper trader to mark-to-market between cycles.
+        """
+        out: dict[tuple[str, str], float] = {}
+        for h in self._last_hits:
+            if h.last_price is None:
+                continue
+            out[(h.exchange.upper(), str(h.token))] = float(h.last_price)
+        return out
+
     async def poll_once(
         self, api: SmartApiClient, available_funds: float | None
     ) -> list[ScannerHit]:
-        wl = self.settings.scanner_watchlist()
+        wl = self.active_watchlist()
         if not wl:
             return []
         exchange_tokens: dict[str, list[str]] = {
@@ -137,8 +164,23 @@ class ScannerEngine:
             lot_size = int(m.get("lot_size") or 0) or None
             notional = (last * lot_size) if (last is not None and lot_size) else None
             affordable = None
+            shortfall: float | None = None
             if available_funds is not None and notional and notional > 0:
                 affordable = max(0, int(available_funds // notional))
+                if affordable < 1:
+                    shortfall = max(0.0, notional - float(available_funds))
+
+            in_range = True
+            range_reason: str | None = None
+            min_tv = self.settings.strategy_min_trade_value or 0.0
+            max_tv = self.settings.strategy_max_trade_value or 0.0
+            if notional is not None:
+                if min_tv > 0 and notional < min_tv:
+                    in_range = False
+                    range_reason = f"below_min_trade_value ({notional:.0f} < {min_tv:.0f})"
+                elif max_tv > 0 and notional > max_tv:
+                    in_range = False
+                    range_reason = f"above_max_trade_value ({notional:.0f} > {max_tv:.0f})"
 
             brain_out: BrainOutput = self.brain.evaluate(last_price=last, agg=agg)
             c1, c5, c15 = agg.all_candles_including_partial()
@@ -155,6 +197,9 @@ class ScannerEngine:
                     lot_size=lot_size,
                     notional_per_lot=notional,
                     affordable_lots=affordable,
+                    capital_short_for_one_lot=shortfall,
+                    in_trade_value_range=in_range,
+                    capital_range_reason=range_reason,
                     score=brain_out.score.total,
                     score_breakdown=brain_out.score.to_dict(),
                     signal_side=brain_out.signal.side,

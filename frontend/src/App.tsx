@@ -5,6 +5,7 @@ import LoginPage from "./pages/LoginPage";
 import DashboardLayout from "./pages/DashboardLayout";
 import LivePage from "./pages/LivePage";
 import HistoryPage from "./pages/HistoryPage";
+import UniversePage from "./pages/UniversePage";
 
 function useStatus(intervalMs = 4000) {
   return useQuery({
@@ -58,6 +59,7 @@ export default function App() {
         <Route index element={<Navigate to="live" replace />} />
         <Route path="live" element={<LivePage />} />
         <Route path="history" element={<HistoryPage />} />
+        <Route path="universe" element={<UniversePage />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard/live" replace />} />
     </Routes>

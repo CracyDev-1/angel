@@ -4,14 +4,59 @@
 
 :root {
   color-scheme: dark;
+  /* Theme accent — flipped at runtime by toggling .mode-live / .mode-dryrun
+     on <body>. Dry-run = cool blue (safe / sandbox), Live = warm amber (real money). */
+  --accent-r: 56;
+  --accent-g: 189;
+  --accent-b: 248;             /* sky-400 */
+  --accent-soft: rgba(56, 189, 248, 0.12);
+  --accent-strong: rgba(56, 189, 248, 0.45);
+  --accent-text: #7dd3fc;      /* sky-300 */
+  --bg-tint-1: #1e293b;
+  --bg-tint-2: #0b1120;
+  --bg-tint-3: #060912;
+  --mode-banner-bg: rgba(56, 189, 248, 0.10);
+  --mode-banner-border: rgba(56, 189, 248, 0.35);
+  --mode-banner-text: #bae6fd;
+}
+
+body.mode-live {
+  --accent-r: 251;
+  --accent-g: 146;
+  --accent-b: 60;              /* orange-400 */
+  --accent-soft: rgba(251, 146, 60, 0.12);
+  --accent-strong: rgba(251, 146, 60, 0.50);
+  --accent-text: #fdba74;      /* orange-300 */
+  --bg-tint-1: #2a1810;
+  --bg-tint-2: #100806;
+  --bg-tint-3: #07040a;
+  --mode-banner-bg: rgba(244, 63, 94, 0.10);
+  --mode-banner-border: rgba(244, 63, 94, 0.45);
+  --mode-banner-text: #fecaca;
+}
+
+body.mode-dryrun {
+  --accent-r: 56;
+  --accent-g: 189;
+  --accent-b: 248;
+  --accent-soft: rgba(56, 189, 248, 0.12);
+  --accent-strong: rgba(56, 189, 248, 0.45);
+  --accent-text: #7dd3fc;
+  --bg-tint-1: #112240;
+  --bg-tint-2: #060d20;
+  --bg-tint-3: #02040c;
+  --mode-banner-bg: rgba(56, 189, 248, 0.10);
+  --mode-banner-border: rgba(56, 189, 248, 0.35);
+  --mode-banner-text: #bae6fd;
 }
 
 html, body, #root { height: 100%; }
 body {
-  background: radial-gradient(1200px 800px at 70% -10%, #1e293b 0%, #0b1120 50%, #060912 100%);
+  background: radial-gradient(1200px 800px at 70% -10%, var(--bg-tint-1) 0%, var(--bg-tint-2) 50%, var(--bg-tint-3) 100%);
   color: #e2e8f0;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Inter, sans-serif;
   -webkit-font-smoothing: antialiased;
+  transition: background 600ms ease;
 }
 
 @layer components {
@@ -35,6 +80,19 @@ body {
   }
   .table-th { @apply text-left text-xs uppercase tracking-wider text-slate-400 px-3 py-2 font-medium; }
   .table-td { @apply px-3 py-2 text-sm border-t border-white/5; }
+
+  /* Mode-aware accents (use CSS vars set by body.mode-*) */
+  .mode-banner {
+    background-color: var(--mode-banner-bg);
+    border-color: var(--mode-banner-border);
+    color: var(--mode-banner-text);
+  }
+  .accent-text { color: var(--accent-text); }
+  .accent-bg-soft { background-color: var(--accent-soft); }
+  .accent-border { border-color: var(--accent-strong); }
+  .accent-ring {
+    box-shadow: 0 0 0 1px var(--accent-strong), 0 12px 30px -10px var(--accent-soft);
+  }
 }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }

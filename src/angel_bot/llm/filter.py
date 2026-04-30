@@ -1,7 +1,32 @@
+"""Optional OpenAI risk-filter for trade attempts.
+
+The LLM does **not** decide trades. It only acts as a veto gate AFTER the
+rule-based brain (`strategy/brain.py`) has already produced a BUY_CALL or
+BUY_PUT signal AND after all funds/risk checks have passed.
+
+Flow (in `runtime._consider_trade`):
+
+    brain → BUY_CALL on NIFTY
+        ↓
+    risk + funds + lot-fit checks pass
+        ↓
+    llm_filter_setup(market_context, "BUY_CALL @ NIFTY24500CE")
+        ↓
+    YES → place order
+    NO / AVOID / error (and fail-closed) → skip, log the reason
+
+Safety:
+  * No API keys / JWTs / broker tokens / client codes are EVER sent.
+  * Strict JSON output. Anything else → AVOID.
+  * Configurable fail-open vs fail-closed for outages.
+  * Hard timeout (default 8s) so a slow LLM never holds up the trade loop.
+"""
+
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
@@ -14,12 +39,60 @@ log = structlog.get_logger(__name__)
 LLMVerdict = Literal["YES", "NO", "AVOID"]
 
 
+@dataclass
+class LlmDecision:
+    """Structured result from the LLM filter."""
+
+    verdict: LLMVerdict          # YES / NO / AVOID
+    allowed: bool                # True iff verdict == "YES"
+    reason: str                  # short text the model returned (or our fallback)
+    source: str                  # "openai" / "disabled" / "no_key" / "error" / "fail_closed"
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": self.verdict,
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "source": self.source,
+        }
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
+    text = (text or "").strip()
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:
-        raise ValueError("LLM did not return JSON object")
+        raise ValueError("LLM did not return a JSON object")
     return json.loads(m.group(0))
+
+
+# Keys we will NEVER forward to the LLM, even if they appear in market_context.
+_REDACT_KEYS: frozenset[str] = frozenset({
+    "api_key", "apikey", "x-privatekey",
+    "jwt", "jwtToken", "access_token", "refresh_token", "feed_token",
+    "clientcode", "client_code", "ANGEL_PIN", "pin", "totp",
+    "OPENAI_API_KEY", "openai_api_key", "Authorization",
+    "symboltoken", "token",  # broker tokens — model doesn't need them
+})
+
+
+def sanitize_context(ctx: Any) -> Any:
+    """Strip secrets / broker-specific identifiers from any nested dict/list."""
+    if isinstance(ctx, dict):
+        out: dict[str, Any] = {}
+        for k, v in ctx.items():
+            if k in _REDACT_KEYS:
+                continue
+            out[k] = sanitize_context(v)
+        return out
+    if isinstance(ctx, list):
+        return [sanitize_context(x) for x in ctx]
+    return ctx
+
+
+def _disabled(reason: str) -> LlmDecision:
+    """Helper for short-circuit paths that should pass-through (no veto)."""
+    return LlmDecision(verdict="YES", allowed=True, reason=reason, source="disabled")
 
 
 async def llm_filter_setup(
@@ -27,45 +100,107 @@ async def llm_filter_setup(
     market_context: dict[str, Any],
     proposed_signal: str,
     settings: Settings | None = None,
-) -> LLMVerdict:
-    """
-    Optional filter only. Returns YES / NO / AVOID from strict JSON.
-    Does not place orders. Never include API keys or broker tokens in `market_context`.
+    client: httpx.AsyncClient | None = None,
+) -> LlmDecision:
+    """Ask the LLM whether to allow a proposed trade.
+
+    Returns an ``LlmDecision`` with ``allowed=True`` for YES; False otherwise.
+    Designed to be a strict veto, not a generator. If no API key is configured
+    or the filter is disabled, the trade is allowed unconditionally.
     """
     settings = settings or get_settings()
+
+    if not settings.llm_filter_enabled:
+        return _disabled("LLM_FILTER_ENABLED=false")
+
     key = settings.openai_api_key
     if not key:
-        log.info("llm_filter_skipped", reason="no OPENAI_API_KEY")
-        return "YES"
+        return LlmDecision(
+            verdict="YES", allowed=True, reason="OPENAI_API_KEY not set", source="no_key"
+        )
+
+    safe_ctx = sanitize_context(market_context)
 
     system = (
-        "You are a risk filter for an existing rule-based trade setup. "
-        "You do NOT decide entries alone. Reply with ONE JSON object only: "
-        '{"verdict":"YES"|"NO"|"AVOID","reason":"short text"}. '
-        "Use NO or AVOID when context is ambiguous, stale, or late/choppy."
+        "You are a risk filter for an existing rule-based options/equity trade setup. "
+        "The rule-based brain has already decided to take this trade. Your job is "
+        "to look at the live market context and answer ONLY whether to ALLOW it. "
+        "You do NOT generate new trades. Reply with EXACTLY ONE JSON object: "
+        '{"verdict":"YES"|"NO"|"AVOID","reason":"<=120 chars"}. '
+        "Use NO when momentum/trend is clearly against the proposed direction. "
+        "Use AVOID when context is stale, choppy, late in the move, or ambiguous. "
+        "Use YES otherwise."
     )
-    user = json.dumps({"proposed_signal": proposed_signal, "market": market_context})
+    user = json.dumps({"proposed_signal": proposed_signal, "market": safe_ctx}, default=str)
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {key.get_secret_value()}",
-        "Content-Type": "application/json",
-    }
     body = {
         "model": settings.openai_model,
         "temperature": 0,
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(url, headers=headers, json=body)
-        r.raise_for_status()
-        data = r.json()
-    content = data["choices"][0]["message"]["content"]
-    parsed = _extract_json_object(content)
-    verdict = parsed.get("verdict", "AVOID")
-    if verdict not in ("YES", "NO", "AVOID"):
-        return "AVOID"
-    return verdict  # type: ignore[return-value]
+    headers = {
+        "Authorization": f"Bearer {key.get_secret_value()}",
+        "Content-Type": "application/json",
+    }
+    url = "https://api.openai.com/v1/chat/completions"
+    timeout = max(1.0, float(settings.llm_filter_timeout_s))
+
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=timeout)
+
+    try:
+        try:
+            r = await client.post(url, headers=headers, json=body, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+        except httpx.HTTPError as e:
+            log.warning("llm_filter_http_error", error=str(e))
+            return _on_error(settings, f"http_error:{type(e).__name__}")
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            log.warning("llm_filter_bad_shape", error=str(e), raw=data)
+            return _on_error(settings, "bad_response_shape")
+
+        try:
+            parsed = _extract_json_object(content)
+        except (ValueError, json.JSONDecodeError) as e:
+            log.warning("llm_filter_non_json", error=str(e), raw=content[:200])
+            return _on_error(settings, "non_json_reply")
+
+        verdict_raw = str(parsed.get("verdict", "AVOID")).strip().upper()
+        if verdict_raw not in ("YES", "NO", "AVOID"):
+            verdict_raw = "AVOID"
+        reason = str(parsed.get("reason", "")).strip()[:200] or "no_reason"
+        verdict: LLMVerdict = verdict_raw  # type: ignore[assignment]
+        return LlmDecision(
+            verdict=verdict,
+            allowed=(verdict == "YES"),
+            reason=reason,
+            source="openai",
+            raw={"model": settings.openai_model},
+        )
+    finally:
+        if own_client:
+            await client.aclose()
+
+
+def _on_error(settings: Settings, reason: str) -> LlmDecision:
+    """Apply the configured fail-open / fail-closed policy."""
+    if settings.llm_filter_fail_closed:
+        return LlmDecision(
+            verdict="AVOID", allowed=False,
+            reason=f"llm_unavailable:{reason} (fail-closed)",
+            source="fail_closed",
+        )
+    return LlmDecision(
+        verdict="YES", allowed=True,
+        reason=f"llm_unavailable:{reason} (fail-open)",
+        source="error",
+    )

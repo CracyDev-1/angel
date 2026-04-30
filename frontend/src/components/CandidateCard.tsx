@@ -57,8 +57,27 @@ export default function CandidateCard({ row, isTop }: { row: ScannerHit; isTop: 
             <span className={`${sideClass} text-[10px]`}>{row.signal_side.replace("BUY_", "")}</span>
           </div>
           <div className="mt-1 text-xs text-slate-400">
-            LTP {formatINR(row.last_price)} • Δ {formatPct(row.change_pct)} • {row.affordable_lots ?? 0} lots affordable
+            LTP {formatINR(row.last_price)} • Δ {formatPct(row.change_pct)} •{" "}
+            {row.affordable_lots ?? 0} lots affordable
+            {row.notional_per_lot ? (
+              <>
+                {" "}
+                • 1 lot ={" "}
+                <span className="text-slate-200">{formatINR(row.notional_per_lot)}</span>
+              </>
+            ) : null}
           </div>
+          {row.affordable_lots !== null && row.affordable_lots < 1 && row.capital_short_for_one_lot ? (
+            <div className="mt-1 text-[11px] text-amber-300">
+              Need <span className="font-semibold">{formatINR(row.capital_short_for_one_lot)}</span>{" "}
+              more cash to take 1 lot.
+            </div>
+          ) : null}
+          {!row.in_trade_value_range && row.capital_range_reason ? (
+            <div className="mt-1 text-[11px] text-amber-300">
+              Lot value out of configured range — {row.capital_range_reason}.
+            </div>
+          ) : null}
           <div className="mt-2 text-sm text-slate-200">{headline}</div>
         </div>
         <div className="text-right">

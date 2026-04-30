@@ -47,8 +47,18 @@ class Settings(BaseSettings):
 
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_MODEL")
+    # When true, the LLM is asked YES/NO/AVOID *after* the rule-based brain has
+    # decided to trade. The LLM can only veto, never create trades. Auto-on
+    # whenever OPENAI_API_KEY is set; flip to false to disable temporarily.
+    llm_filter_enabled: bool = Field(default=True, validation_alias="LLM_FILTER_ENABLED")
+    # If the LLM call times out / errors / returns garbage:
+    #   true  → treat as veto (safe: skip the trade, log the reason)
+    #   false → fall through and let the trade go (faster, riskier)
+    llm_filter_fail_closed: bool = Field(default=True, validation_alias="LLM_FILTER_FAIL_CLOSED")
+    llm_filter_timeout_s: float = Field(default=8.0, validation_alias="LLM_FILTER_TIMEOUT_S")
 
-    risk_capital_rupees: float = Field(default=100_000.0, validation_alias="RISK_CAPITAL_RUPEES")
+    # 0 = auto: use live broker available cash. Any positive value overrides.
+    risk_capital_rupees: float = Field(default=0.0, validation_alias="RISK_CAPITAL_RUPEES")
     risk_per_trade_pct: float = Field(default=0.75, validation_alias="RISK_PER_TRADE_PCT")
     risk_max_daily_loss_pct: float = Field(default=2.5, validation_alias="RISK_MAX_DAILY_LOSS_PCT")
     risk_max_trades_per_day: int = Field(default=4, validation_alias="RISK_MAX_TRADES_PER_DAY")
@@ -56,7 +66,35 @@ class Settings(BaseSettings):
         default=True, validation_alias="RISK_ONE_POSITION_AT_A_TIME"
     )
 
+    # Legacy name — still respected for backwards-compat. Prefer
+    # INSTRUMENT_MASTER_PATH below (works for JSON + CSV).
     instrument_master_csv: str | None = Field(default=None, validation_alias="INSTRUMENT_MASTER_CSV")
+    instrument_master_path: str | None = Field(
+        default="./data/angel_scrip_master.json",
+        validation_alias="INSTRUMENT_MASTER_PATH",
+    )
+    instrument_master_url: str = Field(
+        default="https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+        validation_alias="INSTRUMENT_MASTER_URL",
+    )
+    instrument_master_auto_download: bool = Field(
+        default=True, validation_alias="INSTRUMENT_MASTER_AUTO_DOWNLOAD"
+    )
+    # Re-download if the local cache is older than this many hours.
+    instrument_master_max_age_hours: float = Field(
+        default=20.0, validation_alias="INSTRUMENT_MASTER_MAX_AGE_HOURS"
+    )
+
+    # Dynamic universe — overrides SCANNER_WATCHLIST_JSON when set, and
+    # ATM option contracts are recomputed every ATM_REFRESH_INTERVAL_S seconds
+    # using the latest spot price from the scanner.
+    universe_spec_json: str = Field(
+        default="",
+        validation_alias="UNIVERSE_SPEC_JSON",
+    )
+    atm_refresh_interval_s: float = Field(
+        default=120.0, validation_alias="ATM_REFRESH_INTERVAL_S"
+    )
 
     dashboard_host: str = Field(default="127.0.0.1", validation_alias="DASHBOARD_HOST")
     dashboard_port: int = Field(default=9812, validation_alias="DASHBOARD_PORT")
@@ -121,6 +159,39 @@ class Settings(BaseSettings):
     score_w_volume: float = Field(default=0.00, validation_alias="SCORE_W_VOLUME")
     # Minimum score to even consider acting
     strategy_min_score: float = Field(default=0.45, validation_alias="STRATEGY_MIN_SCORE")
+    # Hard capital range per trade (per-lot notional). 0 disables the bound.
+    strategy_min_trade_value: float = Field(
+        default=0.0, validation_alias="STRATEGY_MIN_TRADE_VALUE"
+    )
+    strategy_max_trade_value: float = Field(
+        default=0.0, validation_alias="STRATEGY_MAX_TRADE_VALUE"
+    )
+
+    # ------------------------- DRY-RUN / PAPER --------------------------
+    # When 0, dry-run sizing uses live broker available cash. Set > 0 to
+    # let the user simulate "what trades would the bot take with ₹X?"
+    # without touching the real account. Adjustable in real time via the
+    # dashboard; this is just the startup default.
+    dryrun_capital_override: float = Field(
+        default=0.0, validation_alias="DRYRUN_CAPITAL_OVERRIDE"
+    )
+    paper_stop_loss_pct: float = Field(default=0.01, validation_alias="PAPER_STOP_LOSS_PCT")
+    paper_take_profit_pct: float = Field(default=0.02, validation_alias="PAPER_TAKE_PROFIT_PCT")
+    paper_max_hold_minutes: int = Field(default=90, validation_alias="PAPER_MAX_HOLD_MINUTES")
+    paper_max_open_positions: int = Field(
+        default=5, validation_alias="PAPER_MAX_OPEN_POSITIONS"
+    )
+
+    # ------------------------- RATE LIMITS ------------------------------
+    # Client-side guard for the published Angel One quotas
+    # (https://smartapi.angelone.in/docs/RateLimit). Disabling this is only
+    # safe in offline tests where the broker is not real.
+    rate_limit_enabled: bool = Field(default=True, validation_alias="RATE_LIMIT_ENABLED")
+    # 0..1 — run at this fraction of the documented cap to leave headroom
+    # for in-flight retries and clock skew.
+    rate_limit_safety_factor: float = Field(
+        default=0.9, validation_alias="RATE_LIMIT_SAFETY_FACTOR"
+    )
 
     log_format: str = Field(default="console", validation_alias="LOG_FORMAT")
 
@@ -156,6 +227,18 @@ class Settings(BaseSettings):
                 continue
             out[str(ex).upper()] = [dict(it) for it in items if isinstance(it, dict)]
         return out
+
+    def universe_spec(self) -> dict[str, Any] | None:
+        raw = (self.universe_spec_json or "").strip()
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"UNIVERSE_SPEC_JSON is not valid JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError("UNIVERSE_SPEC_JSON must be a JSON object")
+        return data
 
 
 @lru_cache

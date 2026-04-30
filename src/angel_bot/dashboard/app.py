@@ -30,6 +30,18 @@ def _check_dashboard_token(x_dashboard_token: str | None) -> None:
 async def lifespan(app: FastAPI):
     rt = TradingRuntime.instance()
     s = get_settings()
+    # Always try to load the instrument master at startup so dynamic
+    # universe + ATM resolution work from the very first scanner cycle.
+    try:
+        master_res = await rt.ensure_master(force_download=False)
+        log.info(
+            "instrument_master_ready",
+            ok=master_res.get("ok"),
+            instruments=(master_res.get("status") or {}).get("instruments"),
+            source=(master_res.get("status") or {}).get("source"),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("instrument_master_startup_failed", error=str(e))
     if s.auto_connect_on_startup and rt.auto_mode:
         try:
             res = await rt.auto_connect()
@@ -206,9 +218,86 @@ def create_app() -> FastAPI:
         return TradingRuntime.instance().set_trading_enabled(False)
 
     @app.get("/api/history")
-    async def api_history(x_dashboard_token: str | None = Header(default=None)) -> Any:
+    async def api_history(
+        mode: str = "live",
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
         _check_dashboard_token(x_dashboard_token)
-        return TradingRuntime.instance().history(orders_limit=200)
+        return TradingRuntime.instance().history(orders_limit=200, mode=mode)
+
+    @app.post("/api/dryrun/capital")
+    async def api_set_dryrun_capital(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Set the capital the dry-run sim should use for sizing.
+
+        Body: {"amount": <float ₹, 0 = use real broker cash>}.
+        """
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        amount = body.get("amount")
+        if amount is None:
+            raise HTTPException(status_code=400, detail="missing 'amount'")
+        try:
+            amt = float(amount)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid amount: {e}") from e
+        if amt < 0:
+            raise HTTPException(status_code=400, detail="amount must be >= 0")
+        return TradingRuntime.instance().set_dryrun_capital(amt)
+
+    @app.get("/api/dryrun/paper")
+    async def api_paper_positions(x_dashboard_token: str | None = Header(default=None)) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        rt = TradingRuntime.instance()
+        return {
+            "open": rt.paper.open_positions_summary(),
+            "today": rt.paper.today_summary(),
+        }
+
+    @app.post("/api/dryrun/reset")
+    async def api_reset_paper(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Wipe paper book, dry-run daily P&L and dry-run order history.
+        Body: {"confirm": "RESET_DRYRUN"}."""
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if str(body.get("confirm", "")).strip() != "RESET_DRYRUN":
+            raise HTTPException(
+                status_code=400,
+                detail='Send {"confirm":"RESET_DRYRUN"} to wipe paper history.',
+            )
+        return TradingRuntime.instance().reset_paper()
+
+    @app.post("/api/dryrun/paper/close")
+    async def api_paper_close(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Close a single open paper position at its last marked price.
+        Body: {"id": <paper_id>}."""
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        pid = body.get("id")
+        if pid is None:
+            raise HTTPException(status_code=400, detail="missing 'id'")
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid id: {e}") from e
+        return TradingRuntime.instance().close_paper_position(pid_int)
 
     @app.post("/api/kill-switch")
     async def api_kill_switch(
@@ -269,6 +358,86 @@ def create_app() -> FastAPI:
         except Exception as e:  # noqa: BLE001
             log.exception("close_position_error")
             raise HTTPException(status_code=500, detail=str(e)) from e
+
+    @app.get("/api/instruments/status")
+    async def api_instruments_status(x_dashboard_token: str | None = Header(default=None)) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        rt = TradingRuntime.instance()
+        st = rt.master_status
+        return {
+            "loaded": rt.master is not None,
+            "instruments": (len(rt.master) if rt.master else 0),
+            "status": (st.__dict__ if st else None),
+        }
+
+    @app.post("/api/instruments/refresh")
+    async def api_instruments_refresh(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """(Re)download the Angel scrip master and rebuild the dynamic universe.
+        Body: optional {"force": true} to bypass the cache freshness check."""
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        force = bool(body.get("force", False))
+        return await TradingRuntime.instance().ensure_master(force_download=force)
+
+    @app.get("/api/instruments/search")
+    async def api_instruments_search(
+        q: str,
+        exchange: str | None = None,
+        kind: str | None = None,
+        limit: int = 25,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        return TradingRuntime.instance().search_instruments(
+            q, exchange=exchange, kind=kind, limit=int(limit)
+        )
+
+    @app.get("/api/universe")
+    async def api_universe_get(x_dashboard_token: str | None = Header(default=None)) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        return TradingRuntime.instance().universe_state()
+
+    @app.post("/api/universe")
+    async def api_universe_set(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Replace the live universe spec at runtime.
+        Body: {"indices": [...], "stocks": [...], "commodities": [...],
+               "atm_for": [...], "atm_offsets": [-1,0,1]}."""
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        return TradingRuntime.instance().set_universe_spec(body)
+
+    @app.post("/api/universe/kinds")
+    async def api_universe_kinds(
+        request: Request,
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        """Toggle which instrument categories the bot watches and trades.
+        Body: {"INDEX": true|false, "EQUITY": true|false,
+               "COMMODITY": true|false, "OPTION": true|false}.
+        Disabled kinds are dropped from the watchlist (no API polls) and
+        cannot be traded until re-enabled."""
+        _check_dashboard_token(x_dashboard_token)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        return TradingRuntime.instance().set_kind_enabled(body)
 
     @app.post("/api/disconnect")
     async def disconnect(x_dashboard_token: str | None = Header(default=None)) -> Any:

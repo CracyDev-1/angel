@@ -7,12 +7,14 @@ import httpx
 import structlog
 
 from angel_bot.config import Settings, get_settings
+from angel_bot.ratelimit import get_rate_limiter, looks_rate_limited
 
 log = structlog.get_logger(__name__)
 
 LOGIN_PATH = "/rest/auth/angelbroking/user/v1/loginByPassword"
 REFRESH_PATH = "/rest/auth/angelbroking/jwt/v1/generateTokens"
 PROFILE_PATH = "/rest/secure/angelbroking/user/v1/getProfile"
+LOGOUT_PATH = "/rest/secure/angelbroking/user/v1/logout"
 
 
 class AngelHttpError(RuntimeError):
@@ -82,7 +84,14 @@ class AngelSession:
     def __init__(self, settings: Settings | None = None, client: httpx.AsyncClient | None = None):
         self.settings = settings or get_settings()
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(base_url=self.settings.angel_base_url, timeout=30.0)
+        self._client = client or httpx.AsyncClient(
+            base_url=self.settings.angel_base_url,
+            timeout=30.0,
+            # Some Angel endpoints 301-redirect to the trailing-slash variant.
+            # Without this, POST redirects return an empty body and downstream
+            # parsers see "Non-JSON response: ''".
+            follow_redirects=True,
+        )
         self.jwt: str | None = None
         self.refresh_token: str | None = None
         self.feed_token: str | None = None
@@ -192,18 +201,9 @@ class AngelSession:
         jwt: str | None = None,
     ) -> dict[str, Any]:
         headers = _public_headers(self.settings, with_auth=auth, jwt=jwt)
+        await get_rate_limiter().acquire(path)
         r = await self._client.post(path, json=json, headers=headers)
-        try:
-            payload = r.json()
-        except Exception as exc:
-            raise AngelHttpError(f"Non-JSON response: {r.text[:500]}", status_code=r.status_code) from exc
-        if r.status_code >= 400:
-            raise AngelHttpError(
-                f"HTTP {r.status_code} for {path}",
-                status_code=r.status_code,
-                body=payload,
-            )
-        return payload
+        return self._handle_response(r, path)
 
     async def _get_json(
         self,
@@ -213,11 +213,26 @@ class AngelSession:
         jwt: str | None,
     ) -> dict[str, Any]:
         headers = _public_headers(self.settings, with_auth=True, jwt=jwt)
+        await get_rate_limiter().acquire(path)
         r = await self._client.get(path, params=params, headers=headers)
+        return self._handle_response(r, path)
+
+    def _handle_response(self, r: httpx.Response, path: str) -> dict[str, Any]:
         try:
             payload = r.json()
         except Exception as exc:
-            raise AngelHttpError(f"Non-JSON response: {r.text[:500]}", status_code=r.status_code) from exc
+            if looks_rate_limited(status_code=r.status_code, body=r.text):
+                get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+            raise AngelHttpError(
+                f"Non-JSON response: {r.text[:500]}", status_code=r.status_code
+            ) from exc
+        if looks_rate_limited(status_code=r.status_code, body=payload):
+            get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+            raise AngelHttpError(
+                f"Rate limited by broker for {path}",
+                status_code=r.status_code,
+                body=payload,
+            )
         if r.status_code >= 400:
             raise AngelHttpError(
                 f"HTTP {r.status_code} for {path}",

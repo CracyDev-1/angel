@@ -48,19 +48,19 @@ export default function Header(p: Props) {
 
         {p.tradingEnabled ? (
           <button
-            className="pill-amber hover:opacity-80"
+            className="pill-red hover:opacity-80"
             onClick={p.onGoDryRun}
             disabled={p.switchingMode}
-            title="Switch the bot back to dry-run (no real orders)."
+            title="Switch back to dry-run (no real orders)."
           >
-            LIVE TRADING ✓
+            LIVE — switch to dry-run?
           </button>
         ) : (
           <button
-            className="pill-slate hover:opacity-80"
+            className="pill-blue hover:opacity-80"
             onClick={p.onRequestGoLive}
             disabled={p.switchingMode}
-            title="Switch the bot from dry-run to live (sends real orders)."
+            title="Switch from dry-run paper trading to live (sends real orders)."
           >
             DRY RUN — go live?
           </button>

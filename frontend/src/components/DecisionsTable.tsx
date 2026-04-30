@@ -1,4 +1,4 @@
-import type { DecisionRow } from "../lib/api";
+import type { DecisionRow, LlmDecisionInfo } from "../lib/api";
 import { formatINR, formatTime } from "../lib/format";
 
 function signalPill(s: DecisionRow["signal"]): string {
@@ -6,6 +6,42 @@ function signalPill(s: DecisionRow["signal"]): string {
   if (s === "BUY_PUT") return "pill-red";
   if (s === "MODE") return "pill-blue";
   return "pill-slate";
+}
+
+function LlmBadge({ llm }: { llm: LlmDecisionInfo | undefined }) {
+  if (!llm) return <span className="text-xs text-slate-500">—</span>;
+  // Source explains *why* we got this verdict (real openai vs disabled vs error).
+  const cls =
+    llm.verdict === "YES"
+      ? "pill-green"
+      : llm.verdict === "NO"
+      ? "pill-red"
+      : "pill-amber";
+  const sourceLabel =
+    llm.source === "openai"
+      ? "AI"
+      : llm.source === "fail_closed"
+      ? "AI down"
+      : llm.source === "disabled"
+      ? "off"
+      : llm.source === "no_key"
+      ? "no key"
+      : "AI err";
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className={cls} title={llm.reason}>
+        {sourceLabel}: {llm.verdict}
+      </span>
+      {llm.reason ? (
+        <span
+          className="max-w-[220px] truncate text-[10px] text-slate-500"
+          title={llm.reason}
+        >
+          {llm.reason}
+        </span>
+      ) : null}
+    </div>
+  );
 }
 
 export default function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
@@ -28,6 +64,7 @@ export default function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
             <th className="table-th">Qty (lots)</th>
             <th className="table-th">Capital</th>
             <th className="table-th">Reason</th>
+            <th className="table-th">AI veto</th>
             <th className="table-th">Mode</th>
             <th className="table-th">Order id</th>
           </tr>
@@ -55,6 +92,9 @@ export default function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
               <td className="table-td">{d.quantity} ({d.lots})</td>
               <td className="table-td">{formatINR(d.capital_used)}</td>
               <td className="table-td text-xs text-slate-300">{d.reason}</td>
+              <td className="table-td">
+                <LlmBadge llm={d.extra?.llm} />
+              </td>
               <td className="table-td">
                 {d.dry_run ? <span className="pill-slate">dry-run</span> : <span className="pill-amber">live</span>}
               </td>

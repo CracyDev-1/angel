@@ -120,6 +120,9 @@ export type ScannerHit = {
   lot_size: number | null;
   notional_per_lot: number | null;
   affordable_lots: number | null;
+  capital_short_for_one_lot: number | null;
+  in_trade_value_range: boolean;
+  capital_range_reason: string | null;
   score: number;
   score_breakdown: ScoreBreakdown;
   signal_side: "BUY_CALL" | "BUY_PUT" | "NO_TRADE";
@@ -131,6 +134,13 @@ export type ScannerHit = {
   candles_5m: number;
   candles_15m: number;
   as_of: string;
+};
+
+export type LlmDecisionInfo = {
+  verdict: "YES" | "NO" | "AVOID";
+  allowed: boolean;
+  reason: string;
+  source: "openai" | "disabled" | "no_key" | "error" | "fail_closed";
 };
 
 export type DecisionRow = {
@@ -148,6 +158,7 @@ export type DecisionRow = {
   placed: boolean;
   dry_run: boolean;
   broker_order_id?: string | null;
+  extra?: { llm?: LlmDecisionInfo; underlying?: string; [k: string]: unknown };
 };
 
 export type OrderRow = {
@@ -234,6 +245,7 @@ export type CePeSummary = {
 };
 
 export type BotToday = {
+  mode?: "live" | "dryrun";
   trades_placed: number;
   pending: number;
   filled: number;
@@ -243,10 +255,148 @@ export type BotToday = {
   net_pnl: number;
 };
 
+export type PaperPosition = {
+  id: number;
+  tradingsymbol: string;
+  exchange: string;
+  symboltoken: string;
+  kind: string | null;
+  side: "CE" | "PE";
+  signal: "BUY_CALL" | "BUY_PUT";
+  lots: number;
+  lot_size: number;
+  qty: number;
+  entry_price: number;
+  stop_price: number | null;
+  target_price: number | null;
+  last_price: number;
+  capital_used: number;
+  unrealized_pnl: number;
+  opened_at: string | null;
+  last_marked_at: string | null;
+  reason_at_open: string | null;
+};
+
+export type PaperOpenSummary = {
+  rows: PaperPosition[];
+  open_positions: number;
+  ce_open: number;
+  pe_open: number;
+  capital_used_ce: number;
+  capital_used_pe: number;
+  capital_used_total: number;
+  unrealized_pnl_ce: number;
+  unrealized_pnl_pe: number;
+  unrealized_pnl_total: number;
+};
+
+export type PaperToday = {
+  trades: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  net_pnl: number;
+  open_positions: number;
+};
+
+export type PaperBlock = {
+  config: {
+    stop_loss_pct: number;
+    take_profit_pct: number;
+    max_hold_minutes: number;
+    max_open_positions: number;
+  };
+  open: PaperOpenSummary;
+  today: PaperToday;
+};
+
+export type DryrunBlock = {
+  capital_override: number;
+  live_available_cash: number;
+  deployable_cash: number;
+};
+
+export type RateLimitNearCap = {
+  path: string;
+  window_s: number;
+  used: number;
+  limit: number;
+};
+
+export type RateLimitSummary = {
+  enabled: boolean;
+  safety_factor?: number;
+  calls_total: number;
+  waits_total: number;
+  last_wait_s?: number;
+  near_cap: RateLimitNearCap[];
+};
+
+export type MasterStatus = {
+  path: string;
+  bytes: number;
+  last_modified_iso: string | null;
+  age_seconds: number | null;
+  is_fresh: boolean;
+  source: "cache" | "downloaded" | "missing";
+  instruments?: number;
+};
+
+export type UniverseReport = {
+  indices_resolved: number;
+  indices_missing: string[];
+  stocks_resolved: number;
+  stocks_missing: string[];
+  commodities_resolved: number;
+  commodities_missing: string[];
+  atm_resolved: number;
+  atm_missing: string[];
+  notes: string[];
+};
+
+export type UniverseEntry = {
+  name: string;
+  token: string;
+  kind: "INDEX" | "EQUITY" | "OPTION" | "COMMODITY" | string;
+  lot_size: number;
+  underlying?: string;
+  expiry?: string;
+  strike?: number;
+  side?: "CE" | "PE";
+  offset?: number;
+};
+
+export type UniverseBlock = {
+  master: MasterStatus | null;
+  spec: {
+    indices: string[];
+    stocks: string[];
+    commodities: string[];
+    atm_for: string[];
+    atm_offsets: number[];
+  };
+  report: UniverseReport | null;
+  watchlist: Record<string, UniverseEntry[]>;
+  last_atm_refresh_at: string | null;
+  kind_enabled?: Partial<Record<"INDEX" | "EQUITY" | "COMMODITY" | "OPTION", boolean>>;
+};
+
+export type InstrumentSearchRow = {
+  exchange: string;
+  tradingsymbol: string;
+  symboltoken: string;
+  name: string;
+  instrument_type: string;
+  expiry: string;
+  strike: number;
+  lot_size: number;
+  tick_size: number;
+};
+
 export type Snapshot = {
   connected: boolean;
   bot_running: boolean;
   trading_enabled: boolean;
+  mode?: "live" | "dryrun";
   auto_mode: boolean;
   last_loop_at: string | null;
   last_scan_summary: ScanSummary | null;
@@ -262,6 +412,23 @@ export type Snapshot = {
   recent_orders: OrderRow[];
   decisions: DecisionRow[];
   daily: StatsResponse;
+  rate_limit?: RateLimitSummary;
+  paper?: PaperBlock;
+  dryrun?: DryrunBlock;
+  universe?: UniverseBlock;
+  market_hours?: Record<string, MarketStatus>;
+};
+
+export type MarketStatus = {
+  kind: string;
+  label: string;
+  is_open: boolean;
+  is_weekend: boolean;
+  opens_at_iso: string | null;
+  closes_at_iso: string | null;
+  opens_at_label: string | null;
+  closes_at_label: string | null;
+  reason: "open" | "weekend" | "before_open" | "after_close" | "unknown_kind";
 };
 
 export type KillSwitchReport = {
@@ -274,7 +441,9 @@ export type KillSwitchReport = {
 };
 
 export type HistoryResponse = {
+  mode?: "live" | "dryrun";
   orders: OrderRow[];
   all_days: { day: string; trades: number; pnl: number }[];
   totals: { trades: number; realized_pnl: number; days_traded: number };
+  paper_positions?: PaperPosition[];
 };

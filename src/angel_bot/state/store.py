@@ -58,6 +58,45 @@ class StateStore:
                   trades INTEGER NOT NULL,
                   pnl REAL NOT NULL
                 );
+
+                -- Daily P&L per mode (live vs dryrun) so the dashboard can
+                -- show separate ledgers.
+                CREATE TABLE IF NOT EXISTS daily_stats_mode (
+                  day TEXT NOT NULL,
+                  mode TEXT NOT NULL,    -- 'live' | 'dryrun'
+                  trades INTEGER NOT NULL,
+                  pnl REAL NOT NULL,
+                  PRIMARY KEY (day, mode)
+                );
+
+                -- Paper (dry-run) positions and their lifecycle. Mark-to-market
+                -- is computed in Python from incoming LTPs; SQLite is authoritative.
+                CREATE TABLE IF NOT EXISTS paper_positions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  exchange TEXT NOT NULL,
+                  symboltoken TEXT NOT NULL,
+                  tradingsymbol TEXT NOT NULL,
+                  kind TEXT,            -- EQUITY | INDEX | COMMODITY
+                  side TEXT NOT NULL,   -- CE | PE  (synthetic option side)
+                  signal TEXT NOT NULL, -- BUY_CALL | BUY_PUT
+                  lots INTEGER NOT NULL,
+                  lot_size INTEGER NOT NULL,
+                  qty INTEGER NOT NULL,
+                  entry_price REAL NOT NULL,
+                  stop_price REAL,
+                  target_price REAL,
+                  capital_used REAL NOT NULL,
+                  capital_at_open REAL,
+                  opened_at TEXT NOT NULL,
+                  last_price REAL,
+                  last_marked_at TEXT,
+                  closed_at TEXT,
+                  exit_price REAL,
+                  exit_reason TEXT,     -- 'stop' | 'target' | 'manual' | 'session_end'
+                  realized_pnl REAL,
+                  reason_at_open TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_open ON paper_positions(closed_at);
                 """
             )
             cols = self._table_columns(con, "orders")
@@ -76,6 +115,8 @@ class StateStore:
                 ("symboltoken", "ALTER TABLE orders ADD COLUMN symboltoken TEXT"),
                 ("transactiontype", "ALTER TABLE orders ADD COLUMN transactiontype TEXT"),
                 ("variety", "ALTER TABLE orders ADD COLUMN variety TEXT"),
+                # Marks live vs dryrun. NULL is treated as 'live' for old rows.
+                ("mode", "ALTER TABLE orders ADD COLUMN mode TEXT DEFAULT 'live'"),
             ]
             for name, ddl in migrations:
                 if name not in cols:
@@ -90,6 +131,7 @@ class StateStore:
         lifecycle_status: str | None = None,
         placed_by_bot: bool = False,
         intent: str | None = None,
+        mode: str = "live",
     ) -> None:
         now = datetime.now(UTC).isoformat()
         ls = lifecycle_status or status
@@ -101,8 +143,8 @@ class StateStore:
                   lifecycle_status, updated_at,
                   placed_by_bot, intent,
                   tradingsymbol, exchange, symboltoken,
-                  transactiontype, variety
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  transactiontype, variety, mode
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     broker_order_id,
@@ -118,6 +160,7 @@ class StateStore:
                     payload.get("symboltoken"),
                     payload.get("transactiontype"),
                     payload.get("variety"),
+                    (mode or "live").lower(),
                 ),
             )
 
@@ -250,3 +293,146 @@ class StateStore:
         with self._connect() as con:
             rows = con.execute("SELECT day, trades, pnl FROM daily_stats ORDER BY day DESC").fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Per-mode (live | dryrun) daily stats
+    # ------------------------------------------------------------------
+
+    def add_mode_pnl(self, mode: str, pnl_delta: float, trades_delta: int = 1) -> None:
+        """Increment today's per-mode realized P&L and trade count."""
+        d = datetime.now(UTC).date().isoformat()
+        m = (mode or "live").lower()
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO daily_stats_mode (day, mode, trades, pnl) VALUES (?,?,?,?)
+                ON CONFLICT(day, mode) DO UPDATE SET
+                  trades = trades + excluded.trades,
+                  pnl = pnl + excluded.pnl
+                """,
+                (d, m, int(trades_delta), float(pnl_delta)),
+            )
+
+    def get_mode_daily_stats(self, mode: str, day: date | None = None) -> tuple[int, float]:
+        d = (day or datetime.now(UTC).date()).isoformat()
+        m = (mode or "live").lower()
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT trades, pnl FROM daily_stats_mode WHERE day = ? AND mode = ?",
+                (d, m),
+            ).fetchone()
+            if not row:
+                return (0, 0.0)
+            return (int(row["trades"]), float(row["pnl"]))
+
+    def all_mode_daily_stats(self, mode: str) -> list[dict[str, Any]]:
+        m = (mode or "live").lower()
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT day, trades, pnl FROM daily_stats_mode WHERE mode = ? ORDER BY day DESC",
+                (m,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def reset_mode(self, mode: str) -> None:
+        """Wipe paper positions + per-mode daily stats + per-mode orders.
+
+        Only supports 'dryrun' to avoid accidentally nuking live history.
+        """
+        m = (mode or "").lower()
+        if m != "dryrun":
+            raise ValueError("reset_mode only supports 'dryrun'")
+        with self._connect() as con:
+            con.execute("DELETE FROM paper_positions")
+            con.execute("DELETE FROM daily_stats_mode WHERE mode = 'dryrun'")
+            con.execute("DELETE FROM orders WHERE mode = 'dryrun'")
+
+    def recent_orders_by_mode(self, mode: str, limit: int = 200) -> list[dict[str, Any]]:
+        m = (mode or "live").lower()
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM orders WHERE mode = ? ORDER BY id DESC LIMIT ?",
+                (m, int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Paper (dry-run) positions
+    # ------------------------------------------------------------------
+
+    def open_paper_position(self, p: dict[str, Any]) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                INSERT INTO paper_positions (
+                  exchange, symboltoken, tradingsymbol, kind, side, signal,
+                  lots, lot_size, qty, entry_price, stop_price, target_price,
+                  capital_used, capital_at_open, opened_at,
+                  last_price, last_marked_at, reason_at_open
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    p["exchange"],
+                    p["symboltoken"],
+                    p["tradingsymbol"],
+                    p.get("kind"),
+                    p["side"],
+                    p["signal"],
+                    int(p["lots"]),
+                    int(p["lot_size"]),
+                    int(p["qty"]),
+                    float(p["entry_price"]),
+                    p.get("stop_price"),
+                    p.get("target_price"),
+                    float(p["capital_used"]),
+                    p.get("capital_at_open"),
+                    p.get("opened_at") or now,
+                    float(p["entry_price"]),
+                    now,
+                    p.get("reason_at_open"),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_open_paper_positions(self) -> list[dict[str, Any]]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM paper_positions WHERE closed_at IS NULL ORDER BY id DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_recent_paper_positions(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM paper_positions ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_paper_mark(self, pid: int, last_price: float) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            con.execute(
+                "UPDATE paper_positions SET last_price = ?, last_marked_at = ? WHERE id = ? AND closed_at IS NULL",
+                (float(last_price), now, int(pid)),
+            )
+
+    def close_paper_position(
+        self,
+        pid: int,
+        *,
+        exit_price: float,
+        exit_reason: str,
+        realized_pnl: float,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE paper_positions
+                SET closed_at = ?, exit_price = ?, exit_reason = ?,
+                    realized_pnl = ?, last_price = ?, last_marked_at = ?
+                WHERE id = ?
+                """,
+                (now, float(exit_price), exit_reason, float(realized_pnl), float(exit_price), now, int(pid)),
+            )
