@@ -52,6 +52,15 @@ class SmartApiClient:
                 return True
         return False
 
+    # Angel One caps the Quote (getMarketData) endpoint at ~50 tokens per
+    # request (summed across all exchanges in the body) per their docs, but
+    # in practice we've observed AB1004 ("Tokens max limit exceeded") even
+    # below that — the per-account / per-burst cap appears to be tighter.
+    # We intentionally chunk at 30 to give ourselves headroom; the cost is
+    # ~5 small POSTs per scan instead of ~3 large ones, which the rate
+    # limiter handles fine.
+    MARKET_DATA_BATCH_LIMIT = 30
+
     async def get_ltp(
         self,
         exchange_tokens: dict[str, list[str]],
@@ -63,10 +72,68 @@ class SmartApiClient:
         Hits Angel's *getMarketData* endpoint (NOT getLtpData, which is
         single-symbol only). Mode = "LTP" / "OHLC" / "FULL" — "LTP" is the
         cheapest and is what the scanner needs.
+
+        Auto-chunks when the watchlist exceeds Angel's per-request cap of
+        ``MARKET_DATA_BATCH_LIMIT`` tokens, then merges the responses so the
+        caller sees a single uniform shape.
         """
         await self.session.ensure_login()
-        body: dict[str, Any] = {"mode": mode, "exchangeTokens": exchange_tokens}
-        return await self._post_with_auth_retry(MARKET_DATA_PATH, body)
+        chunks = self._split_exchange_tokens(exchange_tokens, self.MARKET_DATA_BATCH_LIMIT)
+        if len(chunks) <= 1:
+            body: dict[str, Any] = {"mode": mode, "exchangeTokens": chunks[0] if chunks else {}}
+            return await self._post_with_auth_retry(MARKET_DATA_PATH, body)
+
+        # Multi-batch: fire sequentially so the rate limiter sees them as
+        # separate calls and applies headroom. Merge `data.fetched` /
+        # `data.unfetched` as we go.
+        merged_fetched: list[Any] = []
+        merged_unfetched: list[Any] = []
+        last_status: Any = True
+        last_message: str = "SUCCESS"
+        for chunk in chunks:
+            body = {"mode": mode, "exchangeTokens": chunk}
+            resp = await self._post_with_auth_retry(MARKET_DATA_PATH, body)
+            if not isinstance(resp, dict):
+                continue
+            last_status = resp.get("status", last_status)
+            last_message = str(resp.get("message", last_message) or last_message)
+            data = resp.get("data") or {}
+            if isinstance(data, dict):
+                fetched = data.get("fetched") or []
+                unfetched = data.get("unfetched") or []
+                if isinstance(fetched, list):
+                    merged_fetched.extend(fetched)
+                if isinstance(unfetched, list):
+                    merged_unfetched.extend(unfetched)
+        return {
+            "status": last_status,
+            "message": last_message,
+            "data": {"fetched": merged_fetched, "unfetched": merged_unfetched},
+        }
+
+    @staticmethod
+    def _split_exchange_tokens(
+        exchange_tokens: dict[str, list[str]],
+        limit: int,
+    ) -> list[dict[str, list[str]]]:
+        """Chunk an ``exchangeTokens`` payload so each chunk has ≤ ``limit``
+        total tokens (summed across exchanges)."""
+        chunks: list[dict[str, list[str]]] = []
+        current: dict[str, list[str]] = {}
+        current_count = 0
+        for ex, tokens in exchange_tokens.items():
+            if not isinstance(tokens, list) or not tokens:
+                continue
+            for tok in tokens:
+                if current_count >= limit:
+                    chunks.append(current)
+                    current = {}
+                    current_count = 0
+                current.setdefault(ex, []).append(str(tok))
+                current_count += 1
+        if current:
+            chunks.append(current)
+        return chunks
 
     async def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
         await self.session.ensure_login()

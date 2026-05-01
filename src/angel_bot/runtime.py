@@ -101,10 +101,17 @@ class TradingRuntime:
         # Per-kind toggles. ON = scanner polls + bot may trade; OFF = excluded
         # from the watchlist entirely (no API calls, no trades). Toggleable
         # at runtime from the dashboard.
+        # COMMODITY defaults to OFF: each MCX symbol consumes part of
+        # Angel's per-request Quote token budget, and combined with the
+        # 7-underlying ATM option chain (~140 rows) it reliably triggers
+        # AB1004 ("Tokens max limit exceeded"). Users who explicitly want
+        # commodities can re-enable from the dashboard *and* repopulate
+        # `commodities` in UNIVERSE_SPEC_JSON; nothing in the code path
+        # has been removed.
         self.kind_enabled: dict[str, bool] = {
             "INDEX": True,
             "EQUITY": True,
-            "COMMODITY": True,
+            "COMMODITY": False,
             "OPTION": True,
         }
 

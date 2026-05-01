@@ -149,14 +149,17 @@ export default function LivePage() {
         />
       </section>
 
-      {/* Scanner buckets — Stocks / Indexes / Commodities */}
+      {/* Scanner buckets — Stocks / Indexes (commodities intentionally
+          excluded: each MCX symbol counts toward Angel's per-request token
+          cap and reliably triggers AB1004 once we add the option chain on
+          top). */}
       <section>
         <SectionTitle
           title="What the bot is scanning"
           hint="Number of instruments that fit your available cash for at least one lot."
         />
-        <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-3">
-          {["EQUITY", "INDEX", "COMMODITY"].map((k) => {
+        <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
+          {["EQUITY", "INDEX"].map((k) => {
             const toggleKey = k === "INDEX" ? "OPTION" : k;
             const enabled = data?.universe?.kind_enabled?.[toggleKey as "EQUITY" | "OPTION" | "COMMODITY"] ?? true;
             const market = data?.market_hours?.[toggleKey] ?? data?.market_hours?.[k];

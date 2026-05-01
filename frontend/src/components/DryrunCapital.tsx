@@ -7,6 +7,7 @@ type Props = {
   liveAvailableCash: number;
   override: number;
   deployable: number;
+  useCapitalPct?: number;
 };
 
 /**
@@ -16,7 +17,12 @@ type Props = {
  *
  * Visible only in dry-run; the parent decides when to render.
  */
-export default function DryrunCapital({ liveAvailableCash, override, deployable }: Props) {
+export default function DryrunCapital({
+  liveAvailableCash,
+  override,
+  deployable,
+  useCapitalPct,
+}: Props) {
   const qc = useQueryClient();
   const [draft, setDraft] = useState<string>(override > 0 ? String(Math.round(override)) : "");
 
@@ -41,6 +47,11 @@ export default function DryrunCapital({ liveAvailableCash, override, deployable 
   }
 
   const usingOverride = override > 0;
+  const base = usingOverride ? override : liveAvailableCash;
+  // If a known cap was passed, prefer it; otherwise infer from base vs deployable.
+  const inferredPct = base > 0 ? (deployable / base) * 100 : 100;
+  const pct = typeof useCapitalPct === "number" ? useCapitalPct : inferredPct;
+  const isCapped = pct < 99.5 && base > 0 && deployable < base * 0.999;
 
   return (
     <div className="card flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
@@ -54,6 +65,13 @@ export default function DryrunCapital({ liveAvailableCash, override, deployable 
           {usingOverride
             ? `Override active. Real broker cash is ${formatINR(liveAvailableCash)}.`
             : `Using your real broker cash (${formatINR(liveAvailableCash)}). Set a custom amount to stress-test.`}
+          {isCapped ? (
+            <>
+              {" "}<span className="text-amber-400">
+                BOT_USE_CAPITAL_PCT is {pct}% — set it to 100 in .env to deploy every rupee.
+              </span>
+            </>
+          ) : null}
         </div>
       </div>
 

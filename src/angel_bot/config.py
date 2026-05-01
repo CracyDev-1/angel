@@ -127,7 +127,11 @@ class Settings(BaseSettings):
     trading_enabled: bool = Field(default=False, validation_alias="TRADING_ENABLED")
     bot_loop_interval_s: float = Field(default=5.0, validation_alias="BOT_LOOP_INTERVAL_S")
     bot_max_concurrent_positions: int = Field(default=3, validation_alias="BOT_MAX_CONCURRENT_POSITIONS")
-    bot_use_capital_pct: float = Field(default=70.0, validation_alias="BOT_USE_CAPITAL_PCT")
+    # Cap on the % of available broker cash the bot may deploy per cycle.
+    # 100 = use every rupee (recommended for options BUYING, where you pay
+    # full premium upfront with no margin-call risk). Lower it (e.g. 80) if
+    # you want to keep a passive cash buffer.
+    bot_use_capital_pct: float = Field(default=100.0, validation_alias="BOT_USE_CAPITAL_PCT")
     bot_min_signal_strength: float = Field(default=0.0, validation_alias="BOT_MIN_SIGNAL_STRENGTH")
     bot_default_product: str = Field(default="INTRADAY", validation_alias="BOT_DEFAULT_PRODUCT")
     bot_default_variety: str = Field(default="NORMAL", validation_alias="BOT_DEFAULT_VARIETY")

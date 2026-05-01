@@ -109,6 +109,80 @@ def test_commodity_future_lookup() -> None:
     assert fut.lot_size == 100
 
 
+def _bse_master() -> InstrumentMaster:
+    """Sample mixing NSE indices, BSE indices, and BFO options for SENSEX."""
+    return InstrumentMaster([
+        Instrument("NSE", "NIFTY 50", "99926000", name="NIFTY", instrument_type="AMXIDX"),
+        Instrument("BSE", "SENSEX", "99919000", name="SENSEX", instrument_type="AMXIDX"),
+        Instrument("BSE", "BANKEX", "99919012", name="BANKEX", instrument_type="AMXIDX"),
+        # SENSEX weekly options on BFO at two expiries, two strikes each
+        Instrument("BFO", "SENSEX07MAY2680000CE", "BFO-W1-80000-CE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="2026-05-07", strike=80000, lot_size=10),
+        Instrument("BFO", "SENSEX07MAY2680000PE", "BFO-W1-80000-PE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="2026-05-07", strike=80000, lot_size=10),
+        Instrument("BFO", "SENSEX14MAY2680000CE", "BFO-W2-80000-CE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="2026-05-14", strike=80000, lot_size=10),
+        Instrument("BFO", "SENSEX14MAY2680000PE", "BFO-W2-80000-PE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="2026-05-14", strike=80000, lot_size=10),
+    ])
+
+
+def test_index_lookup_searches_nse_then_bse() -> None:
+    m = _bse_master()
+    nifty = m.index("NIFTY")
+    assert nifty is not None and nifty.exchange == "NSE"
+    sensex = m.index("SENSEX")
+    assert sensex is not None and sensex.exchange == "BSE"
+    bankex = m.index("BANKEX")
+    assert bankex is not None and bankex.exchange == "BSE"
+
+
+def test_option_chain_auto_routes_to_bfo_for_sensex() -> None:
+    m = _bse_master()
+    # exchange='auto' (default) should pick BFO for SENSEX
+    chain = m.option_chain("SENSEX")
+    assert len(chain) == 4
+    assert all(r.exchange == "BFO" for r in chain)
+
+
+def test_upcoming_expiries_returns_n_in_order() -> None:
+    from datetime import date
+    m = _bse_master()
+    exps = m.upcoming_expiries("SENSEX", n=2, on=date(2026, 5, 1))
+    assert exps == ["2026-05-07", "2026-05-14"]
+    only_one = m.upcoming_expiries("SENSEX", n=1, on=date(2026, 5, 1))
+    assert only_one == ["2026-05-07"]
+
+
+def test_universe_builder_emits_multiple_expiries() -> None:
+    # The builder uses the wall clock for upcoming_expiries(), so we craft a
+    # master whose expiries are far in the future relative to test runtime.
+    master = InstrumentMaster([
+        Instrument("BSE", "SENSEX", "99919000", name="SENSEX", instrument_type="AMXIDX"),
+        Instrument("BFO", "SENSEX25DEC9980000CE", "FAR1-CE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="9999-12-25", strike=80000, lot_size=10),
+        Instrument("BFO", "SENSEX25DEC9980000PE", "FAR1-PE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="9999-12-25", strike=80000, lot_size=10),
+        Instrument("BFO", "SENSEX31DEC9980000CE", "FAR2-CE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="9999-12-31", strike=80000, lot_size=10),
+        Instrument("BFO", "SENSEX31DEC9980000PE", "FAR2-PE", name="SENSEX",
+                   instrument_type="OPTIDX", expiry="9999-12-31", strike=80000, lot_size=10),
+    ])
+    spec = UniverseSpec(
+        indices=["SENSEX"], stocks=[], commodities=[],
+        atm_for=["SENSEX"], atm_offsets=[0], atm_expiries=2,
+    )
+    builder = UniverseBuilder(master)
+    watchlist, report = builder.build(spec, spot_provider=lambda u: 80000.0)
+    bfo = watchlist.get("BFO", [])
+    # 2 expiries × 1 strike × 2 sides (CE+PE) = 4 option entries
+    option_entries = [e for e in bfo if e["kind"] == "OPTION"]
+    assert len(option_entries) == 4
+    distinct_expiries = {e.get("expiry") for e in option_entries}
+    assert distinct_expiries == {"9999-12-25", "9999-12-31"}
+    assert report.atm_resolved == 4
+
+
 def test_search_substring() -> None:
     m = _sample_master()
     hits = m.search("NIFTY", exchange="NFO", limit=10)

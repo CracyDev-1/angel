@@ -336,14 +336,41 @@ class InstrumentMaster:
         # Fallback: tradingsymbol match RELIANCE-EQ / RELIANCE
         return self.maybe_resolve(ex, n) or self.maybe_resolve(ex, f"{n}-EQ")
 
-    def index(self, name: str, exchange: str = "NSE") -> Instrument | None:
-        ex = exchange.strip().upper()
+    # Underlyings whose options are listed on BSE F&O (BFO) instead of NSE F&O.
+    # Everything else defaults to NFO; MCX bullion-index uses MCX.
+    _BFO_UNDERLYINGS: frozenset[str] = frozenset({"SENSEX", "SENSEX50", "BANKEX"})
+    _MCX_INDEX_UNDERLYINGS: frozenset[str] = frozenset({"MCXBULLDEX"})
+
+    def index(self, name: str, exchange: str | None = None) -> Instrument | None:
+        """Find an index row.
+
+        ``exchange`` defaults to "any": searches NSE first then BSE. This way
+        the universe spec can list NIFTY and SENSEX side-by-side without
+        having to encode where each one lives.
+        """
         n = name.strip().upper()
-        for c in self._by_name.get(n, []):
-            if c.exchange == ex and c.is_index:
-                return c
-        # Some index rows have empty `name` (e.g., NIFTY 50 vs NIFTY). Try direct.
-        return self.maybe_resolve(ex, n)
+        if exchange:
+            exes = [exchange.strip().upper()]
+        else:
+            exes = ["NSE", "BSE"]
+        for ex in exes:
+            for c in self._by_name.get(n, []):
+                if c.exchange == ex and c.is_index:
+                    return c
+            # Some index rows have empty `name` (e.g., NIFTY 50 vs NIFTY).
+            inst = self.maybe_resolve(ex, n)
+            if inst is not None:
+                return inst
+        return None
+
+    def options_exchange_for(self, underlying: str) -> str:
+        """Return the F&O segment where this underlying's options are listed."""
+        n = underlying.strip().upper()
+        if n in self._BFO_UNDERLYINGS:
+            return "BFO"
+        if n in self._MCX_INDEX_UNDERLYINGS:
+            return "MCX"
+        return "NFO"
 
     def commodity_future(self, name: str, exchange: str = "MCX") -> Instrument | None:
         """Pick the *nearest* MCX future for a given commodity (CRUDEOIL, GOLD…)."""
@@ -364,10 +391,16 @@ class InstrumentMaster:
         underlying: str,
         *,
         expiry: str | None = None,
-        exchange: str = "NFO",
+        exchange: str = "auto",
     ) -> list[Instrument]:
+        """List option rows for an underlying. ``exchange='auto'`` (default)
+        picks NFO / BFO / MCX based on where the underlying's options live."""
         n = underlying.strip().upper()
-        ex = exchange.strip().upper()
+        ex = (
+            self.options_exchange_for(n)
+            if exchange.strip().upper() == "AUTO"
+            else exchange.strip().upper()
+        )
         rows = [
             r
             for r in self._by_name.get(n, [])
@@ -379,7 +412,7 @@ class InstrumentMaster:
         rows.sort(key=lambda r: (r.expiry or "9999-12-31", r.strike, r.option_side))
         return rows
 
-    def list_expiries(self, underlying: str, *, exchange: str = "NFO") -> list[str]:
+    def list_expiries(self, underlying: str, *, exchange: str = "auto") -> list[str]:
         chain = self.option_chain(underlying, exchange=exchange)
         seen: list[str] = []
         for r in chain:
@@ -387,24 +420,41 @@ class InstrumentMaster:
                 seen.append(r.expiry)
         return seen
 
-    def nearest_expiry(
+    def upcoming_expiries(
         self,
         underlying: str,
         *,
-        exchange: str = "NFO",
+        exchange: str = "auto",
+        n: int = 1,
         on: date | None = None,
-    ) -> str | None:
+    ) -> list[str]:
+        """Return the next ``n`` non-past expiries (closest first)."""
         today = on or datetime.now(UTC).date()
+        out: list[str] = []
         for exp in self.list_expiries(underlying, exchange=exchange):
             try:
                 d = date.fromisoformat(exp)
             except ValueError:
                 continue
             if d >= today:
-                return exp
-        # If everything is in the past (stale master), return the latest expiry.
+                out.append(exp)
+                if len(out) >= max(1, n):
+                    return out
+        if out:
+            return out
+        # Stale master fallback: return last known expiries.
         all_exp = self.list_expiries(underlying, exchange=exchange)
-        return all_exp[-1] if all_exp else None
+        return all_exp[-max(1, n):]
+
+    def nearest_expiry(
+        self,
+        underlying: str,
+        *,
+        exchange: str = "auto",
+        on: date | None = None,
+    ) -> str | None:
+        ups = self.upcoming_expiries(underlying, exchange=exchange, n=1, on=on)
+        return ups[0] if ups else None
 
     def atm_options(
         self,
@@ -412,7 +462,7 @@ class InstrumentMaster:
         spot: float,
         *,
         expiry: str | None = None,
-        exchange: str = "NFO",
+        exchange: str = "auto",
         offsets: Iterable[int] = (0,),
     ) -> dict[str, Any]:
         """Resolve ATM (and optional offset) CE/PE for an underlying at given spot.

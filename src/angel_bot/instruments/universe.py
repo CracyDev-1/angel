@@ -51,7 +51,8 @@ class UniverseSpec:
     stocks: list[str]
     commodities: list[str]
     atm_for: list[str]            # underlyings that should auto-resolve ATM CE+PE
-    atm_offsets: list[int]        # e.g. [-1, 0, 1] = ITM-1, ATM, OTM-1
+    atm_offsets: list[int]        # e.g. [-2,-1,0,1,2] = ITM-2 .. OTM-2
+    atm_expiries: int = 1         # how many of the next expiries to include per underlying
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> UniverseSpec:
@@ -65,12 +66,18 @@ class UniverseSpec:
         except (TypeError, ValueError):
             offs_i = [0]
 
+        try:
+            atm_exp = int(d.get("atm_expiries") or 1)
+        except (TypeError, ValueError):
+            atm_exp = 1
+
         return cls(
             indices=_list("indices"),
             stocks=_list("stocks"),
             commodities=_list("commodities"),
             atm_for=_list("atm_for"),
             atm_offsets=offs_i,
+            atm_expiries=max(1, atm_exp),
         )
 
     @classmethod
@@ -80,27 +87,35 @@ class UniverseSpec:
         # and rotate when funds change. Toggle whole categories from the
         # dashboard, or override entirely via UNIVERSE_SPEC_JSON in .env.
         #
-        # MCX commodity coverage (matches the standard MCX board):
-        #   Energy   : CRUDEOIL, CRUDEOILM (mini), NATURALGAS, NATGASMINI
-        #   Bullion  : GOLD, GOLDM (mini), GOLDGUINEA (8g), GOLDPETAL (1g),
-        #              GOLDTEN (10g), SILVER, SILVERM (mini), SILVERMIC (micro)
-        #   Base Met.: COPPER, ZINC, ZINCMINI, LEAD, LEADMINI,
-        #              ALUMINIUM, ALUMINI, NICKEL
+        # All options-eligible Indian indices Angel exposes are included:
+        #   NSE F&O (NFO):  NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50
+        #   BSE F&O (BFO):  SENSEX, BANKEX
+        #
+        # NOTE: Commodities are intentionally *empty* by default. Each MCX
+        # symbol counts towards Angel's per-request "Quote" token budget,
+        # and the index + 7-underlying ATM chain (~140 option rows) already
+        # consumes most of it. Adding 20 MCX rows on top reliably triggers
+        # `AB1004 Tokens max limit exceeded`. If you want to trade
+        # commodities, override `UNIVERSE_SPEC_JSON` in .env *and* drop the
+        # number of `atm_for` underlyings or `atm_offsets`/`atm_expiries`
+        # to stay under the cap.
+        #
+        # ATM chain: 5 strikes per side per expiry (ITM-2 .. OTM+2) over the
+        # next 2 expiries → fat-but-relevant options watchlist that surfaces
+        # both intraday and weekly expiries on the dashboard.
         return cls(
-            indices=["NIFTY", "BANKNIFTY", "FINNIFTY"],
-            stocks=["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK"],
-            commodities=[
-                # Energy
-                "CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI",
-                # Bullion
-                "GOLD", "GOLDM", "GOLDGUINEA", "GOLDPETAL", "GOLDTEN",
-                "SILVER", "SILVERM", "SILVERMIC",
-                # Base metals
-                "COPPER", "ZINC", "ZINCMINI", "LEAD", "LEADMINI",
-                "ALUMINIUM", "ALUMINI", "NICKEL",
+            indices=[
+                "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
+                "SENSEX", "BANKEX",
             ],
-            atm_for=["NIFTY", "BANKNIFTY"],
-            atm_offsets=[0],
+            stocks=["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK"],
+            commodities=[],
+            atm_for=[
+                "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
+                "SENSEX", "BANKEX",
+            ],
+            atm_offsets=[-2, -1, 0, 1, 2],
+            atm_expiries=2,
         )
 
 
@@ -164,6 +179,7 @@ class UniverseBuilder:
         *,
         spot_provider: callable | None = None,
         atm_offsets: Iterable[int] | None = None,
+        atm_expiries: int | None = None,
         disabled_kinds: set[str] | None = None,
     ) -> tuple[dict[str, list[dict[str, Any]]], BuildReport]:
         """Build the watchlist. ``disabled_kinds`` (uppercase) lets the runtime
@@ -224,32 +240,40 @@ class UniverseBuilder:
 
         # ----- ATM options -----------------------------------------------
         offs = list(atm_offsets) if atm_offsets is not None else spec.atm_offsets
+        n_exp = max(1, int(atm_expiries if atm_expiries is not None else spec.atm_expiries))
         spec_atm_for = [] if "OPTION" in disabled else spec.atm_for
         for underlying in spec_atm_for:
             spot = spot_provider(underlying) if spot_provider else None
             if spot is None or spot <= 0:
                 report.atm_missing.append(f"{underlying}:no_spot")
                 continue
-            chain = self.master.atm_options(underlying, spot, offsets=offs)
-            if not chain.get("rows"):
-                report.atm_missing.append(f"{underlying}:no_chain")
+            expiries = self.master.upcoming_expiries(underlying, n=n_exp)
+            if not expiries:
+                report.atm_missing.append(f"{underlying}:no_expiries")
                 continue
-            for row in chain["rows"]:
-                for side_key in ("ce", "pe"):
-                    inst = row.get(side_key)
-                    if inst is None:
-                        continue
-                    out.setdefault(inst.exchange, []).append(
-                        _entry(
-                            inst,
-                            "OPTION",
-                            underlying=underlying,
-                            expiry=chain.get("expiry"),
-                            strike=row["strike"],
-                            side=side_key.upper(),
-                            offset=row["offset"],
+            for exp in expiries:
+                chain = self.master.atm_options(
+                    underlying, spot, offsets=offs, expiry=exp,
+                )
+                if not chain.get("rows"):
+                    report.atm_missing.append(f"{underlying}:no_chain@{exp}")
+                    continue
+                for row in chain["rows"]:
+                    for side_key in ("ce", "pe"):
+                        inst = row.get(side_key)
+                        if inst is None:
+                            continue
+                        out.setdefault(inst.exchange, []).append(
+                            _entry(
+                                inst,
+                                "OPTION",
+                                underlying=underlying,
+                                expiry=chain.get("expiry"),
+                                strike=row["strike"],
+                                side=side_key.upper(),
+                                offset=row["offset"],
+                            )
                         )
-                    )
-                    report.atm_resolved += 1
+                        report.atm_resolved += 1
 
         return out, report
