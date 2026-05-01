@@ -12,6 +12,7 @@ from angel_bot.broker_models import normalize_positions, normalize_rms, summariz
 from angel_bot.config import Settings, get_settings
 from angel_bot.decisions import Decision, DecisionLog
 from angel_bot.execution.orders import DuplicateOrderGuard, build_order_payload, validate_order_payload
+from angel_bot.exits.live import LiveExitConfig, LiveExitManager
 from angel_bot.instruments.loader import MasterStatus, ensure_local_master
 from angel_bot.instruments.master import Instrument, InstrumentMaster
 from angel_bot.instruments.universe import BuildReport, UniverseBuilder, UniverseSpec
@@ -58,7 +59,7 @@ class TradingRuntime:
         self.store = StateStore(self.settings.state_sqlite_path)
         self.scanner = ScannerEngine(self.settings)
         self.decisions = DecisionLog()
-        self.risk = RiskEngine(self.settings)
+        self.risk = RiskEngine(self.settings, store=self.store)
         self._dup_guard = DuplicateOrderGuard(ttl_s=60.0)
         self._tracker = OrderTracker(self.store)
         self.paper = PaperTrader(
@@ -69,6 +70,19 @@ class TradingRuntime:
                 max_hold_minutes=self.settings.paper_max_hold_minutes,
                 max_open_positions=self.settings.paper_max_open_positions,
             ),
+        )
+        # Live-mode equivalent of PaperTrader. Uses the SAME SL / TP / max-hold
+        # numbers so live behavior mirrors what dry-run was showing the user.
+        # Wired with a price-lookup callback that prefers the scanner cache
+        # (always-fresh) and falls back to broker positions LTP.
+        self.live_exits = LiveExitManager(
+            self.store,
+            LiveExitConfig(
+                stop_loss_pct=self.settings.paper_stop_loss_pct,
+                take_profit_pct=self.settings.paper_take_profit_pct,
+                max_hold_minutes=self.settings.paper_max_hold_minutes,
+            ),
+            price_lookup=self._live_exit_price_lookup,
         )
 
         self.last_funds: dict[str, Any] | None = None
@@ -856,6 +870,42 @@ class TradingRuntime:
                         # Feed the post-loss cooldown timer.
                         self.risk.record_close(realized_pnl=float(ev.realized_pnl or 0.0))
 
+                    # Live-position exit manager: enforces premium SL / TP /
+                    # max-hold for every position the bot opened in live mode.
+                    # Always runs (even in dry-run) so a session that flipped
+                    # back to dry-run with positions still open still gets
+                    # them managed. Each closure also feeds the post-loss
+                    # cooldown.
+                    try:
+                        live_closures = await self.live_exits.mark_and_close(api)
+                    except Exception as e:  # noqa: BLE001 — never crash the loop
+                        live_closures = []
+                        log.warning("live_exit_mark_and_close_failed", error=str(e))
+                    for lev in live_closures:
+                        self.decisions.add(
+                            Decision(
+                                ts=DecisionLog.now_iso(),
+                                name=lev.tradingsymbol,
+                                exchange="-",
+                                token="-",
+                                signal="MODE",
+                                reason=(
+                                    f"live_close_{lev.exit_reason}: "
+                                    f"pnl ₹{lev.realized_pnl:+.2f}"
+                                ),
+                                last_price=lev.exit_price,
+                                quantity=lev.qty,
+                                lots=0,
+                                capital_used=lev.entry_price * lev.qty,
+                                side=lev.side,
+                                placed=True,
+                                dry_run=False,
+                                broker_order_id=lev.close_order_id,
+                                extra={"live_exit": True, "exit_reason": lev.exit_reason},
+                            )
+                        )
+                        self.risk.record_close(realized_pnl=float(lev.realized_pnl or 0.0))
+
                     self._record_scan_summary(hits, positions, available, deployable)
 
                     # NEW: rank → take TOP-N → process each independently. The
@@ -1015,6 +1065,38 @@ class TradingRuntime:
         for h in self.scanner.last_hits:
             if h.exchange.upper() == ex and str(h.token) == tok and h.last_price:
                 return float(h.last_price)
+        return None
+
+    def _live_exit_price_lookup(self, exchange: str, symboltoken: str) -> float | None:
+        """Price callback the LiveExitManager uses to mark positions to market.
+
+        Order of preference:
+          1. Scanner cache — fresh, sub-second, no extra API call.
+          2. Broker positions row (``self.last_positions``) — broker reports
+             ``ltp`` for everything you hold so this works even when the
+             instrument has fallen out of the scanner watchlist (e.g. an ATM
+             option whose strike moved away from the current spot).
+
+        Returns ``None`` only when neither source has a price; the manager
+        treats that as "skip mark this cycle, only max-hold can still fire".
+        """
+        ex = (exchange or "").upper()
+        tok = str(symboltoken or "")
+        cached = self._scanner_premium_for(ex, tok)
+        if cached is not None:
+            return cached
+        rows = (self.last_positions or {}).get("rows") or []
+        for r in rows:
+            r_ex = str(r.get("exchange") or "").upper()
+            r_tok = str(r.get("symboltoken") or "")
+            if r_ex == ex and r_tok == tok:
+                ltp = r.get("ltp") or r.get("last_price")
+                try:
+                    f = float(ltp) if ltp is not None else 0.0
+                except (TypeError, ValueError):
+                    f = 0.0
+                if f > 0:
+                    return f
         return None
 
     async def _run_llm_filter(
@@ -1464,6 +1546,29 @@ class TradingRuntime:
                 payload, oid, status="placed", lifecycle_status="placed",
                 placed_by_bot=True, intent="open", mode="live",
             )
+            # Register the exit plan immediately. The LiveExitManager will
+            # back-fill the actual fill price + recompute SL/TP from it on
+            # the next reconcile, so the plan is honest even if the open
+            # slips. Registration is idempotent on broker_order_id.
+            try:
+                self.live_exits.register_open(
+                    open_order_id=str(oid),
+                    exchange=exec_inst.exchange,
+                    symboltoken=exec_inst.symboltoken,
+                    tradingsymbol=exec_inst.tradingsymbol,
+                    kind=hit.kind,
+                    side=side,
+                    signal=signal,
+                    underlying=hit.name,
+                    qty=chosen_qty,
+                    lots=chosen_lots,
+                    lot_size=lot_size,
+                    planned_entry=exec_price,
+                    product=s.bot_default_product,
+                    variety=s.bot_default_variety,
+                )
+            except Exception as e:  # noqa: BLE001 — never block the trade on plan persistence
+                log.warning("live_exit_register_failed", error=str(e), broker_order_id=oid)
         self._record_decision(
             hit=hit, signal=signal,
             reason=f"placed {exec_inst.tradingsymbol}",

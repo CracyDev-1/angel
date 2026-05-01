@@ -97,6 +97,58 @@ class StateStore:
                   reason_at_open TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_open ON paper_positions(closed_at);
+
+                -- Live exit plans: one row per LIVE position the bot opens.
+                -- Mirrors paper SL/TP/max-hold, but for real broker
+                -- positions. The exit manager iterates open plans every
+                -- cycle, checks LTP from the scanner / broker positions,
+                -- and fires a market reverse order when SL/TP/max-hold
+                -- triggers. Persisted so a process restart inside a live
+                -- session doesn't forget about positions it should be
+                -- managing.
+                CREATE TABLE IF NOT EXISTS live_exit_plans (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  open_order_id TEXT NOT NULL UNIQUE,
+                  exchange TEXT NOT NULL,
+                  symboltoken TEXT NOT NULL,
+                  tradingsymbol TEXT NOT NULL,
+                  kind TEXT,                -- INDEX | EQUITY | COMMODITY (signal source)
+                  side TEXT NOT NULL,       -- CE | PE | LONG (cash buy)
+                  signal TEXT NOT NULL,     -- BUY_CALL | BUY_PUT
+                  underlying TEXT,
+                  qty INTEGER NOT NULL,
+                  lots INTEGER NOT NULL,
+                  lot_size INTEGER NOT NULL,
+                  planned_entry REAL NOT NULL,
+                  fill_price REAL,          -- avg fill from order book (NULL until reconciled)
+                  filled_at TEXT,           -- ISO time the open filled
+                  stop_price REAL NOT NULL,
+                  target_price REAL NOT NULL,
+                  max_hold_minutes INTEGER NOT NULL,
+                  product TEXT NOT NULL,
+                  variety TEXT NOT NULL,
+                  opened_at TEXT NOT NULL,  -- when the plan was created
+                  close_order_id TEXT,      -- broker order id of the square-off
+                  closed_at TEXT,
+                  exit_price REAL,
+                  exit_reason TEXT,         -- stop | target | session_end | manual | kill
+                  realized_pnl REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_exit_open
+                  ON live_exit_plans(closed_at);
+
+                -- Persistent fragments of RiskState so per-hour cap and
+                -- post-loss cooldown survive a process restart.
+                CREATE TABLE IF NOT EXISTS risk_entries (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  entered_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_risk_entries_at
+                  ON risk_entries(entered_at);
+                CREATE TABLE IF NOT EXISTS risk_state (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  last_loss_at TEXT
+                );
                 """
             )
             cols = self._table_columns(con, "orders")
@@ -436,3 +488,157 @@ class StateStore:
                 """,
                 (now, float(exit_price), exit_reason, float(realized_pnl), float(exit_price), now, int(pid)),
             )
+
+    # ------------------------------------------------------------------
+    # Live exit plans (live-mode equivalent of paper_positions)
+    # ------------------------------------------------------------------
+
+    def create_live_exit_plan(self, p: dict[str, Any]) -> int:
+        """Persist a new exit plan when the bot places a LIVE open order.
+
+        Idempotent on ``open_order_id`` — re-registering the same broker order id
+        is a no-op (returns the existing plan id). This protects against a race
+        where the runtime restarts mid-cycle and tries to re-register a plan
+        whose open order is already in the DB.
+        """
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            existing = con.execute(
+                "SELECT id FROM live_exit_plans WHERE open_order_id = ?",
+                (p["open_order_id"],),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            cur = con.execute(
+                """
+                INSERT INTO live_exit_plans (
+                  open_order_id, exchange, symboltoken, tradingsymbol, kind,
+                  side, signal, underlying,
+                  qty, lots, lot_size,
+                  planned_entry, stop_price, target_price, max_hold_minutes,
+                  product, variety, opened_at
+                ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?)
+                """,
+                (
+                    str(p["open_order_id"]),
+                    str(p["exchange"]).upper(),
+                    str(p["symboltoken"]),
+                    str(p["tradingsymbol"]),
+                    p.get("kind"),
+                    str(p["side"]).upper(),
+                    str(p["signal"]),
+                    p.get("underlying"),
+                    int(p["qty"]),
+                    int(p["lots"]),
+                    int(p["lot_size"]),
+                    float(p["planned_entry"]),
+                    float(p["stop_price"]),
+                    float(p["target_price"]),
+                    int(p["max_hold_minutes"]),
+                    str(p["product"]),
+                    str(p["variety"]),
+                    p.get("opened_at") or now,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_open_live_exit_plans(self) -> list[dict[str, Any]]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM live_exit_plans WHERE closed_at IS NULL ORDER BY id DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_live_exit_plan_fill(
+        self, *, open_order_id: str, fill_price: float, filled_at: str | None = None
+    ) -> None:
+        when = filled_at or datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE live_exit_plans
+                SET fill_price = ?, filled_at = COALESCE(filled_at, ?)
+                WHERE open_order_id = ? AND closed_at IS NULL
+                """,
+                (float(fill_price), when, str(open_order_id)),
+            )
+
+    def close_live_exit_plan(
+        self,
+        plan_id: int,
+        *,
+        exit_price: float,
+        exit_reason: str,
+        realized_pnl: float,
+        close_order_id: str | None = None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE live_exit_plans
+                SET closed_at = ?, exit_price = ?, exit_reason = ?,
+                    realized_pnl = ?, close_order_id = ?
+                WHERE id = ? AND closed_at IS NULL
+                """,
+                (
+                    now,
+                    float(exit_price),
+                    str(exit_reason),
+                    float(realized_pnl),
+                    close_order_id,
+                    int(plan_id),
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # Persistent fragments of RiskState
+    # ------------------------------------------------------------------
+
+    def add_risk_entry(self, when_iso: str) -> None:
+        """Append a UTC-ISO timestamp marking a successful trade entry."""
+        with self._connect() as con:
+            con.execute("INSERT INTO risk_entries (entered_at) VALUES (?)", (str(when_iso),))
+
+    def trim_risk_entries(self, before_iso: str) -> int:
+        """Delete risk_entries older than ``before_iso``. Returns rows removed."""
+        with self._connect() as con:
+            cur = con.execute(
+                "DELETE FROM risk_entries WHERE entered_at < ?", (str(before_iso),)
+            )
+            return int(cur.rowcount or 0)
+
+    def list_recent_risk_entries(self, since_iso: str) -> list[str]:
+        """Return all entry timestamps at or after ``since_iso``, oldest first."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT entered_at FROM risk_entries WHERE entered_at >= ? ORDER BY entered_at ASC",
+                (str(since_iso),),
+            ).fetchall()
+            return [str(r["entered_at"]) for r in rows]
+
+    def upsert_risk_last_loss(self, when_iso: str | None) -> None:
+        """Set / clear the last losing-close timestamp. ``None`` clears it."""
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO risk_state (id, last_loss_at) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET last_loss_at = excluded.last_loss_at
+                """,
+                (when_iso,),
+            )
+
+    def get_risk_state(self) -> dict[str, Any]:
+        """Snapshot of the persisted RiskState fragment."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT last_loss_at FROM risk_state WHERE id = 1"
+            ).fetchone()
+            last_loss = str(row["last_loss_at"]) if row and row["last_loss_at"] else None
+            entries_rows = con.execute(
+                "SELECT entered_at FROM risk_entries ORDER BY entered_at ASC"
+            ).fetchall()
+        return {
+            "last_loss_at": last_loss,
+            "recent_entries": [str(r["entered_at"]) for r in entries_rows],
+        }

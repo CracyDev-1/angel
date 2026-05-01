@@ -37,18 +37,28 @@ class SmartApiClient:
         self.session = session
         self.settings = settings or get_settings()
 
+    # Documented Angel auth-error codes; anything else (e.g. AB1004 "Tokens
+    # max limit exceeded") must NOT trigger a JWT refresh-and-retry cycle.
+    _AUTH_ERROR_CODES = frozenset({"AG8001", "AG8002", "AG8003", "AB1010", "AB1011"})
+
     def _auth_retryable(self, e: AngelHttpError) -> bool:
         if e.status_code in (401, 403):
             return True
         body = e.body
         if isinstance(body, dict):
+            err = str(body.get("errorcode", "")).strip().upper()
+            if err in self._AUTH_ERROR_CODES:
+                return True
             msg = str(body.get("message", "")).lower()
-            if "invalid" in msg and "token" in msg:
+            # Strict phrase match — substring-only checks (`"token" in msg`)
+            # incorrectly classify AB1004's message ("Tokens max limit
+            # exceeded") as auth, causing a useless refresh + retry of an
+            # oversized payload.
+            if "invalid token" in msg:
                 return True
-            if "expired" in msg and "token" in msg:
+            if "token expired" in msg or "session expired" in msg:
                 return True
-            err = str(body.get("errorcode", "")).lower()
-            if "ag" in err or "token" in err:
+            if "unauthorized" in msg:
                 return True
         return False
 
@@ -243,6 +253,24 @@ class SmartApiClient:
             raise AngelHttpError(f"HTTP {r.status_code} for {path}", status_code=r.status_code, body=payload)
         if isinstance(payload, dict) and payload.get("status") is False:
             msg = str(payload.get("message", ""))
-            if any(x in msg.lower() for x in ("token", "invalid", "expired", "unauthorized")):
+            err = str(payload.get("errorcode", "")).strip().upper()
+            # Auth-shaped errors per Angel docs:
+            #   AG8001  Invalid Token
+            #   AG8002  Token Expired
+            #   AG8003  Token mismatch
+            #   AB1010  Invalid Refresh Token
+            # IMPORTANT: do NOT match the generic substring "token" in the
+            # message — it accidentally catches AB1004 "Tokens max limit
+            # exceeded" (the Quote endpoint cap), which is NOT auth.
+            auth_codes = {"AG8001", "AG8002", "AG8003", "AB1010", "AB1011"}
+            low = msg.lower()
+            looks_auth = (
+                err in auth_codes
+                or "invalid token" in low
+                or "token expired" in low
+                or "session expired" in low
+                or "unauthorized" in low
+            )
+            if looks_auth:
                 raise AngelHttpError(msg, status_code=401, body=payload)
         return payload

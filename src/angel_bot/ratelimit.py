@@ -335,20 +335,26 @@ def reset_rate_limiter() -> None:
 def looks_rate_limited(*, status_code: int | None, body: object) -> bool:
     """Heuristic — Angel sometimes returns HTTP 403 with a JSON body explaining
     the breach, sometimes returns 200 with status:false + a message. Either way
-    the message contains 'rate limit' / 'exceeding'. Treat as backoff-worthy.
+    the message contains 'rate limit' / 'exceeding rate'. Treat as backoff-worthy.
+
+    Important: this MUST NOT match auth-shaped errors (AG8001/AG8002/AG8003)
+    or the per-request payload cap AB1004 ("Tokens max limit exceeded").
+    Those need their own handling — silently backing off and retrying the
+    same payload just masks the real problem.
     """
     if status_code == 429:
         return True
     msg = ""
-    err = ""
     if isinstance(body, dict):
         msg = str(body.get("message") or body.get("errormessage") or "").lower()
-        err = str(body.get("errorcode") or "").lower()
-    if status_code == 403 and ("rate" in msg or "exceed" in msg or "denied" in msg):
+    # Angel's published rate-limit response on 403 always says
+    # "Access denied because of exceeding access rate".
+    if status_code == 403 and (
+        "rate limit" in msg
+        or "exceeding access rate" in msg
+        or "access denied" in msg
+    ):
         return True
     if "rate limit" in msg or "exceeding rate" in msg or "too many requests" in msg:
-        return True
-    # Angel's documented rate-limit error code in some payloads.
-    if err in {"ab1004", "ag8002", "ag8003"}:
         return True
     return False

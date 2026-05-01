@@ -119,11 +119,19 @@ async def test_note_rate_limited_forces_backoff():
 
 def test_looks_rate_limited_detection():
     assert looks_rate_limited(status_code=429, body=None)
-    assert looks_rate_limited(status_code=403, body={"message": "exceeding rate limit"})
+    assert looks_rate_limited(status_code=403, body={"message": "exceeding access rate"})
     assert looks_rate_limited(status_code=200, body={"status": False, "message": "Rate limit exceeded"})
-    assert looks_rate_limited(status_code=200, body={"errorcode": "AB1004"})
     assert not looks_rate_limited(status_code=200, body={"status": True, "data": {}})
     assert not looks_rate_limited(status_code=401, body={"message": "Invalid token"})
+    # AB1004 is a per-request payload cap, NOT a rate limit. Treating it as
+    # such caused a refresh-and-retry loop on the same oversized payload.
+    assert not looks_rate_limited(
+        status_code=200, body={"errorcode": "AB1004", "message": "Tokens max limit exceeded"}
+    )
+    # AG8002/AG8003 are auth, not rate.
+    assert not looks_rate_limited(
+        status_code=200, body={"errorcode": "AG8002", "message": "Token Expired"}
+    )
 
 
 def test_every_documented_endpoint_is_registered():
