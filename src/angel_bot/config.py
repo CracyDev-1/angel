@@ -72,13 +72,17 @@ class Settings(BaseSettings):
     risk_capital_rupees: float = Field(default=0.0, validation_alias="RISK_CAPITAL_RUPEES")
     risk_per_trade_pct: float = Field(default=1.0, validation_alias="RISK_PER_TRADE_PCT")
     risk_max_daily_loss_pct: float = Field(default=2.5, validation_alias="RISK_MAX_DAILY_LOSS_PCT")
-    risk_max_trades_per_day: int = Field(default=12, validation_alias="RISK_MAX_TRADES_PER_DAY")
+    # Daily trade-count cap. 0 disables (the default) — count-based
+    # throttles can stop a strategy mid-streak; rely on the daily-loss
+    # kill switch + concurrent-position cap for safety instead.
+    risk_max_trades_per_day: int = Field(default=0, validation_alias="RISK_MAX_TRADES_PER_DAY")
     risk_one_position_at_a_time: bool = Field(
         default=False, validation_alias="RISK_ONE_POSITION_AT_A_TIME"
     )
-    # Trades-per-hour cap (rolling 60-minute window). 0 disables the cap.
+    # Trades-per-hour cap (rolling 60-minute window). 0 disables (the
+    # default) — same rationale as the daily count cap.
     risk_max_trades_per_hour: int = Field(
-        default=3, validation_alias="RISK_MAX_TRADES_PER_HOUR"
+        default=0, validation_alias="RISK_MAX_TRADES_PER_HOUR"
     )
     # Cooldown after a losing close: refuse new entries for this many
     # minutes. 0 disables the cooldown.
@@ -148,20 +152,29 @@ class Settings(BaseSettings):
     # history at bot start so the brain has ≥5 5m + ≥2 15m bars on cycle 1
     # — without this, every restart loses the in-memory aggregator and the
     # bot sits in ``warmup`` for 25-30 minutes before grading any signal.
+    # Runs as a background task so the auto-trader loop starts scanning
+    # immediately (live-tick polls + brain grades each instrument as soon
+    # as its seed lands).
     bot_warmup_from_history: bool = Field(
         default=True, validation_alias="BOT_WARMUP_FROM_HISTORY"
     )
+    # Tight lookback windows — just enough to clear the brain's warmup
+    # gate (≥5 5m bars + ≥2 15m bars). 90 min of 5m → ~18 bars, 6 h of
+    # 15m → ~24 bars (handles Monday morning when Friday closes still
+    # count). Default 1m lookback is 0 minutes: the live-tick scanner
+    # populates the first 1m bar within seconds, so paying for a
+    # historical-API call for it is wasted rate budget on every restart.
     bot_warmup_lookback_5m_min: int = Field(
-        default=360, validation_alias="BOT_WARMUP_LOOKBACK_5M_MIN"
+        default=90, validation_alias="BOT_WARMUP_LOOKBACK_5M_MIN"
     )
     bot_warmup_lookback_15m_min: int = Field(
-        default=2160, validation_alias="BOT_WARMUP_LOOKBACK_15M_MIN"
+        default=360, validation_alias="BOT_WARMUP_LOOKBACK_15M_MIN"
     )
     bot_warmup_lookback_1m_min: int = Field(
-        default=60, validation_alias="BOT_WARMUP_LOOKBACK_1M_MIN"
+        default=0, validation_alias="BOT_WARMUP_LOOKBACK_1M_MIN"
     )
     bot_warmup_concurrency: int = Field(
-        default=3, validation_alias="BOT_WARMUP_CONCURRENCY"
+        default=1, validation_alias="BOT_WARMUP_CONCURRENCY"
     )
 
     # Adopt long positions opened *directly on the Angel One platform* and

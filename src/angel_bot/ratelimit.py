@@ -332,10 +332,21 @@ def reset_rate_limiter() -> None:
 # Helpers for callers
 # ---------------------------------------------------------------------------
 
+_RATE_LIMIT_PHRASES: tuple[str, ...] = (
+    "rate limit",
+    "exceeding rate",
+    "exceeding access rate",
+    "access denied",
+    "too many requests",
+)
+
+
 def looks_rate_limited(*, status_code: int | None, body: object) -> bool:
     """Heuristic — Angel sometimes returns HTTP 403 with a JSON body explaining
-    the breach, sometimes returns 200 with status:false + a message. Either way
-    the message contains 'rate limit' / 'exceeding rate'. Treat as backoff-worthy.
+    the breach, sometimes returns 200 with status:false + a message, and
+    sometimes returns 403 with a *plain-text* body ("Access denied because of
+    exceeding access rate"). All three should trigger a back-off rather than
+    a JWT refresh.
 
     Important: this MUST NOT match auth-shaped errors (AG8001/AG8002/AG8003)
     or the per-request payload cap AB1004 ("Tokens max limit exceeded").
@@ -344,17 +355,19 @@ def looks_rate_limited(*, status_code: int | None, body: object) -> bool:
     """
     if status_code == 429:
         return True
+
     msg = ""
     if isinstance(body, dict):
         msg = str(body.get("message") or body.get("errormessage") or "").lower()
-    # Angel's published rate-limit response on 403 always says
-    # "Access denied because of exceeding access rate".
-    if status_code == 403 and (
-        "rate limit" in msg
-        or "exceeding access rate" in msg
-        or "access denied" in msg
-    ):
+    elif isinstance(body, (str, bytes)):
+        msg = (body.decode() if isinstance(body, bytes) else body).lower()
+
+    if any(p in msg for p in _RATE_LIMIT_PHRASES):
         return True
-    if "rate limit" in msg or "exceeding rate" in msg or "too many requests" in msg:
+    # Bare 403 with no body — Angel's gateway sometimes drops the
+    # explanatory text but still means "you're banging too hard". Treating
+    # it as rate-limited (and backing off) is safer than treating it as
+    # auth and burning a JWT refresh on every burst.
+    if status_code == 403 and not msg:
         return True
     return False

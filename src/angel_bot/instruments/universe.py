@@ -100,9 +100,18 @@ class UniverseSpec:
         # number of `atm_for` underlyings or `atm_offsets`/`atm_expiries`
         # to stay under the cap.
         #
-        # ATM chain: 5 strikes per side per expiry (ITM-2 .. OTM+2) over the
-        # next 2 expiries → fat-but-relevant options watchlist that surfaces
-        # both intraday and weekly expiries on the dashboard.
+        # ATM chain: 3 strikes per side (ITM-1 / ATM / OTM+1) on the
+        # NEAREST expiry only. Two reasons:
+        #   1. Wider chains polluted the watchlist with strikes the bot
+        #      will never trade and inflated Angel's LTP-batch token
+        #      budget (AB1004 errors at 7 indices × 5 offsets × 2
+        #      expiries × 2 sides = 140 option rows).
+        #   2. Showing ATM for the *next* expiry alongside the nearest
+        #      caused the dashboard to display the wrong premium (the
+        #      farther-out one is fatter due to time value), which is
+        #      why "1 lot" looked higher on the bot than on Angel One.
+        # Only the nearest weekly/monthly expiry is watched and traded —
+        # exactly what the user asked for.
         return cls(
             indices=[
                 "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
@@ -114,8 +123,8 @@ class UniverseSpec:
                 "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
                 "SENSEX", "BANKEX",
             ],
-            atm_offsets=[-2, -1, 0, 1, 2],
-            atm_expiries=2,
+            atm_offsets=[-1, 0, 1],
+            atm_expiries=1,
         )
 
 

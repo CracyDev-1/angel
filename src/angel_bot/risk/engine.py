@@ -188,10 +188,12 @@ class RiskEngine:
                 False, 0,
                 f"max_concurrent ({self.state.open_position_count}/{s.bot_max_concurrent_positions})",
             )
-        # 2) daily trade cap
-        if self.state.trades_today >= s.risk_max_trades_per_day:
+        # 2) daily trade-count cap (0 disables — count-based throttles
+        #    can stop a winning streak prematurely; the daily-loss kill
+        #    switch below is the real safety net).
+        if s.risk_max_trades_per_day > 0 and self.state.trades_today >= s.risk_max_trades_per_day:
             return RiskDecision(False, 0, "max_trades_today")
-        # 3) per-hour trade cap
+        # 3) per-hour trade-count cap (0 disables — same rationale).
         if s.risk_max_trades_per_hour > 0:
             n_hour = self.trades_last_hour()
             if n_hour >= s.risk_max_trades_per_hour:

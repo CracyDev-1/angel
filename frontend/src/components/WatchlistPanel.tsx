@@ -25,11 +25,34 @@ function expiryLabel(iso: string | undefined | null): string {
   return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
 }
 
+// "2026-05-12" sorts lexicographically the same as chronologically; empty
+// expiry strings sort LAST so any row missing metadata can't masquerade
+// as the nearest expiry.
+function expirySortKey(h: ScannerHit): string {
+  return h.expiry && h.expiry.length > 0 ? h.expiry : "9999-12-31";
+}
+
+function nearestExpiry(rows: ScannerHit[]): string {
+  let earliest: string | null = null;
+  for (const r of rows) {
+    if (!r.expiry) continue;
+    if (earliest == null || r.expiry < earliest) earliest = r.expiry;
+  }
+  return earliest ?? "";
+}
+
 function pickAtm(rows: ScannerHit[]): ScannerHit | null {
   if (rows.length === 0) return null;
-  const exact = rows.find((r) => (r.offset ?? 99) === 0);
+  // The watchlist may contain multiple expiries for the same underlying
+  // (anyone overriding atm_expiries > 1). The "ATM" pill must show the
+  // NEAREST expiry's premium — the further-out one is always fatter due
+  // to time value, which is why bot lot-cost looked higher than Angel
+  // One's app. We always anchor to the earliest expiry we know about.
+  const nearest = nearestExpiry(rows);
+  const sameExpiry = nearest ? rows.filter((r) => r.expiry === nearest) : rows;
+  const exact = sameExpiry.find((r) => (r.offset ?? 99) === 0);
   if (exact) return exact;
-  return rows.slice().sort(
+  return sameExpiry.slice().sort(
     (a, b) => Math.abs(a.offset ?? 0) - Math.abs(b.offset ?? 0),
   )[0];
 }
@@ -55,8 +78,18 @@ function groupHits(hits: ScannerHit[]): Group[] {
     }
   }
   for (const g of buckets.values()) {
-    g.ce.sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0));
-    g.pe.sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0));
+    // Primary key: expiry ASC (so nearest comes first), secondary: offset.
+    // This is what makes the strike-strip render nearest-expiry strikes
+    // before any further-out strikes, and lets pickAtm trust the head of
+    // the list when multiple expiries are present.
+    g.ce.sort((a, b) => {
+      const e = expirySortKey(a).localeCompare(expirySortKey(b));
+      return e !== 0 ? e : (a.offset ?? 0) - (b.offset ?? 0);
+    });
+    g.pe.sort((a, b) => {
+      const e = expirySortKey(a).localeCompare(expirySortKey(b));
+      return e !== 0 ? e : (a.offset ?? 0) - (b.offset ?? 0);
+    });
   }
   return Array.from(buckets.values()).sort((a, b) =>
     a.underlying.localeCompare(b.underlying),
@@ -128,9 +161,15 @@ function IndexRow({ group, availableCash }: { group: Group; availableCash: numbe
   const atmCe = pickAtm(group.ce);
   const atmPe = pickAtm(group.pe);
   const expiry = atmCe?.expiry || atmPe?.expiry || "";
-  const hasOptions = group.ce.length > 0 || group.pe.length > 0;
+  // Only render strikes that share the displayed ATM expiry. Without
+  // this, an override of atm_expiries > 1 would interleave next-week
+  // strikes alongside the ATM expiry's strikes and confuse the user
+  // ("why is the same strike listed twice?").
+  const ceNear = expiry ? group.ce.filter((r) => r.expiry === expiry) : group.ce;
+  const peNear = expiry ? group.pe.filter((r) => r.expiry === expiry) : group.pe;
+  const hasOptions = ceNear.length > 0 || peNear.length > 0;
   const extraCount =
-    Math.max(0, group.ce.length - 1) + Math.max(0, group.pe.length - 1);
+    Math.max(0, ceNear.length - 1) + Math.max(0, peNear.length - 1);
 
   return (
     <li>
@@ -175,11 +214,11 @@ function IndexRow({ group, availableCash }: { group: Group; availableCash: numbe
 
       {open && hasOptions ? (
         <div className="space-y-1 bg-slate-950/40 px-3 pb-3 pt-1">
-          {group.ce.length > 0 ? (
-            <StrikeStrip rows={group.ce} side="CE" availableCash={availableCash} />
+          {ceNear.length > 0 ? (
+            <StrikeStrip rows={ceNear} side="CE" availableCash={availableCash} />
           ) : null}
-          {group.pe.length > 0 ? (
-            <StrikeStrip rows={group.pe} side="PE" availableCash={availableCash} />
+          {peNear.length > 0 ? (
+            <StrikeStrip rows={peNear} side="PE" availableCash={availableCash} />
           ) : null}
         </div>
       ) : null}
@@ -202,12 +241,29 @@ function AtmPill({
   const lotTone =
     lot != null && availableCash > 0 && lot > availableCash ? "text-amber-300" : "text-slate-300";
   const score = Math.round((h.score ?? 0) * 100);
+  const strikeLabel =
+    h.strike && h.strike > 0
+      ? h.strike.toLocaleString("en-IN", { maximumFractionDigits: 0 })
+      : null;
+  // Tooltip is intentionally verbose so the user can verify against
+  // Angel One: tradingsymbol + strike + LTP × lot_size = displayed lot
+  // value. If anything mismatches, the symbol shown here pinpoints
+  // exactly which instrument the bot is pricing.
+  const lotMath =
+    h.last_price != null && h.lot_size
+      ? `LTP ${formatINR(h.last_price)} × ${h.lot_size} = ${
+          lot != null ? formatINR(lot) : "—"
+        }`
+      : `1 lot ${lot != null ? formatINR(lot) : "—"}`;
   return (
     <span
       className={`group flex min-w-0 items-center gap-1 rounded border ${sideTone} bg-slate-900/40 px-1.5 py-1 text-[11px]`}
-      title={`${h.tradingsymbol || h.name}${h.strike ? ` · strike ${h.strike}` : ""} · 1 lot ${lot != null ? formatINR(lot) : "—"} · ${aff} affordable · score ${score}`}
+      title={`${h.tradingsymbol || h.name}${strikeLabel ? ` · strike ${strikeLabel}` : ""} · ${lotMath} · ${aff} affordable · score ${score}`}
     >
       <span className="font-semibold uppercase tracking-wider">{side}</span>
+      {strikeLabel ? (
+        <span className="text-slate-500 tabular-nums">{strikeLabel}</span>
+      ) : null}
       <span className="font-semibold tabular-nums text-slate-100">
         {formatINR(h.last_price)}
       </span>

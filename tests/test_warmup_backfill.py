@@ -129,7 +129,10 @@ def _scanner_with_watchlist() -> ScannerEngine:
     return scanner
 
 
-def test_warmup_from_history_seeds_each_watchlist_token() -> None:
+def test_warmup_from_history_seeds_each_watchlist_token_default_skips_1m() -> None:
+    """By default we only fetch 5m + 15m. The brain's 1m gate is satisfied
+    by live ticks within seconds, so paying for a third historical call
+    per instrument on every restart was wasted rate budget."""
     base = datetime(2026, 5, 4, 9, 15, tzinfo=UTC)
     api = AsyncMock()
     api.get_candle_data = AsyncMock(
@@ -146,13 +149,39 @@ def test_warmup_from_history_seeds_each_watchlist_token() -> None:
     scanner = _scanner_with_watchlist()
     seeded = asyncio.run(scanner.warmup_from_history(api))
     assert seeded == 2
-    # Each (exchange, token) made exactly 3 calls (1m / 5m / 15m).
-    assert api.get_candle_data.await_count == 6
-    # Seeded data is reachable through the aggregator.
+    # 2 instruments × 2 timeframes (5m, 15m) = 4 calls (NOT 6 — 1m is
+    # skipped by default).
+    assert api.get_candle_data.await_count == 4
+    intervals_called = {
+        kw.get("interval_minutes") for _, kw in api.get_candle_data.await_args_list
+    }
+    assert intervals_called == {5, 15}
     agg_nifty = scanner._aggs["NSE:99926000"]  # noqa: SLF001
     _, c5, c15 = agg_nifty.snapshot_lists()
     assert len(c5) == 10
     assert len(c15) == 4
+
+
+def test_warmup_optionally_includes_1m_when_lookback_set() -> None:
+    """Opt-in 1m fetch — kept for advanced users who want the brain's
+    pattern-detection block fully primed on cycle 1."""
+    base = datetime(2026, 5, 4, 9, 15, tzinfo=UTC)
+    api = AsyncMock()
+    api.get_candle_data = AsyncMock(
+        side_effect=lambda *, exchange, symboltoken, interval_minutes, fromdate, todate: (
+            _angel_history_response(
+                _make_candles(
+                    base,
+                    interval_minutes,
+                    {1: 30, 5: 10, 15: 4}.get(interval_minutes, 0),
+                )
+            )
+        )
+    )
+    scanner = _scanner_with_watchlist()
+    seeded = asyncio.run(scanner.warmup_from_history(api, lookback_1m_minutes=30))
+    assert seeded == 2
+    assert api.get_candle_data.await_count == 6  # 2 instruments × 3 timeframes
 
 
 def test_warmup_only_keys_filters_targets() -> None:
@@ -162,8 +191,8 @@ def test_warmup_only_keys_filters_targets() -> None:
     )
     scanner = _scanner_with_watchlist()
     asyncio.run(scanner.warmup_from_history(api, only_keys={"NFO:12345"}))
-    # Only the option leg should have been called (1m + 5m + 15m = 3 calls).
-    assert api.get_candle_data.await_count == 3
+    # Default: 5m + 15m only = 2 calls for the option leg.
+    assert api.get_candle_data.await_count == 2
     called_tokens = {kw.get("symboltoken") for _, kw in api.get_candle_data.await_args_list}
     assert called_tokens == {"12345"}
 
@@ -211,6 +240,75 @@ def test_warmup_handles_iso_with_explicit_offset_and_naive_strings() -> None:
     assert c5[0].ts.hour == 3 and c5[0].ts.minute == 45
     # 09:20 IST = 03:50 UTC
     assert c5[1].ts.hour == 3 and c5[1].ts.minute == 50
+
+
+def test_runtime_does_not_block_loop_on_warmup() -> None:
+    """The auto-trader loop must NOT await the historical seed inline.
+
+    Previous behaviour blocked for ~30 seconds (12 instruments × 3 timeframes
+    @ 1/sec rate limit) before the first scan cycle. We now schedule the
+    seed as a background task — the runtime stores a reference to it on
+    ``_warmup_task`` and proceeds straight to live scanning.
+    """
+    from angel_bot.runtime import TradingRuntime
+
+    rt = TradingRuntime.__new__(TradingRuntime)
+    rt.settings = get_settings()
+    rt.scanner = _scanner_with_watchlist()
+    rt._warmup_task = None  # type: ignore[attr-defined]
+    rt._warmed_keys = set()  # type: ignore[attr-defined]
+    rt._warmup_seeded = 0  # type: ignore[attr-defined]
+
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def _slow_warmup(*_args: Any, **_kw: Any) -> int:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.set()
+        return 2
+
+    rt.scanner.warmup_from_history = _slow_warmup  # type: ignore[assignment]
+
+    async def _scenario() -> None:
+        api = AsyncMock()
+        rt._warmup_task = asyncio.create_task(rt._run_initial_warmup(api))  # type: ignore[attr-defined]
+        # The synchronous part returned immediately; the background task
+        # is still running.
+        assert not finished.is_set()
+        await started.wait()
+        assert rt._warmup_task is not None  # type: ignore[attr-defined]
+        assert not rt._warmup_task.done()  # type: ignore[attr-defined]
+        await rt._warmup_task  # type: ignore[attr-defined]
+        assert finished.is_set()
+        assert rt._warmup_seeded == 2  # type: ignore[attr-defined]
+
+    asyncio.run(_scenario())
+
+
+def test_runtime_warmup_failure_does_not_kill_runtime() -> None:
+    """A broker error during the background warmup must not propagate."""
+    from angel_bot.runtime import TradingRuntime
+
+    rt = TradingRuntime.__new__(TradingRuntime)
+    rt.settings = get_settings()
+    rt.scanner = _scanner_with_watchlist()
+    rt._warmup_task = None  # type: ignore[attr-defined]
+    rt._warmed_keys = set()  # type: ignore[attr-defined]
+    rt._warmup_seeded = 0  # type: ignore[attr-defined]
+
+    async def _boom(*_args: Any, **_kw: Any) -> int:
+        raise RuntimeError("broker exploded")
+
+    rt.scanner.warmup_from_history = _boom  # type: ignore[assignment]
+
+    async def _scenario() -> None:
+        api = AsyncMock()
+        # Should swallow the error and leave _warmup_seeded at 0.
+        await rt._run_initial_warmup(api)  # type: ignore[attr-defined]
+        assert rt._warmup_seeded == 0  # type: ignore[attr-defined]
+
+    asyncio.run(_scenario())
 
 
 @pytest.mark.parametrize("interval_minutes", [1, 5, 15])

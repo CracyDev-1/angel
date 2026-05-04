@@ -121,19 +121,30 @@ class ScannerEngine:
         api: SmartApiClient,
         *,
         only_keys: set[str] | None = None,
-        lookback_5m_minutes: int = 6 * 60,
-        lookback_15m_minutes: int = 36 * 60,
-        lookback_1m_minutes: int = 60,
-        max_concurrent: int = 3,
+        lookback_5m_minutes: int = 90,
+        lookback_15m_minutes: int = 6 * 60,
+        lookback_1m_minutes: int = 0,
+        max_concurrent: int = 1,
     ) -> int:
         """Backfill each watchlist symbol's candle aggregator from broker history.
 
         Without this, every process restart leaves the brain stuck in
         ``warmup`` for ~25 minutes while the in-memory aggregator rebuilds
         from live LTP polls. We call Angel's ``getCandleData`` for each
-        ``(exchange, token)`` we plan to watch and seed the 1m / 5m / 15m
+        ``(exchange, token)`` we plan to watch and seed the 5m / 15m
         deques with the closed bars the broker already has — so the brain
-        can grade signals on the very first scan cycle.
+        can grade signals very soon after start.
+
+        Defaults are deliberately small to minimise total warmup time
+        without losing signal quality:
+          * 5m: 90-minute lookback → ~18 bars (brain needs ≥5)
+          * 15m: 6-hour lookback → ~24 bars (brain needs ≥2; longer lookback
+            is needed because Friday closes count for Monday morning).
+          * 1m: skipped by default (``lookback_1m_minutes=0``) — the brain
+            only needs ``len(c1) >= 1`` and the live-tick scanner provides
+            that within seconds. Saves N getCandleData calls per restart.
+          * concurrency 1 — Angel's gateway is stricter than the published
+            3/sec on getCandleData; serialising avoids 403 thrash.
 
         ``only_keys`` (optional) limits the warmup to specific
         ``"EXCHANGE:TOKEN"`` keys, used when the universe rebuild adds new
@@ -161,7 +172,11 @@ class ScannerEngine:
         now_ist = datetime.now(IST)
         from_5m = now_ist - timedelta(minutes=lookback_5m_minutes)
         from_15m = now_ist - timedelta(minutes=lookback_15m_minutes)
-        from_1m = now_ist - timedelta(minutes=lookback_1m_minutes)
+        from_1m = (
+            now_ist - timedelta(minutes=lookback_1m_minutes)
+            if lookback_1m_minutes > 0
+            else None
+        )
         to_str = now_ist.strftime("%Y-%m-%d %H:%M")
 
         sem = asyncio.Semaphore(max(1, int(max_concurrent)))
@@ -191,11 +206,16 @@ class ScannerEngine:
             return _parse_candle_rows(data)
 
         async def seed_one(ex: str, tok: str) -> bool:
-            c1, c5, c15 = await asyncio.gather(
-                fetch_one(ex, tok, 1, from_1m),
+            tasks = [
                 fetch_one(ex, tok, 5, from_5m),
                 fetch_one(ex, tok, 15, from_15m),
-            )
+            ]
+            if from_1m is not None:
+                tasks.append(fetch_one(ex, tok, 1, from_1m))
+            fetched = await asyncio.gather(*tasks)
+            c5 = fetched[0]
+            c15 = fetched[1]
+            c1 = fetched[2] if len(fetched) > 2 else []
             # Seed even partial data — 5m alone is often enough to clear
             # the warmup gate. We require at least one timeframe to have
             # rows so we don't blank an aggregator that already has live
@@ -215,6 +235,9 @@ class ScannerEngine:
             "scanner_warmup_history_done",
             requested=len(targets),
             seeded=seeded,
+            lookback_5m_min=lookback_5m_minutes,
+            lookback_15m_min=lookback_15m_minutes,
+            lookback_1m_min=lookback_1m_minutes,
         )
         return seeded
 

@@ -57,7 +57,15 @@ class SmartApiClient:
     _AUTH_ERROR_CODES = frozenset({"AG8001", "AG8002", "AG8003", "AB1010", "AB1011"})
 
     def _auth_retryable(self, e: AngelHttpError) -> bool:
-        if e.status_code in (401, 403):
+        # 401 is unambiguously auth. 403 used to be treated as auth too, but
+        # Angel uses 403 for both "JWT bad" AND "you tripped the per-second
+        # rate limit" — the latter is FAR more common and was flooding logs
+        # with "smartapi_refresh_after_auth_error" + an immediate JWT
+        # generateTokens call (which also costs rate budget). The
+        # rate-limit retry path catches 403s with rate-limit phrases or
+        # empty bodies, so by the time we get here a 403 is genuinely
+        # auth-shaped only if its message looks like one.
+        if e.status_code == 401:
             return True
         body = e.body
         if isinstance(body, dict):
@@ -189,6 +197,30 @@ class SmartApiClient:
         await self.session.ensure_login()
         return await self._get_with_auth_retry(HOLDING_PATH)
 
+    async def get_single_ltp(
+        self,
+        *,
+        exchange: str,
+        tradingsymbol: str,
+        symboltoken: str,
+    ) -> dict[str, Any]:
+        """Fetch LTP/OHLC for one instrument via Angel's getLtpData endpoint.
+
+        Used as a fallback when the scanner cache hasn't priced an option
+        the brain just resolved (e.g. an ATM strike that joined the
+        watchlist a fraction of a second ago) — instead of skipping the
+        trade with ``no_execution_price`` we make this single, cheap call
+        and retry. Has its own rate-limit bucket (10/sec) so it doesn't
+        compete with the scanner's batch quote.
+        """
+        await self.session.ensure_login()
+        body = {
+            "exchange": str(exchange).upper(),
+            "tradingsymbol": str(tradingsymbol),
+            "symboltoken": str(symboltoken),
+        }
+        return await self._post_with_auth_retry(LTP_PATH, body)
+
     async def get_candle_data(
         self,
         *,
@@ -286,6 +318,18 @@ class SmartApiClient:
                     content_type=r.headers.get("content-type"),
                     final_url=str(r.url),
                 )
+                # An empty 403 from Angel's gateway is almost always a
+                # rate-limit drop (especially on bursts to /historical or
+                # /quote). Push the limiter so the next retry naturally
+                # waits, and surface it as a rate-limited error so the
+                # auth-retry path doesn't try to refresh JWT.
+                if r.status_code == 403:
+                    get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+                    raise AngelHttpError(
+                        f"Rate limited by broker (HTTP 403, empty body) for {path}",
+                        status_code=r.status_code,
+                        body="rate limit",
+                    )
                 raise AngelHttpError(
                     "Empty error body from broker (HTTP "
                     f"{r.status_code}) for {path} — often gateway rejection; "
@@ -306,7 +350,8 @@ class SmartApiClient:
             try:
                 parsed: Any = json.loads(raw_text)
             except json.JSONDecodeError as exc:
-                if looks_rate_limited(status_code=r.status_code, body=raw_text):
+                rate_limited = looks_rate_limited(status_code=r.status_code, body=raw_text)
+                if rate_limited:
                     get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
                 log.warning(
                     "smartapi_non_json_response",
@@ -316,9 +361,14 @@ class SmartApiClient:
                     body_preview=raw_text[:500],
                     final_url=str(r.url),
                 )
+                # Pass the raw text through as ``body`` so the auth-vs-rate-
+                # limit classifier upstream can match the message phrase
+                # ("Access denied because of exceeding access rate") and
+                # avoid a wasted JWT refresh.
                 raise AngelHttpError(
                     f"Non-JSON response (HTTP {r.status_code}): {raw_text[:500]!r}",
                     status_code=r.status_code,
+                    body=raw_text[:500],
                 ) from exc
             if not isinstance(parsed, dict):
                 log.warning(
