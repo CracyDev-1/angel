@@ -32,9 +32,9 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class PaperConfig:
-    stop_loss_pct: float = 0.01      # 1% adverse move from entry
-    take_profit_pct: float = 0.02    # 2% favorable move from entry
-    max_hold_minutes: int = 90       # session timeout for a paper trade
+    stop_loss_pct: float = 0.015     # 1.5% adverse move from entry
+    take_profit_pct: float = 0.04    # 4% favorable move from entry
+    max_hold_minutes: int = 55       # session timeout for a paper trade
     max_open_positions: int = 5      # safety cap
 
 

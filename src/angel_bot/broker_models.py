@@ -72,15 +72,14 @@ def normalize_positions(
 
     P&L resolution order (most-trustworthy first), per row:
 
-      1. ``realised + unrealised`` if both fields are present — this is
-         exactly what Angel One's app shows.
-      2. ``mark_to_market`` recomputed from the freshest LTP we have
-         (scanner cache via ``fresh_prices`` first, broker's own ``ltp``
-         second) and the broker's avg-buy/sell. Beats Angel's ``pnl``
-         field for open positions because the broker snapshot lags by
-         several seconds during fast tape.
-      3. ``pnl`` field straight from the broker (last resort — already
-         stale by the time we render it but at least non-zero).
+      1. ``realised + unrealised`` when Angel splits them — matches the
+         position-level breakdown in the Angel One app.
+      2. Consolidated ``pnl`` on the row when R/U are absent — Angel's
+         own net for that line (may include their fee/charge treatment).
+         We prefer this *before* recomputing MTM so the dashboard total
+         tracks the broker feed instead of our synthetic mark.
+      3. ``mark_to_market`` from the freshest LTP (scanner cache first)
+         when neither split nor ``pnl`` is available.
 
     We *never* fall back to ``netvalue``: that field is sell_amount –
     buy_amount, which for an open BUY position equals -buy_amount and
@@ -133,7 +132,20 @@ def normalize_positions(
         if realised is not None or unrealised is not None:
             pnl = (realised or 0.0) + (unrealised or 0.0)
             pnl_source = "broker_realised_unrealised"
-        # Step 2: mark to market with whatever LTP is freshest.
+        # Step 2: Angel's consolidated row total — match their feed before
+        # we invent an MTM number (which ignores broker-side adjustments).
+        elif broker_pnl is not None:
+            pnl = broker_pnl
+            pnl_source = "broker_pnl"
+            # Attribute to realised vs unrealised so header totals stay
+            # consistent with pnl_total when Angel omits the split.
+            if (net_qty or 0) != 0:
+                realised = 0.0
+                unrealised = broker_pnl
+            else:
+                realised = broker_pnl
+                unrealised = 0.0
+        # Step 3: mark to market with whatever LTP is freshest.
         elif ltp is not None and ltp > 0 and buy_avg is not None and (net_qty or buy_qty):
             qty_for_mtm = net_qty if net_qty != 0 else buy_qty
             pnl = (ltp - buy_avg) * qty_for_mtm
@@ -148,10 +160,6 @@ def normalize_positions(
                 unrealised = pnl
                 realised = 0.0
             pnl_source = "mark_to_market"
-        # Step 3: last-resort broker total. NEVER fall back to netvalue.
-        elif broker_pnl is not None:
-            pnl = broker_pnl
-            pnl_source = "broker_pnl"
         else:
             pnl = None
             pnl_source = "unknown"

@@ -24,7 +24,7 @@ import pytest
 
 from angel_bot.config import get_settings
 from angel_bot.market_data.candles import Candle, CandleAggregator
-from angel_bot.scanner.engine import ScannerEngine
+from angel_bot.scanner.engine import ScannerEngine, WarmupResult
 from angel_bot.strategy.brain import BrainEngine
 
 
@@ -147,8 +147,8 @@ def test_warmup_from_history_seeds_each_watchlist_token_default_skips_1m() -> No
         )
     )
     scanner = _scanner_with_watchlist()
-    seeded = asyncio.run(scanner.warmup_from_history(api))
-    assert seeded == 2
+    result = asyncio.run(scanner.warmup_from_history(api))
+    assert result.seeded == 2
     # 2 instruments × 2 timeframes (5m, 15m) = 4 calls (NOT 6 — 1m is
     # skipped by default).
     assert api.get_candle_data.await_count == 4
@@ -179,8 +179,8 @@ def test_warmup_optionally_includes_1m_when_lookback_set() -> None:
         )
     )
     scanner = _scanner_with_watchlist()
-    seeded = asyncio.run(scanner.warmup_from_history(api, lookback_1m_minutes=30))
-    assert seeded == 2
+    result = asyncio.run(scanner.warmup_from_history(api, lookback_1m_minutes=30))
+    assert result.seeded == 2
     assert api.get_candle_data.await_count == 6  # 2 instruments × 3 timeframes
 
 
@@ -201,8 +201,8 @@ def test_warmup_ignores_http_errors_and_keeps_aggregator_clean() -> None:
     api = AsyncMock()
     api.get_candle_data = AsyncMock(side_effect=RuntimeError("broker down"))
     scanner = _scanner_with_watchlist()
-    seeded = asyncio.run(scanner.warmup_from_history(api))
-    assert seeded == 0
+    result = asyncio.run(scanner.warmup_from_history(api))
+    assert result.seeded == 0
     # Aggregators were NOT created with empty seed data; an unseeded
     # aggregator should still be in its pristine state.
     agg = scanner._aggs["NSE:99926000"]  # noqa: SLF001
@@ -214,8 +214,8 @@ def test_warmup_skips_when_status_false() -> None:
     api = AsyncMock()
     api.get_candle_data = AsyncMock(return_value={"status": False, "message": "AB1010"})
     scanner = _scanner_with_watchlist()
-    seeded = asyncio.run(scanner.warmup_from_history(api))
-    assert seeded == 0
+    result = asyncio.run(scanner.warmup_from_history(api))
+    assert result.seeded == 0
 
 
 def test_warmup_handles_iso_with_explicit_offset_and_naive_strings() -> None:
@@ -262,11 +262,11 @@ def test_runtime_does_not_block_loop_on_warmup() -> None:
     started = asyncio.Event()
     finished = asyncio.Event()
 
-    async def _slow_warmup(*_args: Any, **_kw: Any) -> int:
+    async def _slow_warmup(*_args: Any, **_kw: Any) -> WarmupResult:
         started.set()
         await asyncio.sleep(0.05)
         finished.set()
-        return 2
+        return WarmupResult(2, frozenset())
 
     rt.scanner.warmup_from_history = _slow_warmup  # type: ignore[assignment]
 
@@ -297,7 +297,7 @@ def test_runtime_warmup_failure_does_not_kill_runtime() -> None:
     rt._warmed_keys = set()  # type: ignore[attr-defined]
     rt._warmup_seeded = 0  # type: ignore[attr-defined]
 
-    async def _boom(*_args: Any, **_kw: Any) -> int:
+    async def _boom(*_args: Any, **_kw: Any) -> WarmupResult:
         raise RuntimeError("broker exploded")
 
     rt.scanner.warmup_from_history = _boom  # type: ignore[assignment]

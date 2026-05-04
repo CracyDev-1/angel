@@ -132,6 +132,10 @@ class TradingRuntime:
         # flight; replaced with a fresh asyncio.Task each time start_bot
         # fires.
         self._warmup_task: asyncio.Task | None = None
+        # Background backfill for tokens that appear when ATM rolls — must
+        # not block the refresher loop (and should not run unbounded in
+        # parallel; see ``_schedule_delta_warmup``).
+        self._delta_warmup_task: asyncio.Task | None = None
         self.auto_mode: bool = totp_configured_in_env(self.settings)
         self._watchdog_task: asyncio.Task | None = None
         # runtime mode override — flipped by the dashboard "Go Live" toggle
@@ -514,6 +518,13 @@ class TradingRuntime:
             except asyncio.CancelledError:
                 pass
         self._warmup_task = None
+        if self._delta_warmup_task and not self._delta_warmup_task.done():
+            self._delta_warmup_task.cancel()
+            try:
+                await self._delta_warmup_task
+            except asyncio.CancelledError:
+                pass
+        self._delta_warmup_task = None
         self._stop = asyncio.Event()
 
     async def _atm_refresher_loop(self) -> None:
@@ -532,7 +543,7 @@ class TradingRuntime:
             while not self._stop.is_set():
                 try:
                     self._rebuild_universe(spot_provider=self._scanner_spot_provider)
-                    await self._warmup_new_universe_keys()
+                    self._schedule_delta_warmup()
                 except Exception as e:  # noqa: BLE001
                     log.warning("atm_refresh_failed", error=str(e))
                 slept = 0.0
@@ -554,26 +565,39 @@ class TradingRuntime:
         """
         s = self.settings
         try:
-            seeded = await self.scanner.warmup_from_history(
+            outcome = await self.scanner.warmup_from_history(
                 api,
                 lookback_5m_minutes=int(s.bot_warmup_lookback_5m_min),
                 lookback_15m_minutes=int(s.bot_warmup_lookback_15m_min),
                 lookback_1m_minutes=int(s.bot_warmup_lookback_1m_min),
                 max_concurrent=int(s.bot_warmup_concurrency),
             )
-            self._warmup_seeded = int(seeded or 0)
-            wl = self.scanner.active_watchlist()
-            for ex, items in (wl or {}).items():
-                for it in items:
-                    tok = str(it.get("token", "")).strip()
-                    if tok:
-                        self._warmed_keys.add(f"{ex.upper()}:{tok}")
+            self._warmup_seeded = int(outcome.seeded or 0)
+            # Only mark tokens that *actually* received candle rows. The old
+            # behaviour merged the entire watchlist into ``_warmed_keys`` even
+            # when every Angel call failed (403) — those tokens were never
+            # retried, the brain saw empty 5m/15m series → permanent ``warmup``
+            # and zero live orders.
+            self._warmed_keys |= set(outcome.ok_keys)
         except asyncio.CancelledError:
             log.info("auto_trader_warmup_cancelled")
             raise
         except Exception as e:  # noqa: BLE001 — never block the loop on warmup
             log.warning("auto_trader_warmup_failed", error=str(e))
             self._warmup_seeded = 0
+
+    def _schedule_delta_warmup(self) -> None:
+        """Fire-and-forget historical backfill for new universe keys.
+
+        Awaiting this inside the ATM loop used to block for tens of seconds
+        while ``getCandleData`` ratcheted, and merging *all* new keys into
+        ``_warmed_keys`` on failure made retries impossible.
+        """
+        if self._delta_warmup_task and not self._delta_warmup_task.done():
+            return
+        self._delta_warmup_task = asyncio.create_task(
+            self._warmup_new_universe_keys(), name="angel-warmup-delta"
+        )
 
     async def _warmup_new_universe_keys(self) -> None:
         """Seed history for any watchlist tokens we haven't backfilled yet.
@@ -599,21 +623,27 @@ class TradingRuntime:
         new_keys = all_keys - self._warmed_keys
         if not new_keys:
             return
+        max_k = max(0, int(s.bot_warmup_delta_max_keys))
+        sorted_nk = sorted(new_keys)
+        batch = set(sorted_nk[:max_k]) if max_k > 0 else set(sorted_nk)
+        if not batch:
+            return
         try:
-            seeded = await self.scanner.warmup_from_history(
+            outcome = await self.scanner.warmup_from_history(
                 api,
-                only_keys=new_keys,
+                only_keys=batch,
                 lookback_5m_minutes=int(s.bot_warmup_lookback_5m_min),
                 lookback_15m_minutes=int(s.bot_warmup_lookback_15m_min),
                 lookback_1m_minutes=int(s.bot_warmup_lookback_1m_min),
                 max_concurrent=int(s.bot_warmup_concurrency),
             )
-            self._warmed_keys |= new_keys
-            self._warmup_seeded += int(seeded or 0)
+            self._warmed_keys |= set(outcome.ok_keys)
+            self._warmup_seeded += int(outcome.seeded or 0)
             log.info(
                 "scanner_warmup_universe_delta",
-                new_keys=len(new_keys),
-                seeded=seeded,
+                new_keys=len(batch),
+                seeded=outcome.seeded,
+                ok_keys=len(outcome.ok_keys),
                 total_warmed=len(self._warmed_keys),
             )
         except Exception as e:  # noqa: BLE001

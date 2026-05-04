@@ -92,6 +92,19 @@ class ScannerHit:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class WarmupResult:
+    """Outcome of :meth:`ScannerEngine.warmup_from_history`."""
+
+    seeded: int
+    # ``"EXCHANGE:TOKEN"`` keys that actually received a non-empty
+    # ``seed_history`` — used by the runtime to update ``_warmed_keys``
+    # *only* on success. Marking failed tokens as "warmed" prevented any
+    # retry after Angel returned 403 / empty data, leaving empty candles
+    # and locking the brain in ``warmup`` (no live trades).
+    ok_keys: frozenset[str]
+
+
 class ScannerEngine:
     """Stateful: keeps one CandleAggregator per (exchange,token)."""
 
@@ -125,7 +138,7 @@ class ScannerEngine:
         lookback_15m_minutes: int = 6 * 60,
         lookback_1m_minutes: int = 0,
         max_concurrent: int = 1,
-    ) -> int:
+    ) -> WarmupResult:
         """Backfill each watchlist symbol's candle aggregator from broker history.
 
         Without this, every process restart leaves the brain stuck in
@@ -154,7 +167,7 @@ class ScannerEngine:
         """
         wl = self.active_watchlist()
         if not wl:
-            return 0
+            return WarmupResult(0, frozenset())
 
         targets: list[tuple[str, str]] = []
         for ex, items in wl.items():
@@ -167,7 +180,7 @@ class ScannerEngine:
                     continue
                 targets.append((ex.upper(), tok))
         if not targets:
-            return 0
+            return WarmupResult(0, frozenset())
 
         now_ist = datetime.now(IST)
         from_5m = now_ist - timedelta(minutes=lookback_5m_minutes)
@@ -206,16 +219,15 @@ class ScannerEngine:
             return _parse_candle_rows(data)
 
         async def seed_one(ex: str, tok: str) -> bool:
-            tasks = [
-                fetch_one(ex, tok, 5, from_5m),
-                fetch_one(ex, tok, 15, from_15m),
-            ]
+            # Sequential interval fetches — ``asyncio.gather`` here used to
+            # issue two ``getCandleData`` calls back-to-back for the same
+            # symbol and contributed to gateway 403 bursts alongside LTP /
+            # position traffic.
+            c5 = await fetch_one(ex, tok, 5, from_5m)
+            c15 = await fetch_one(ex, tok, 15, from_15m)
+            c1: list[Candle] = []
             if from_1m is not None:
-                tasks.append(fetch_one(ex, tok, 1, from_1m))
-            fetched = await asyncio.gather(*tasks)
-            c5 = fetched[0]
-            c15 = fetched[1]
-            c1 = fetched[2] if len(fetched) > 2 else []
+                c1 = await fetch_one(ex, tok, 1, from_1m)
             # Seed even partial data — 5m alone is often enough to clear
             # the warmup gate. We require at least one timeframe to have
             # rows so we don't blank an aggregator that already has live
@@ -229,8 +241,12 @@ class ScannerEngine:
             )
             return True
 
-        results = await asyncio.gather(*(seed_one(ex, tok) for ex, tok in targets))
-        seeded = sum(1 for r in results if r)
+        seeded = 0
+        ok_keys: set[str] = set()
+        for ex, tok in targets:
+            if await seed_one(ex, tok):
+                seeded += 1
+                ok_keys.add(f"{ex.upper()}:{tok}")
         log.info(
             "scanner_warmup_history_done",
             requested=len(targets),
@@ -239,7 +255,7 @@ class ScannerEngine:
             lookback_15m_min=lookback_15m_minutes,
             lookback_1m_min=lookback_1m_minutes,
         )
-        return seeded
+        return WarmupResult(seeded, frozenset(ok_keys))
 
     def active_watchlist(self) -> dict[str, list[dict[str, Any]]]:
         if self._dynamic_watchlist is not None:

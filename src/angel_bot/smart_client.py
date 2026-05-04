@@ -252,7 +252,14 @@ class SmartApiClient:
             "fromdate": fromdate,
             "todate": todate,
         }
-        return await self._post_with_auth_retry(HISTORICAL_PATH, body)
+        out = await self._post_with_auth_retry(HISTORICAL_PATH, body)
+        # Extra spacing beyond the rate-limiter: ``getCandleData`` competes
+        # with LTP/position/order traffic for Angel's *global* gateway budget.
+        # A short pause after every successful call keeps 403 thrash down.
+        gap = float(getattr(self.settings, "rate_limit_candle_min_gap_s", 0.0) or 0.0)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        return out
 
     async def _post_with_auth_retry(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -280,8 +287,9 @@ class SmartApiClient:
 
     async def _after_rate_limit(self, fn, path: str) -> dict[str, Any]:
         """One bounded retry after a broker-side 403/rate-limit. The limiter
-        already inserted a back-off; just yield, then call again."""
-        await asyncio.sleep(0.1)
+        already inserted a back-off; historical candles need extra slack vs
+        other endpoints because Angel's gateway aggregates quotas globally."""
+        await asyncio.sleep(0.45 if path == HISTORICAL_PATH else 0.12)
         log.info("smartapi_retry_after_rate_limit", path=path)
         return await fn()
 
@@ -324,7 +332,9 @@ class SmartApiClient:
                 # waits, and surface it as a rate-limited error so the
                 # auth-retry path doesn't try to refresh JWT.
                 if r.status_code == 403:
-                    get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+                    get_rate_limiter().note_rate_limited(
+                        path, retry_after_s=2.5 if path == HISTORICAL_PATH else 1.5
+                    )
                     raise AngelHttpError(
                         f"Rate limited by broker (HTTP 403, empty body) for {path}",
                         status_code=r.status_code,
@@ -352,7 +362,9 @@ class SmartApiClient:
             except json.JSONDecodeError as exc:
                 rate_limited = looks_rate_limited(status_code=r.status_code, body=raw_text)
                 if rate_limited:
-                    get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+                    get_rate_limiter().note_rate_limited(
+                        path, retry_after_s=2.5 if path == HISTORICAL_PATH else 1.5
+                    )
                 log.warning(
                     "smartapi_non_json_response",
                     path=path,
@@ -384,7 +396,9 @@ class SmartApiClient:
             payload = parsed
 
         if looks_rate_limited(status_code=r.status_code, body=payload):
-            get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+            get_rate_limiter().note_rate_limited(
+                path, retry_after_s=2.5 if path == HISTORICAL_PATH else 1.5
+            )
             raise AngelHttpError(
                 f"Rate limited by broker for {path}",
                 status_code=r.status_code,

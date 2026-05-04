@@ -52,9 +52,10 @@ log = structlog.get_logger(__name__)
 @dataclass
 class LiveExitConfig:
     """Mirrors PaperConfig so live behaves identically to dry-run."""
-    stop_loss_pct: float = 0.006      # 0.6% adverse from FILL price
-    take_profit_pct: float = 0.012    # 1.2% favorable from FILL price
-    max_hold_minutes: int = 25        # session-end style timeout
+
+    stop_loss_pct: float = 0.015     # 1.5% adverse from FILL price
+    take_profit_pct: float = 0.04    # 4% favorable from FILL price
+    max_hold_minutes: int = 55       # session-end style timeout
 
 
 @dataclass

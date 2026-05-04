@@ -14,6 +14,10 @@ import pytest
 from angel_bot.paper import PaperConfig, PaperOpenRequest, PaperTrader
 from angel_bot.state.store import StateStore
 
+# Tight TP/SL so unit tests can square off with small price moves. Production
+# defaults in ``PaperConfig`` / ``Settings`` are wider for real options.
+_TIGHT = PaperConfig(take_profit_pct=0.02, stop_loss_pct=0.01, max_hold_minutes=90)
+
 
 @pytest.fixture()
 def store(tmp_path: Path) -> StateStore:
@@ -128,7 +132,7 @@ def test_unrealized_pnl_reflects_last_mark(store: StateStore) -> None:
 
 
 def test_reset_wipes_paper_and_dryrun_history(store: StateStore) -> None:
-    trader = PaperTrader(store, PaperConfig())
+    trader = PaperTrader(store, _TIGHT)
     _open_call(trader)
     trader.mark_and_close({("NSE", "9999"): 102.0})  # close on target
     assert store.get_mode_daily_stats("dryrun")[0] == 1
@@ -145,7 +149,7 @@ def test_max_open_positions_cap(store: StateStore) -> None:
 
 
 def test_mode_history_isolation_between_live_and_dryrun(store: StateStore) -> None:
-    trader = PaperTrader(store, PaperConfig())
+    trader = PaperTrader(store, _TIGHT)
     _open_call(trader)
     trader.mark_and_close({("NSE", "9999"): 102.0})
     store.add_mode_pnl("live", 500.0)  # pretend the live broker booked a profit

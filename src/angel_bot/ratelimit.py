@@ -77,7 +77,9 @@ ENDPOINT_LIMITS: dict[str, list[tuple[int, float]]] = {
     "/rest/secure/angelbroking/gtt/v1/ruleDetails": [(10, 1.0), (500, 60.0), (5000, 3600.0)],
     "/rest/secure/angelbroking/gtt/v1/ruleList": [(10, 1.0), (500, 60.0), (5000, 3600.0)],
     # Historical / option greeks
-    "/rest/secure/angelbroking/historical/v1/getCandleData": [(3, 1.0), (180, 60.0), (5000, 3600.0)],
+    # Stricter than the published 3/sec in practice when combined with
+    # LTP, getPosition, and order-reconcile calls on the same session.
+    "/rest/secure/angelbroking/historical/v1/getCandleData": [(2, 1.0), (150, 60.0), (5000, 3600.0)],
     "/rest/secure/angelbroking/marketData/v1/optionGreek": [(1, 1.0)],
 }
 

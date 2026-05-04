@@ -176,6 +176,13 @@ class Settings(BaseSettings):
     bot_warmup_concurrency: int = Field(
         default=1, validation_alias="BOT_WARMUP_CONCURRENCY"
     )
+    # Each ATM universe rebuild can introduce dozens of new option tokens.
+    # Historical backfill for *all* of them in one burst triggers Angel 403s
+    # and can starve order/LTP calls. We only backfill this many *new* keys
+    # per refresh cycle; the rest are picked up on later cycles.
+    bot_warmup_delta_max_keys: int = Field(
+        default=8, validation_alias="BOT_WARMUP_DELTA_MAX_KEYS"
+    )
 
     # Adopt long positions opened *directly on the Angel One platform* and
     # manage their exits with the same SL/TP/max-hold the bot uses for its
@@ -293,12 +300,12 @@ class Settings(BaseSettings):
     dryrun_capital_override: float = Field(
         default=0.0, validation_alias="DRYRUN_CAPITAL_OVERRIDE"
     )
-    # Tight scalp-friendly exits. Each LOSS is bounded at ~0.6% of the
-    # premium paid; winners exit at ~1.2% (2:1 reward:risk). Max hold
-    # cuts dead trades fast so capital cycles into the next setup.
-    paper_stop_loss_pct: float = Field(default=0.006, validation_alias="PAPER_STOP_LOSS_PCT")
-    paper_take_profit_pct: float = Field(default=0.012, validation_alias="PAPER_TAKE_PROFIT_PCT")
-    paper_max_hold_minutes: int = Field(default=25, validation_alias="PAPER_MAX_HOLD_MINUTES")
+    # Swing-friendlier defaults for index options: tight scalp settings
+    # (0.6% / 1.2% / 25m) get stopped out by normal premium noise and
+    # round-trip costs. Widen via .env if you want a different profile.
+    paper_stop_loss_pct: float = Field(default=0.015, validation_alias="PAPER_STOP_LOSS_PCT")
+    paper_take_profit_pct: float = Field(default=0.04, validation_alias="PAPER_TAKE_PROFIT_PCT")
+    paper_max_hold_minutes: int = Field(default=55, validation_alias="PAPER_MAX_HOLD_MINUTES")
     paper_max_open_positions: int = Field(
         default=5, validation_alias="PAPER_MAX_OPEN_POSITIONS"
     )
@@ -312,6 +319,12 @@ class Settings(BaseSettings):
     # for in-flight retries and clock skew.
     rate_limit_safety_factor: float = Field(
         default=0.9, validation_alias="RATE_LIMIT_SAFETY_FACTOR"
+    )
+    # Minimum pause after each successful ``getCandleData`` response (seconds).
+    # Historical candles share Angel's global gateway budget with LTP / RMS /
+    # orders; this gap keeps us under the observed 403 threshold in practice.
+    rate_limit_candle_min_gap_s: float = Field(
+        default=0.4, validation_alias="RATE_LIMIT_CANDLE_MIN_GAP_S"
     )
 
     log_format: str = Field(default="console", validation_alias="LOG_FORMAT")

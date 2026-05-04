@@ -1,3 +1,3 @@
-from angel_bot.scanner.engine import ScannerEngine, ScannerHit
+from angel_bot.scanner.engine import ScannerEngine, ScannerHit, WarmupResult
 
-__all__ = ["ScannerEngine", "ScannerHit"]
+__all__ = ["ScannerEngine", "ScannerHit", "WarmupResult"]

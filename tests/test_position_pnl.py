@@ -7,8 +7,8 @@ which on a fresh open BUY position produced a phantom "loss" equal to
 the entire premium spent. These tests pin the new resolution order:
 
   1. Explicit ``realised`` + ``unrealised`` from Angel.
-  2. Mark-to-market with the freshest LTP we have (scanner cache > broker).
-  3. Broker ``pnl`` field as a last resort.
+  2. Consolidated ``pnl`` on the row when R/U are absent — Angel's net.
+  3. Mark-to-market with the freshest LTP when neither applies.
 
 And explicitly assert we NEVER fall back to ``netvalue``.
 """
@@ -54,6 +54,17 @@ def test_open_long_with_explicit_realised_unrealised_uses_them() -> None:
     assert out["pnl_total"] == 520.0
     assert out["unrealized_pnl_total"] == 520.0
     assert out["realized_pnl_total"] == 0.0
+
+
+def test_broker_pnl_preferred_over_mtm_when_both_present() -> None:
+    """Angel often sends ``pnl`` alongside LTP — use their number, not ours."""
+    row = _open_long_row(pnl="412.35")  # MTM would give (108-100)*65 = 520
+    out = normalize_positions({"data": [row]})
+    r = out["rows"][0]
+    assert r["pnl"] == 412.35
+    assert r["pnl_source"] == "broker_pnl"
+    assert r["unrealised_pnl"] == 412.35
+    assert r["realised_pnl"] == 0.0
 
 
 def test_open_long_marks_to_market_when_realised_unrealised_missing() -> None:
