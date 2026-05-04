@@ -91,6 +91,24 @@ class TradingRuntime:
         self.last_loop_at: str | None = None
         self.last_scan_summary: dict[str, Any] | None = None
         self.bot_started_at: str | None = None
+        # How many aggregators were successfully seeded from broker history
+        # at startup. 0 means we're back to live-tick warmup. Surfaced in
+        # the snapshot so the dashboard can show "warmed from history".
+        self._warmup_seeded: int = 0
+        # Set of watchlist keys ("EXCHANGE:TOKEN") we've already seeded so
+        # universe rebuilds can detect *new* tokens and only backfill those.
+        self._warmed_keys: set[str] = set()
+        # How many INDEX candidates the last scan cycle dropped because
+        # their resolved ATM CE / PE 1-lot premium is above the user's
+        # deployable cash. Surfaced in the scan summary so the dashboard
+        # can show "Filtered N indexes — lot above your cash" instead of
+        # spamming the decision log with identical need_more_capital rows.
+        self._last_index_unaffordable: int = 0
+        # Per-skip-key dedupe: collapses repeated identical skip reasons
+        # (most commonly need_more_capital) so the decision log isn't
+        # flooded with the same row every scan cycle. Maps the dedup key
+        # to the ISO timestamp of the last decision we recorded.
+        self._last_skip_at: dict[str, str] = {}
         self.auto_mode: bool = totp_configured_in_env(self.settings)
         self._watchdog_task: asyncio.Task | None = None
         # runtime mode override — flipped by the dashboard "Go Live" toggle
@@ -259,13 +277,29 @@ class TradingRuntime:
     def _scanner_spot_provider(self, underlying: str) -> float | None:
         """Look up the latest spot from whatever the scanner has cached.
 
-        The scanner indexes its hits by tradingsymbol. INDICES are present as
-        first-class hits; equities are too. Options live in NFO and are *not*
-        themselves spot providers — we resolve them via their underlying.
+        Match priority — the universe spec uses keys like ``"NIFTY"`` /
+        ``"BANKNIFTY"`` while the broker display tradingsymbol may be
+        ``"NIFTY 50"`` / ``"NIFTY BANK"`` etc. We therefore try the explicit
+        ``underlying`` field first (set by the universe builder for INDEX
+        rows), then the display name, then a loose first-token match for
+        backwards compatibility with manually-curated watchlists.
         """
         u = underlying.strip().upper()
+        if not u:
+            return None
         for h in self.scanner.last_hits:
-            if h.name.upper() == u and h.last_price:
+            if not h.last_price:
+                continue
+            if h.underlying and h.underlying.upper() == u:
+                return float(h.last_price)
+            if h.name.upper() == u:
+                return float(h.last_price)
+        # Fallback: prefix match (e.g. "NIFTY" matching legacy "NIFTY 50").
+        for h in self.scanner.last_hits:
+            if not h.last_price:
+                continue
+            first = h.name.split()[0].upper() if h.name else ""
+            if first and first == u:
                 return float(h.last_price)
         return None
 
@@ -457,6 +491,8 @@ class TradingRuntime:
 
         Index spot moves throughout the day; the ATM strike with it. Without
         this task the watchlist would freeze on whatever the ATM was at start.
+        Newly added tokens are also backfilled from broker history so the
+        brain isn't stuck in warmup on a fresh strike.
         """
         interval = max(15.0, float(self.settings.atm_refresh_interval_s))
         try:
@@ -466,6 +502,7 @@ class TradingRuntime:
             while not self._stop.is_set():
                 try:
                     self._rebuild_universe(spot_provider=self._scanner_spot_provider)
+                    await self._warmup_new_universe_keys()
                 except Exception as e:  # noqa: BLE001
                     log.warning("atm_refresh_failed", error=str(e))
                 slept = 0.0
@@ -475,6 +512,50 @@ class TradingRuntime:
                     slept += step
         except asyncio.CancelledError:
             return
+
+    async def _warmup_new_universe_keys(self) -> None:
+        """Seed history for any watchlist tokens we haven't backfilled yet.
+
+        Called after each ATM rebuild so a newly resolved CE / PE strike
+        doesn't sit in ``warmup`` for 25 minutes — its 5m / 15m bars are
+        pulled from the broker's historical-candle API the moment it
+        joins the watchlist.
+        """
+        s = self.settings
+        if not s.bot_warmup_from_history:
+            return
+        api = self.smart_client()
+        if api is None:
+            return
+        wl = self.scanner.active_watchlist()
+        all_keys: set[str] = set()
+        for ex, items in (wl or {}).items():
+            for it in items:
+                tok = str(it.get("token", "")).strip()
+                if tok:
+                    all_keys.add(f"{ex.upper()}:{tok}")
+        new_keys = all_keys - self._warmed_keys
+        if not new_keys:
+            return
+        try:
+            seeded = await self.scanner.warmup_from_history(
+                api,
+                only_keys=new_keys,
+                lookback_5m_minutes=int(s.bot_warmup_lookback_5m_min),
+                lookback_15m_minutes=int(s.bot_warmup_lookback_15m_min),
+                lookback_1m_minutes=int(s.bot_warmup_lookback_1m_min),
+                max_concurrent=int(s.bot_warmup_concurrency),
+            )
+            self._warmed_keys |= new_keys
+            self._warmup_seeded += int(seeded or 0)
+            log.info(
+                "scanner_warmup_universe_delta",
+                new_keys=len(new_keys),
+                seeded=seeded,
+                total_warmed=len(self._warmed_keys),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("scanner_warmup_universe_delta_failed", error=str(e))
 
     async def start_bot(self) -> None:
         if not self.connected():
@@ -609,6 +690,59 @@ class TradingRuntime:
             },
             "universe": self.universe_state(),
             "market_hours": all_market_status(),
+            "live_exits": self._live_exits_snapshot(),
+            "warmup": {
+                "from_history": bool(self.settings.bot_warmup_from_history),
+                "seeded_aggregators": int(self._warmup_seeded),
+                "warmed_tokens": len(self._warmed_keys),
+            },
+        }
+
+    def _live_exits_snapshot(self) -> dict[str, Any]:
+        """Compact summary of every open ``live_exit_plans`` row.
+
+        The dashboard uses this to badge bot-managed positions on the broker
+        positions table and to surface the SL / TP / max-hold the bot will
+        enforce on each one. Adopted plans show ``source='adopted'`` so the
+        UI can label them as picked up from the Angel One platform.
+        """
+        try:
+            rows = self.store.list_open_live_exit_plans()
+        except Exception as e:  # noqa: BLE001
+            log.warning("live_exits_snapshot_failed", error=str(e))
+            return {"open": [], "managed_count": 0, "adopted_count": 0}
+        out: list[dict[str, Any]] = []
+        adopted = 0
+        for r in rows:
+            src = str(r.get("source") or "bot").lower() or "bot"
+            if src == "adopted":
+                adopted += 1
+            out.append(
+                {
+                    "plan_id": int(r.get("id") or 0),
+                    "tradingsymbol": r.get("tradingsymbol"),
+                    "exchange": r.get("exchange"),
+                    "symboltoken": str(r.get("symboltoken") or ""),
+                    "side": r.get("side"),
+                    "qty": int(r.get("qty") or 0),
+                    "lots": int(r.get("lots") or 0),
+                    "lot_size": int(r.get("lot_size") or 1),
+                    "fill_price": r.get("fill_price"),
+                    "planned_entry": r.get("planned_entry"),
+                    "stop_price": r.get("stop_price"),
+                    "target_price": r.get("target_price"),
+                    "max_hold_minutes": int(r.get("max_hold_minutes") or 0),
+                    "opened_at": r.get("opened_at"),
+                    "filled_at": r.get("filled_at"),
+                    "source": src,
+                    "underlying": r.get("underlying"),
+                    "kind": r.get("kind"),
+                }
+            )
+        return {
+            "open": out,
+            "managed_count": len(out),
+            "adopted_count": adopted,
         }
 
     def _deployable_cash(self, live_cash: float) -> float:
@@ -823,6 +957,33 @@ class TradingRuntime:
             interval_s=s.bot_loop_interval_s,
             trading_enabled=self._runtime_trading_enabled,
         )
+
+        # Seed each watchlist symbol's candle aggregator from the broker's
+        # historical-candle API so the brain doesn't sit in ``warmup`` for
+        # 25 minutes after every restart. We deliberately do this BEFORE
+        # the first poll_once so cycle 1 already has ≥5 5m bars and ≥2 15m
+        # bars in memory; signals can fire immediately. Failures are
+        # non-fatal — the loop falls back to live-tick warmup.
+        if s.bot_warmup_from_history:
+            try:
+                seeded = await self.scanner.warmup_from_history(
+                    api,
+                    lookback_5m_minutes=int(s.bot_warmup_lookback_5m_min),
+                    lookback_15m_minutes=int(s.bot_warmup_lookback_15m_min),
+                    lookback_1m_minutes=int(s.bot_warmup_lookback_1m_min),
+                    max_concurrent=int(s.bot_warmup_concurrency),
+                )
+                self._warmup_seeded = int(seeded or 0)
+                wl = self.scanner.active_watchlist()
+                for ex, items in (wl or {}).items():
+                    for it in items:
+                        tok = str(it.get("token", "")).strip()
+                        if tok:
+                            self._warmed_keys.add(f"{ex.upper()}:{tok}")
+            except Exception as e:  # noqa: BLE001 — never block the loop on warmup
+                log.warning("auto_trader_warmup_failed", error=str(e))
+                self._warmup_seeded = 0
+
         try:
             while not self._stop.is_set():
                 self.last_loop_at = datetime.now(UTC).isoformat()
@@ -870,6 +1031,82 @@ class TradingRuntime:
                         # Feed the post-loss cooldown timer.
                         self.risk.record_close(realized_pnl=float(ev.realized_pnl or 0.0))
 
+                    # Adopt long broker positions opened directly on the
+                    # Angel One platform (mobile / web) so the bot can manage
+                    # their SL / TP / max-hold exactly like its own trades.
+                    # Adoption is a no-op in dry-run / paper modes — we never
+                    # touch real money from a sim. Also detects user-side
+                    # manual closes and books the realized P&L into live stats.
+                    if self._runtime_trading_enabled and s.bot_adopt_external_positions:
+                        try:
+                            adoption_events = self.live_exits.reconcile_external_positions(
+                                (positions or {}).get("rows") or [],
+                                master=self.master,
+                                product_types={
+                                    p.strip().upper()
+                                    for p in (s.bot_adopt_product_types or "").split(",")
+                                    if p.strip()
+                                },
+                                sl_pct=s.paper_stop_loss_pct,
+                                tp_pct=s.paper_take_profit_pct,
+                                max_hold_minutes=s.paper_max_hold_minutes,
+                                default_variety=s.bot_default_variety,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            adoption_events = []
+                            log.warning("live_exit_adopt_reconcile_failed", error=str(e))
+                        for ae in adoption_events:
+                            if ae.kind == "adopted":
+                                reason = (
+                                    f"adopted_external {ae.tradingsymbol} "
+                                    f"qty {ae.qty} @ ₹{ae.entry_price:.2f}"
+                                )
+                                placed = True
+                                price = ae.entry_price
+                                pnl_chunk = 0.0
+                            elif ae.kind == "qty_resync":
+                                prev = ae.extra.get("prev_qty")
+                                reason = (
+                                    f"adopted_resync {ae.tradingsymbol} qty "
+                                    f"{prev}→{ae.qty}"
+                                )
+                                placed = False
+                                price = ae.entry_price
+                                pnl_chunk = 0.0
+                            else:  # external_close
+                                reason = (
+                                    f"external_close {ae.tradingsymbol}: "
+                                    f"pnl ₹{ae.realized_pnl or 0.0:+.2f}"
+                                )
+                                placed = True
+                                price = ae.exit_price or ae.entry_price
+                                pnl_chunk = float(ae.realized_pnl or 0.0)
+                                self.risk.record_close(realized_pnl=pnl_chunk)
+                            self.decisions.add(
+                                Decision(
+                                    ts=DecisionLog.now_iso(),
+                                    name=ae.tradingsymbol,
+                                    exchange=ae.exchange,
+                                    token=ae.symboltoken,
+                                    signal="MODE",
+                                    reason=reason,
+                                    last_price=price,
+                                    quantity=ae.qty,
+                                    lots=int(ae.extra.get("lots") or 0),
+                                    capital_used=ae.entry_price * ae.qty,
+                                    side=ae.side,
+                                    placed=placed,
+                                    dry_run=False,
+                                    extra={
+                                        "adoption": {
+                                            "kind": ae.kind,
+                                            "plan_id": ae.plan_id,
+                                            **ae.extra,
+                                        }
+                                    },
+                                )
+                            )
+
                     # Live-position exit manager: enforces premium SL / TP /
                     # max-hold for every position the bot opened in live mode.
                     # Always runs (even in dry-run) so a session that flipped
@@ -882,6 +1119,7 @@ class TradingRuntime:
                         live_closures = []
                         log.warning("live_exit_mark_and_close_failed", error=str(e))
                     for lev in live_closures:
+                        src_tag = f" ({lev.source})" if lev.source and lev.source != "bot" else ""
                         self.decisions.add(
                             Decision(
                                 ts=DecisionLog.now_iso(),
@@ -890,7 +1128,7 @@ class TradingRuntime:
                                 token="-",
                                 signal="MODE",
                                 reason=(
-                                    f"live_close_{lev.exit_reason}: "
+                                    f"live_close_{lev.exit_reason}{src_tag}: "
                                     f"pnl ₹{lev.realized_pnl:+.2f}"
                                 ),
                                 last_price=lev.exit_price,
@@ -901,7 +1139,11 @@ class TradingRuntime:
                                 placed=True,
                                 dry_run=False,
                                 broker_order_id=lev.close_order_id,
-                                extra={"live_exit": True, "exit_reason": lev.exit_reason},
+                                extra={
+                                    "live_exit": True,
+                                    "exit_reason": lev.exit_reason,
+                                    "source": lev.source,
+                                },
                             )
                         )
                         self.risk.record_close(realized_pnl=float(lev.realized_pnl or 0.0))
@@ -912,7 +1154,7 @@ class TradingRuntime:
                     # max-concurrent + per-hour caps inside _consider_trade
                     # naturally short-circuit further attempts when full.
                     candidates = self._select_top_candidates(
-                        hits, positions, n=s.llm_top_n_candidates
+                        hits, positions, n=s.llm_top_n_candidates, deployable=deployable
                     )
                     if not candidates:
                         # Still log a NO_TRADE skip so the dashboard doesn't go silent.
@@ -952,26 +1194,39 @@ class TradingRuntime:
         return int(self.paper.open_positions_summary().get("open_positions", 0) or 0)
 
     def _select_top_candidates(
-        self, hits: list[ScannerHit], positions: dict[str, Any], *, n: int = 3
+        self,
+        hits: list[ScannerHit],
+        positions: dict[str, Any],
+        *,
+        n: int = 3,
+        deployable: float | None = None,
     ) -> list[ScannerHit]:
         """Return up to N best-ranked candidates that the brain has signalled
         BUY_CALL / BUY_PUT on, in score order.
 
         Cheap filters (kind, signal exists, score floor, lot-fit for cash
-        instruments) are applied here. Heavier gates (market hours, funds,
-        risk, LLM) are applied per-candidate inside _consider_trade.
+        instruments) are applied here. INDEX candidates whose resolved
+        ATM CE / PE 1-lot premium is already above ``deployable`` cash are
+        also dropped — without this the brain keeps proposing
+        permanently-unaffordable indexes (e.g. NIFTYNXT50 @ ₹72k/lot when
+        the user has ₹12k) and the decision log fills with identical
+        ``need_more_capital`` rows every scan cycle. Heavier gates (market
+        hours, risk, LLM) are applied per-candidate inside _consider_trade.
         """
         if not hits:
+            self._last_index_unaffordable = 0
             return []
         s = self.settings
         live_open = int(positions.get("open_positions", 0) or 0)
         paper_open = int(self.paper.open_positions_summary().get("open_positions", 0))
         open_now = live_open if self._runtime_trading_enabled else paper_open
         if open_now >= s.bot_max_concurrent_positions:
+            self._last_index_unaffordable = 0
             return []
 
         min_score = max(s.strategy_min_score, s.bot_min_signal_strength)
         keep: list[ScannerHit] = []
+        index_unaffordable = 0
         for h in hits:
             if h.kind not in self._SIGNAL_SOURCE_KINDS:
                 continue
@@ -981,16 +1236,41 @@ class TradingRuntime:
                 continue
             if h.signal_side not in ("BUY_CALL", "BUY_PUT"):
                 continue
+            # Hidden by the affordability gate — keep it in the scanner cache
+            # for premium lookup but do not propose it as a candidate.
+            if not h.is_affordable and h.kind != "INDEX":
+                continue
             if h.kind != "INDEX":
                 if not h.lot_size or not h.affordable_lots or h.affordable_lots < 1:
                     continue
                 if not h.in_trade_value_range:
                     continue
+            else:
+                # INDEX → resolve to its ATM CE / PE and drop the candidate
+                # if even one lot of the option is permanently unaffordable.
+                # Tolerant of resolve failures: if we can't price the option
+                # yet, fall through and let _consider_trade record a clean
+                # skip (resolve / no_execution_price) instead of swallowing
+                # it silently.
+                if deployable is not None and deployable > 0:
+                    exec_inst, exec_lot, exec_price, _why = self._resolve_executable(
+                        h, h.signal_side
+                    )
+                    if (
+                        exec_inst is not None
+                        and exec_price is not None
+                        and exec_price > 0
+                        and exec_lot
+                    ):
+                        if exec_price * exec_lot > float(deployable):
+                            index_unaffordable += 1
+                            continue
             keep.append(h)
 
         keep.sort(key=lambda h: h.score, reverse=True)
         # Cap the slate. The runtime breaks out early once max-concurrent fills.
         slots = max(1, min(int(n or 1), s.bot_max_concurrent_positions))
+        self._last_index_unaffordable = index_unaffordable
         return keep[:slots]
 
     # Kept for backwards-compat with any external callers (tests etc.)
@@ -1324,6 +1604,8 @@ class TradingRuntime:
             "reason": reason,
             "top": top,
             "min_score": min_score,
+            "hidden_unaffordable": int(getattr(self.scanner, "last_hidden_unaffordable", 0)),
+            "index_unaffordable": int(self._last_index_unaffordable),
         }
 
     async def _consider_trade(self, api: SmartApiClient, hit: ScannerHit | None, deployable: float) -> None:
@@ -1580,6 +1862,23 @@ class TradingRuntime:
         if oid:
             self.risk.record_entry()
 
+    # Skip reasons that are *stable* per (instrument, side) — i.e. they will
+    # almost certainly fire again on every cycle until something the user
+    # controls changes (cash balance, watchlist, score threshold). We collapse
+    # repeated identical rows to ONE every 5 minutes so the decision log
+    # doesn't fill up with the same line every 5 seconds.
+    _DEDUPE_REASON_PREFIXES: tuple[str, ...] = (
+        "need_more_capital",
+        "option_lot_value_below_min",
+        "option_lot_value_above_max",
+        "kind_disabled",
+        "market_closed",
+        "duplicate_order_window",
+        "no_execution_price",
+        "resolve:",
+    )
+    _DEDUPE_WINDOW_S: float = 300.0
+
     def _record_skip(
         self,
         *,
@@ -1589,6 +1888,8 @@ class TradingRuntime:
         price: float | None,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        if self._should_dedupe_skip(hit, signal, reason):
+            return
         self.decisions.add(
             Decision(
                 ts=DecisionLog.now_iso(),
@@ -1607,6 +1908,39 @@ class TradingRuntime:
                 extra=extra or {},
             )
         )
+
+    def _should_dedupe_skip(
+        self,
+        hit: ScannerHit | None,
+        signal: str,
+        reason: str,
+    ) -> bool:
+        """Return True if this skip is a repeat of a recent one we already
+        logged for the same (instrument, signal, reason-family).
+
+        Only "stable" reason families dedupe — transient ones (warmup,
+        risk, llm) always log so the user sees them flip.
+        """
+        family: str | None = None
+        for pref in self._DEDUPE_REASON_PREFIXES:
+            if reason.startswith(pref):
+                family = pref.rstrip(":")
+                break
+        if family is None:
+            return False
+        token = hit.token if hit else "-"
+        key = f"{token}|{signal}|{family}"
+        now = datetime.now(UTC)
+        prev_iso = self._last_skip_at.get(key)
+        if prev_iso:
+            try:
+                prev = datetime.fromisoformat(prev_iso)
+                if (now - prev).total_seconds() < self._DEDUPE_WINDOW_S:
+                    return True
+            except ValueError:
+                pass
+        self._last_skip_at[key] = now.isoformat()
+        return False
 
     def _record_decision(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
@@ -28,6 +29,20 @@ TRADE_BOOK_PATH = "/rest/secure/angelbroking/order/v1/getTradeBook"
 RMS_PATH = "/rest/secure/angelbroking/user/v1/getRMS"
 POSITION_PATH = "/rest/secure/angelbroking/order/v1/getPosition"
 HOLDING_PATH = "/rest/secure/angelbroking/portfolio/v1/getHolding"
+HISTORICAL_PATH = "/rest/secure/angelbroking/historical/v1/getCandleData"
+
+# Angel historical-candle ``interval`` values. Keys are the minute counts the
+# bot already uses internally so callers can ask for a given step without
+# memorising the broker's enum strings.
+HIST_INTERVAL_BY_MINUTES: dict[int, str] = {
+    1: "ONE_MINUTE",
+    3: "THREE_MINUTE",
+    5: "FIVE_MINUTE",
+    10: "TEN_MINUTE",
+    15: "FIFTEEN_MINUTE",
+    30: "THIRTY_MINUTE",
+    60: "ONE_HOUR",
+}
 
 
 class SmartApiClient:
@@ -174,6 +189,39 @@ class SmartApiClient:
         await self.session.ensure_login()
         return await self._get_with_auth_retry(HOLDING_PATH)
 
+    async def get_candle_data(
+        self,
+        *,
+        exchange: str,
+        symboltoken: str,
+        interval_minutes: int,
+        fromdate: str,
+        todate: str,
+    ) -> dict[str, Any]:
+        """Fetch historical OHLCV candles for one instrument.
+
+        Wraps Angel's ``getCandleData``. ``fromdate`` / ``todate`` must be
+        in ``YYYY-MM-DD HH:MM`` IST format per the broker spec. The response
+        ``data`` is a list of ``[ts_iso, open, high, low, close, volume]``
+        rows ordered oldest → newest. ``interval_minutes`` is mapped to one
+        of Angel's named intervals (1/3/5/10/15/30/60 minute).
+        """
+        await self.session.ensure_login()
+        interval = HIST_INTERVAL_BY_MINUTES.get(int(interval_minutes))
+        if interval is None:
+            raise ValueError(
+                f"Unsupported historical interval: {interval_minutes}m (allowed: "
+                f"{sorted(HIST_INTERVAL_BY_MINUTES)})"
+            )
+        body = {
+            "exchange": str(exchange).upper(),
+            "symboltoken": str(symboltoken),
+            "interval": interval,
+            "fromdate": fromdate,
+            "todate": todate,
+        }
+        return await self._post_with_auth_retry(HISTORICAL_PATH, body)
+
     async def _post_with_auth_retry(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
         try:
             return await self._secure_post(path, json)
@@ -225,23 +273,66 @@ class SmartApiClient:
         return self._parse(r, path)
 
     def _parse(self, r: httpx.Response, path: str) -> dict[str, Any]:
-        try:
-            payload: dict[str, Any] = r.json()
-        except Exception as exc:
-            if looks_rate_limited(status_code=r.status_code, body=r.text):
-                get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
-            log.warning(
-                "smartapi_non_json_response",
-                path=path,
-                status_code=r.status_code,
-                content_type=r.headers.get("content-type"),
-                body_preview=r.text[:500],
-                final_url=str(r.url),
-            )
-            raise AngelHttpError(
-                f"Non-JSON response (HTTP {r.status_code}): {r.text[:500]!r}",
-                status_code=r.status_code,
-            ) from exc
+        raw_text = (r.text or "").lstrip("\ufeff")
+        text_stripped = raw_text.strip()
+
+        if not text_stripped:
+            payload: dict[str, Any] = {}
+            if r.status_code >= 400:
+                log.warning(
+                    "smartapi_empty_error_body",
+                    path=path,
+                    status_code=r.status_code,
+                    content_type=r.headers.get("content-type"),
+                    final_url=str(r.url),
+                )
+                raise AngelHttpError(
+                    "Empty error body from broker (HTTP "
+                    f"{r.status_code}) for {path} — often gateway rejection; "
+                    "verify symboltoken matches tradingsymbol in the instrument "
+                    "master, quantity is a lot multiple, and F&O product type "
+                    "matches your account (INTRADAY vs CARRYFORWARD).",
+                    status_code=r.status_code,
+                    body=None,
+                )
+            if r.status_code < 400:
+                log.warning(
+                    "smartapi_empty_success_body",
+                    path=path,
+                    status_code=r.status_code,
+                    final_url=str(r.url),
+                )
+        else:
+            try:
+                parsed: Any = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                if looks_rate_limited(status_code=r.status_code, body=raw_text):
+                    get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
+                log.warning(
+                    "smartapi_non_json_response",
+                    path=path,
+                    status_code=r.status_code,
+                    content_type=r.headers.get("content-type"),
+                    body_preview=raw_text[:500],
+                    final_url=str(r.url),
+                )
+                raise AngelHttpError(
+                    f"Non-JSON response (HTTP {r.status_code}): {raw_text[:500]!r}",
+                    status_code=r.status_code,
+                ) from exc
+            if not isinstance(parsed, dict):
+                log.warning(
+                    "smartapi_non_object_json",
+                    path=path,
+                    status_code=r.status_code,
+                    parsed_preview=repr(parsed)[:200],
+                )
+                raise AngelHttpError(
+                    f"Expected JSON object from {path}, got {type(parsed).__name__}",
+                    status_code=r.status_code,
+                )
+            payload = parsed
+
         if looks_rate_limited(status_code=r.status_code, body=payload):
             get_rate_limiter().note_rate_limited(path, retry_after_s=1.5)
             raise AngelHttpError(
@@ -250,7 +341,18 @@ class SmartApiClient:
                 body=payload,
             )
         if r.status_code >= 400:
-            raise AngelHttpError(f"HTTP {r.status_code} for {path}", status_code=r.status_code, body=payload)
+            detail = ""
+            if isinstance(payload, dict):
+                detail = str(
+                    payload.get("message")
+                    or payload.get("error")
+                    or payload.get("errorMessage")
+                    or "",
+                ).strip()
+            err = f"HTTP {r.status_code} for {path}"
+            if detail:
+                err = f"{err}: {detail}"
+            raise AngelHttpError(err, status_code=r.status_code, body=payload)
         if isinstance(payload, dict) and payload.get("status") is False:
             msg = str(payload.get("message", ""))
             err = str(payload.get("errorcode", "")).strip().upper()

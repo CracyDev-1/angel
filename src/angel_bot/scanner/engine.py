@@ -9,17 +9,23 @@ Per cycle:
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import structlog
 
 from angel_bot.config import Settings, get_settings
-from angel_bot.market_data.candles import CandleAggregator
+from angel_bot.market_data.candles import Candle, CandleAggregator
 from angel_bot.smart_client import SmartApiClient
 from angel_bot.strategy.brain import BrainConfig, BrainEngine, BrainOutput
+
+# Asia/Kolkata is UTC+5:30 with no DST. Angel's historical-candle API expects
+# both ``fromdate`` / ``todate`` and the returned timestamps in IST so we
+# format and parse against this fixed offset.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 log = structlog.get_logger(__name__)
 
@@ -43,6 +49,28 @@ class ScannerHit:
     capital_short_for_one_lot: float | None = None  # how much MORE cash you need to buy 1 lot
     in_trade_value_range: bool = True              # honors STRATEGY_MIN/MAX_TRADE_VALUE
     capital_range_reason: str | None = None        # human reason if outside range
+    # Underlying key from the universe spec (e.g. "NIFTY" for the index whose
+    # broker tradingsymbol is "NIFTY 50"). Used by the runtime's spot lookup
+    # so ATM resolution matches the spec name even when the display symbol
+    # differs. Empty for instruments whose universe entry didn't set it.
+    underlying: str = ""
+    # Option-only metadata propagated from the universe entry. ``expiry`` is
+    # ISO date (YYYY-MM-DD), ``option_side`` is "CE"/"PE", ``offset`` is the
+    # signed strike offset from ATM (-1 / 0 / +1). All zero/empty for
+    # non-option rows. Used by the dashboard to render a per-underlying
+    # ATM CE/PE breakdown without an extra master lookup.
+    expiry: str = ""
+    strike: float = 0.0
+    option_side: str = ""
+    offset: int = 0
+    tradingsymbol: str = ""
+    # True for INDEX rows always, and for other kinds when the 1-lot notional
+    # is within available cash. False marks rows that should be hidden from
+    # the dashboard / brain candidate selector but still kept in the cache so
+    # the runtime can resolve premium when a higher-level signal points at
+    # them (and emit a clear "need_more_capital" skip reason instead of
+    # silently failing with "no_execution_price").
+    is_affordable: bool = True
 
     # brain output
     score: float = 0.0               # 0..1, ranking
@@ -78,10 +106,117 @@ class ScannerEngine:
         # Dynamic watchlist override. When set (by the runtime via the
         # universe builder), it takes precedence over SCANNER_WATCHLIST_JSON.
         self._dynamic_watchlist: dict[str, list[dict[str, Any]]] | None = None
+        # How many OPTION rows we dropped from the most recent poll because
+        # their 1-lot notional exceeded available cash. Surfaced by the
+        # runtime in the scan summary so the dashboard explains the gap
+        # between watchlist size and visible hits.
+        self.last_hidden_unaffordable: int = 0
 
     def set_watchlist(self, watchlist: dict[str, list[dict[str, Any]]] | None) -> None:
         """Replace the active watchlist. Pass None to revert to the .env value."""
         self._dynamic_watchlist = watchlist or None
+
+    async def warmup_from_history(
+        self,
+        api: SmartApiClient,
+        *,
+        only_keys: set[str] | None = None,
+        lookback_5m_minutes: int = 6 * 60,
+        lookback_15m_minutes: int = 36 * 60,
+        lookback_1m_minutes: int = 60,
+        max_concurrent: int = 3,
+    ) -> int:
+        """Backfill each watchlist symbol's candle aggregator from broker history.
+
+        Without this, every process restart leaves the brain stuck in
+        ``warmup`` for ~25 minutes while the in-memory aggregator rebuilds
+        from live LTP polls. We call Angel's ``getCandleData`` for each
+        ``(exchange, token)`` we plan to watch and seed the 1m / 5m / 15m
+        deques with the closed bars the broker already has — so the brain
+        can grade signals on the very first scan cycle.
+
+        ``only_keys`` (optional) limits the warmup to specific
+        ``"EXCHANGE:TOKEN"`` keys, used when the universe rebuild adds new
+        ATM strikes mid-session and we only need to backfill those.
+
+        Returns the number of aggregators successfully seeded.
+        """
+        wl = self.active_watchlist()
+        if not wl:
+            return 0
+
+        targets: list[tuple[str, str]] = []
+        for ex, items in wl.items():
+            for it in items:
+                tok = str(it.get("token", "")).strip()
+                if not tok:
+                    continue
+                key = f"{ex.upper()}:{tok}"
+                if only_keys is not None and key not in only_keys:
+                    continue
+                targets.append((ex.upper(), tok))
+        if not targets:
+            return 0
+
+        now_ist = datetime.now(IST)
+        from_5m = now_ist - timedelta(minutes=lookback_5m_minutes)
+        from_15m = now_ist - timedelta(minutes=lookback_15m_minutes)
+        from_1m = now_ist - timedelta(minutes=lookback_1m_minutes)
+        to_str = now_ist.strftime("%Y-%m-%d %H:%M")
+
+        sem = asyncio.Semaphore(max(1, int(max_concurrent)))
+
+        async def fetch_one(ex: str, tok: str, interval_min: int, frm: datetime) -> list[Candle]:
+            async with sem:
+                try:
+                    resp = await api.get_candle_data(
+                        exchange=ex,
+                        symboltoken=tok,
+                        interval_minutes=interval_min,
+                        fromdate=frm.strftime("%Y-%m-%d %H:%M"),
+                        todate=to_str,
+                    )
+                except Exception as e:  # noqa: BLE001 — never crash startup on warmup
+                    log.warning(
+                        "scanner_warmup_history_error",
+                        exchange=ex, symboltoken=tok, interval_min=interval_min,
+                        error=str(e),
+                    )
+                    return []
+            if not isinstance(resp, dict) or not resp.get("status"):
+                return []
+            data = resp.get("data") or []
+            if not isinstance(data, list):
+                return []
+            return _parse_candle_rows(data)
+
+        async def seed_one(ex: str, tok: str) -> bool:
+            c1, c5, c15 = await asyncio.gather(
+                fetch_one(ex, tok, 1, from_1m),
+                fetch_one(ex, tok, 5, from_5m),
+                fetch_one(ex, tok, 15, from_15m),
+            )
+            # Seed even partial data — 5m alone is often enough to clear
+            # the warmup gate. We require at least one timeframe to have
+            # rows so we don't blank an aggregator that already has live
+            # ticks (e.g. when only 1m was empty for an illiquid strike).
+            if not (c1 or c5 or c15):
+                return False
+            self._aggs[f"{ex}:{tok}"].seed_history(
+                candles_1m=c1 or None,
+                candles_5m=c5 or None,
+                candles_15m=c15 or None,
+            )
+            return True
+
+        results = await asyncio.gather(*(seed_one(ex, tok) for ex, tok in targets))
+        seeded = sum(1 for r in results if r)
+        log.info(
+            "scanner_warmup_history_done",
+            requested=len(targets),
+            seeded=seeded,
+        )
+        return seeded
 
     def active_watchlist(self) -> dict[str, list[dict[str, Any]]]:
         if self._dynamic_watchlist is not None:
@@ -141,6 +276,7 @@ class ScannerEngine:
         now = datetime.now(UTC)
         now_iso = now.isoformat()
         hits: list[ScannerHit] = []
+        hidden_unaffordable = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -182,9 +318,36 @@ class ScannerEngine:
                     in_range = False
                     range_reason = f"above_max_trade_value ({notional:.0f} > {max_tv:.0f})"
 
+            # Affordability flag (opt-in via BOT_HIDE_UNAFFORDABLE_LOTS).
+            # OPTION rows whose 1-lot premium already exceeds available cash
+            # are still kept in the cache so the runtime can find their
+            # premium when an INDEX brain signal resolves to them — but the
+            # flag tells the dashboard / candidate selector to hide them so
+            # they don't pollute the UI. Index / equity rows always pass.
+            kind_str = str(m.get("kind") or "EQUITY").upper()
+            is_affordable = True
+            if (
+                self.settings.bot_hide_unaffordable_lots
+                and kind_str == "OPTION"
+                and notional is not None
+                and notional > 0
+                and available_funds is not None
+                and notional > float(available_funds)
+            ):
+                is_affordable = False
+                hidden_unaffordable += 1
+
             brain_out: BrainOutput = self.brain.evaluate(last_price=last, agg=agg)
             c1, c5, c15 = agg.all_candles_including_partial()
 
+            try:
+                strike_val = float(m.get("strike") or 0.0)
+            except (TypeError, ValueError):
+                strike_val = 0.0
+            try:
+                offset_val = int(m.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset_val = 0
             hits.append(
                 ScannerHit(
                     name=str(m.get("name") or row.get("tradingsymbol") or tok),
@@ -200,6 +363,13 @@ class ScannerEngine:
                     capital_short_for_one_lot=shortfall,
                     in_trade_value_range=in_range,
                     capital_range_reason=range_reason,
+                    underlying=str(m.get("underlying") or "").upper(),
+                    expiry=str(m.get("expiry") or ""),
+                    strike=strike_val,
+                    option_side=str(m.get("side") or "").upper(),
+                    offset=offset_val,
+                    tradingsymbol=str(m.get("tradingsymbol") or m.get("name") or ""),
+                    is_affordable=is_affordable,
                     score=brain_out.score.total,
                     score_breakdown=brain_out.score.to_dict(),
                     signal_side=brain_out.signal.side,
@@ -219,6 +389,7 @@ class ScannerEngine:
             reverse=True,
         )
         self._last_hits = hits
+        self.last_hidden_unaffordable = hidden_unaffordable
         return hits
 
     # ------------------------------------------------------------------
@@ -253,3 +424,43 @@ def _to_float(x: Any) -> float | None:
         return float(str(x))
     except (TypeError, ValueError):
         return None
+
+
+def _parse_candle_rows(rows: list[Any]) -> list[Candle]:
+    """Convert Angel's [ts, o, h, l, c, v] rows into Candle objects.
+
+    Angel returns timestamps as either ISO strings with the IST offset
+    (``"2026-05-04T09:15:00+05:30"``) or naive ``"YYYY-MM-DD HH:MM:SS"``
+    in IST. We normalise everything to UTC because the in-memory
+    aggregator stores all bucket starts in UTC.
+    """
+    out: list[Candle] = []
+    for r in rows:
+        if not isinstance(r, list) or len(r) < 5:
+            continue
+        ts_raw = r[0]
+        ts: datetime | None = None
+        if isinstance(ts_raw, str):
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+                except ValueError:
+                    ts = None
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=IST)
+        ts_utc = ts.astimezone(UTC)
+        try:
+            o = float(r[1]); h = float(r[2]); lo = float(r[3]); c = float(r[4])
+        except (TypeError, ValueError):
+            continue
+        try:
+            v = float(r[5]) if len(r) > 5 and r[5] is not None else 0.0
+        except (TypeError, ValueError):
+            v = 0.0
+        out.append(Candle(ts=ts_utc, o=o, h=h, low=lo, c=c, v=v))
+    out.sort(key=lambda c: c.ts)
+    return out

@@ -125,11 +125,27 @@ class UniverseSpec:
 
 
 def _entry(inst: Instrument, kind: str, **extra: Any) -> dict[str, Any]:
+    # For INDEX rows we use the master ``name`` field (e.g. "NIFTY") rather
+    # than the broker tradingsymbol ("NIFTY 50") so downstream spot lookups
+    # — which are keyed by the underlying name from the universe spec —
+    # actually match. Without this, ``atm_options`` could never resolve a
+    # strike for indexes whose display symbol differs from their underlying:
+    # NIFTY ("NIFTY 50"), BANKNIFTY ("NIFTY BANK"), FINNIFTY ("NIFTY FIN
+    # SERVICE"), MIDCPNIFTY ("NIFTY MID SELECT"), NIFTYNXT50 ("NIFTY NEXT 50").
+    if kind == "INDEX":
+        display = (inst.name or inst.tradingsymbol or "").strip().upper() or inst.tradingsymbol
+    else:
+        display = inst.tradingsymbol
     out = {
-        "name": inst.tradingsymbol,
+        "name": display,
         "token": inst.symboltoken,
         "kind": kind,
         "lot_size": inst.lot_size or 1,
+        # The underlying key the spec used (filled by the caller). When
+        # absent we fall back to ``inst.name`` so ATM lookups still work.
+        "underlying": (inst.name or display).strip().upper(),
+        # Keep the broker symbol around for order placement / debugging.
+        "tradingsymbol": inst.tradingsymbol,
     }
     if extra:
         out.update(extra)
@@ -209,11 +225,16 @@ class UniverseBuilder:
         else:
             spec_indices = spec.indices
         for name in spec_indices:
-            inst = self.master.index(name) or self.master.maybe_resolve("NSE", name)
+            inst = (
+                self.master.index(name)
+                or self.master.maybe_resolve("NSE", name)
+                or self.master.maybe_resolve("BSE", name)
+            )
             if inst is None:
                 report.indices_missing.append(name)
                 continue
-            out.setdefault(inst.exchange, []).append(_entry(inst, "INDEX"))
+            entry = _entry(inst, "INDEX", underlying=name.strip().upper())
+            out.setdefault(inst.exchange, []).append(entry)
             report.indices_resolved += 1
 
         # ----- stocks (NSE cash) -----------------------------------------

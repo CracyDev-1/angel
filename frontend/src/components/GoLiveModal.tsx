@@ -19,7 +19,7 @@ export default function GoLiveModal({ onCancel, onConfirm, submitting }: Props) 
         </p>
         <ul className="mt-3 list-disc space-y-1 pl-5 text-xs text-slate-400">
           <li>All <code className="text-slate-300">RISK_*</code> caps in <code className="text-slate-300">.env</code> still apply.</li>
-          <li>Live trades for index options are still skipped (no strike resolver).</li>
+          <li>Index signals resolve to ATM CE/PE from the instrument master — refresh the master if strikes fail.</li>
           <li>Switch back to Dry Run from the header at any time — pending positions stay open.</li>
           <li>No system can guarantee profit. You are responsible for losses.</li>
         </ul>

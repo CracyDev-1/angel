@@ -313,8 +313,11 @@ class BrainEngine:
 
         c1, c5, c15 = agg.all_candles_including_partial()
 
-        # Need enough warmup for multi-timeframe rules
-        if len(c5) < 5 or len(c15) < 2:
+        # Need enough warmup for multi-timeframe rules. We also require at
+        # least one 1m bar because the pattern-detection block below indexes
+        # ``c1[-1]`` for the last 1m candle — historical-candle backfill
+        # may seed only 5m + 15m for instruments with no 1m history.
+        if len(c5) < 5 or len(c15) < 2 or len(c1) < 1:
             return BrainOutput(
                 score,
                 Signal(
@@ -325,7 +328,7 @@ class BrainEngine:
                         EntryCheck(
                             "warmup",
                             False,
-                            f"need>=5 5m bars and >=2 15m (have {len(c5)}/{len(c15)})",
+                            f"need>=5 5m, >=2 15m, >=1 1m (have {len(c5)}/{len(c15)}/{len(c1)})",
                         )
                     ],
                 ),

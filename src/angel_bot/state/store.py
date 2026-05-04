@@ -174,6 +174,20 @@ class StateStore:
                 if name not in cols:
                     con.execute(ddl)
 
+            # ----- live_exit_plans migrations (additive, idempotent) -----
+            # ``source`` distinguishes plans the bot opened ('bot') from
+            # positions opened directly on the Angel One platform that the
+            # bot adopted for management ('adopted'). Older rows get 'bot'
+            # by default so existing decisions / dashboards still make sense.
+            plan_cols = self._table_columns(con, "live_exit_plans")
+            plan_migrations = [
+                ("source", "ALTER TABLE live_exit_plans ADD COLUMN source TEXT DEFAULT 'bot'"),
+                ("last_seen_qty", "ALTER TABLE live_exit_plans ADD COLUMN last_seen_qty INTEGER"),
+            ]
+            for name, ddl in plan_migrations:
+                if name not in plan_cols:
+                    con.execute(ddl)
+
     def log_order(
         self,
         payload: dict[str, Any],
@@ -509,15 +523,19 @@ class StateStore:
             ).fetchone()
             if existing is not None:
                 return int(existing["id"])
+            source = str(p.get("source") or "bot").lower()
+            fill_price = p.get("fill_price")
+            filled_at = p.get("filled_at")
             cur = con.execute(
                 """
                 INSERT INTO live_exit_plans (
                   open_order_id, exchange, symboltoken, tradingsymbol, kind,
                   side, signal, underlying,
                   qty, lots, lot_size,
-                  planned_entry, stop_price, target_price, max_hold_minutes,
-                  product, variety, opened_at
-                ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?)
+                  planned_entry, fill_price, filled_at,
+                  stop_price, target_price, max_hold_minutes,
+                  product, variety, opened_at, source, last_seen_qty
+                ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?)
                 """,
                 (
                     str(p["open_order_id"]),
@@ -532,12 +550,16 @@ class StateStore:
                     int(p["lots"]),
                     int(p["lot_size"]),
                     float(p["planned_entry"]),
+                    float(fill_price) if fill_price is not None else None,
+                    str(filled_at) if filled_at else None,
                     float(p["stop_price"]),
                     float(p["target_price"]),
                     int(p["max_hold_minutes"]),
                     str(p["product"]),
                     str(p["variety"]),
                     p.get("opened_at") or now,
+                    source,
+                    int(p["qty"]),
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -548,6 +570,56 @@ class StateStore:
                 "SELECT * FROM live_exit_plans WHERE closed_at IS NULL ORDER BY id DESC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def find_open_live_exit_plan_by_token(
+        self, *, exchange: str, symboltoken: str
+    ) -> dict[str, Any] | None:
+        """Return the open plan that holds (exchange, symboltoken) or None.
+
+        Used by the adoption flow so the same broker position is never
+        managed twice — once a plan exists for a token (whether bot-opened
+        or adopted) we update it in place instead of creating another row.
+        """
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT * FROM live_exit_plans
+                WHERE closed_at IS NULL
+                  AND UPPER(exchange) = ?
+                  AND symboltoken = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(exchange).upper(), str(symboltoken)),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def update_live_exit_plan_qty(
+        self,
+        plan_id: int,
+        *,
+        qty: int,
+        lots: int,
+        last_seen_qty: int | None = None,
+    ) -> None:
+        """Resync qty/lots after a partial manual exit on the broker."""
+        seen = qty if last_seen_qty is None else last_seen_qty
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE live_exit_plans
+                SET qty = ?, lots = ?, last_seen_qty = ?
+                WHERE id = ? AND closed_at IS NULL
+                """,
+                (int(qty), int(lots), int(seen), int(plan_id)),
+            )
+
+    def update_live_exit_plan_seen(self, plan_id: int, *, last_seen_qty: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE live_exit_plans SET last_seen_qty = ? WHERE id = ?",
+                (int(last_seen_qty), int(plan_id)),
+            )
 
     def update_live_exit_plan_fill(
         self, *, open_order_id: str, fill_price: float, filled_at: str | None = None

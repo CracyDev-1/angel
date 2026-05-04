@@ -81,6 +81,9 @@ class LiveExitPlan:
     product: str
     variety: str
     opened_at: datetime
+    # 'bot' for plans the bot opened itself, 'adopted' for positions opened
+    # directly on the Angel One platform that the bot picked up to manage.
+    source: str = "bot"
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> LiveExitPlan:
@@ -106,6 +109,7 @@ class LiveExitPlan:
             product=str(row["product"]),
             variety=str(row["variety"]),
             opened_at=_parse_iso(row.get("opened_at")) or datetime.now(UTC),
+            source=str(row.get("source") or "bot").lower() or "bot",
         )
 
     @property
@@ -131,6 +135,25 @@ class LiveExitEvent:
     realized_pnl: float
     exit_reason: str
     close_order_id: str | None
+    source: str = "bot"
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AdoptionEvent:
+    """Emitted when the bot adopts a manual position or detects the user
+    closed one of its managed positions outside the bot. Surfaced through
+    the decisions stream so the dashboard explains what changed."""
+    kind: str           # "adopted" | "qty_resync" | "external_close"
+    plan_id: int
+    tradingsymbol: str
+    exchange: str
+    symboltoken: str
+    side: str
+    qty: int
+    entry_price: float
+    exit_price: float | None = None
+    realized_pnl: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -240,6 +263,252 @@ class LiveExitManager:
             max_hold_min=mh,
         )
         return plan_id
+
+    # ------------------------------------------------------------------
+    # external position adoption
+    # ------------------------------------------------------------------
+
+    def reconcile_external_positions(
+        self,
+        broker_rows: list[dict[str, Any]],
+        *,
+        master: Any | None,
+        product_types: set[str],
+        sl_pct: float,
+        tp_pct: float,
+        max_hold_minutes: int,
+        default_variety: str,
+        now: datetime | None = None,
+    ) -> list[AdoptionEvent]:
+        """Pick up any long broker position that isn't already being managed.
+
+        Three things happen each cycle:
+
+        1. **Adopt** every broker row with ``net_qty > 0`` that has no open
+           plan yet. We use the broker's own ``buy_avg`` as the "fill price"
+           and compute SL/TP off of it so the bot manages it identically to
+           a trade it placed itself. ``open_order_id`` is a synthetic
+           ``ADOPTED:...`` token so the unique constraint on the column
+           still holds.
+        2. **Resync** the qty on plans whose broker net_qty has changed
+           (e.g. the user manually sold half) — we never sell more lots
+           than the broker still shows.
+        3. **External-close**: when an open plan's broker position has
+           dropped to zero (or vanished entirely) we record the close at
+           the broker's ``sell_avg`` (or ``ltp`` fallback) with reason
+           ``external_close`` and stop managing it.
+
+        Returns a list of :class:`AdoptionEvent` so the runtime can stream
+        them into the decisions log.
+        """
+        now = now or datetime.now(UTC)
+        events: list[AdoptionEvent] = []
+
+        # Index broker rows by (exchange, symboltoken) for quick lookup.
+        rows_by_token: dict[tuple[str, str], dict[str, Any]] = {}
+        for r in broker_rows or []:
+            ex = str(r.get("exchange") or "").upper()
+            tok = str(r.get("symboltoken") or "")
+            if not ex or not tok:
+                continue
+            rows_by_token[(ex, tok)] = r
+
+        # ----- 1+2) Adopt new positions / resync qty for known ones -----
+        prods = {str(p).upper() for p in product_types if p}
+        for (ex, tok), r in rows_by_token.items():
+            net_qty = int(r.get("net_qty") or 0)
+            if net_qty <= 0:
+                continue   # short / flat — bot only manages longs
+            sym = str(r.get("tradingsymbol") or "").strip()
+            if not sym:
+                continue
+            prod = str(r.get("producttype") or "INTRADAY").upper()
+            if prods and prod not in prods:
+                continue
+
+            existing = self.store.find_open_live_exit_plan_by_token(
+                exchange=ex, symboltoken=tok
+            )
+            if existing is not None:
+                old_qty = int(existing.get("qty") or 0)
+                if net_qty != old_qty:
+                    new_lots = max(1, net_qty // max(1, int(existing.get("lot_size") or 1)))
+                    self.store.update_live_exit_plan_qty(
+                        int(existing["id"]),
+                        qty=net_qty,
+                        lots=new_lots,
+                        last_seen_qty=net_qty,
+                    )
+                    events.append(
+                        AdoptionEvent(
+                            kind="qty_resync",
+                            plan_id=int(existing["id"]),
+                            tradingsymbol=sym,
+                            exchange=ex,
+                            symboltoken=tok,
+                            side=str(existing.get("side") or "-"),
+                            qty=net_qty,
+                            entry_price=float(existing.get("fill_price") or existing.get("planned_entry") or 0.0),
+                            extra={"prev_qty": old_qty},
+                        )
+                    )
+                else:
+                    self.store.update_live_exit_plan_seen(int(existing["id"]), last_seen_qty=net_qty)
+                continue
+
+            buy_avg = float(r.get("buy_avg") or 0.0)
+            ltp = float(r.get("ltp") or 0.0)
+            entry = buy_avg if buy_avg > 0 else ltp
+            if entry <= 0:
+                # No price to anchor SL/TP against — try again next cycle.
+                continue
+
+            side = _classify_side_from_symbol(sym)
+            signal = "BUY_CALL" if side != "PE" else "BUY_PUT"
+            is_long = side in ("CE", "LONG")
+
+            lot_size = _resolve_lot_size(master, ex, tok, default_qty=net_qty)
+            lots = max(1, net_qty // max(1, lot_size))
+            underlying = _resolve_underlying(master, ex, tok, fallback=sym)
+
+            if is_long:
+                stop = entry * (1.0 - sl_pct)
+                target = entry * (1.0 + tp_pct)
+            else:
+                stop = entry * (1.0 + sl_pct)
+                target = entry * (1.0 - tp_pct)
+
+            synthetic_id = (
+                f"ADOPTED:{ex}:{tok}:{int(now.timestamp() * 1000)}"
+            )
+            try:
+                plan_id = self.store.create_live_exit_plan(
+                    {
+                        "open_order_id": synthetic_id,
+                        "exchange": ex,
+                        "symboltoken": tok,
+                        "tradingsymbol": sym,
+                        "kind": "OPTION" if side in ("CE", "PE") else "EQUITY",
+                        "side": side,
+                        "signal": signal,
+                        "underlying": underlying,
+                        "qty": net_qty,
+                        "lots": lots,
+                        "lot_size": lot_size,
+                        "planned_entry": entry,
+                        "fill_price": entry,
+                        "filled_at": now.isoformat(),
+                        "stop_price": stop,
+                        "target_price": target,
+                        "max_hold_minutes": max_hold_minutes,
+                        "product": prod,
+                        "variety": default_variety,
+                        "opened_at": now.isoformat(),
+                        "source": "adopted",
+                    }
+                )
+            except Exception as e:  # noqa: BLE001 — never crash the loop
+                log.warning(
+                    "live_exit_adopt_failed", error=str(e), symbol=sym,
+                    exchange=ex, symboltoken=tok,
+                )
+                continue
+            log.info(
+                "live_exit_adopted",
+                plan_id=plan_id,
+                symbol=sym,
+                side=side,
+                qty=net_qty,
+                lots=lots,
+                lot_size=lot_size,
+                entry=round(entry, 4),
+                stop=round(stop, 4),
+                target=round(target, 4),
+                product=prod,
+            )
+            events.append(
+                AdoptionEvent(
+                    kind="adopted",
+                    plan_id=plan_id,
+                    tradingsymbol=sym,
+                    exchange=ex,
+                    symboltoken=tok,
+                    side=side,
+                    qty=net_qty,
+                    entry_price=entry,
+                    extra={
+                        "lot_size": lot_size,
+                        "lots": lots,
+                        "stop": stop,
+                        "target": target,
+                        "max_hold_minutes": max_hold_minutes,
+                        "underlying": underlying,
+                        "product": prod,
+                    },
+                )
+            )
+
+        # ----- 3) External-close: open plans whose broker row dropped to 0 -----
+        for raw in self.store.list_open_live_exit_plans():
+            try:
+                plan = LiveExitPlan.from_row(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            row = rows_by_token.get((plan.exchange, plan.symboltoken))
+            net_qty = int(row.get("net_qty") or 0) if row else 0
+            if net_qty > 0:
+                continue   # still open at the broker — let the normal path drive it
+            # Position is gone. Compute realized P&L using whatever the broker
+            # last reported as a sell average (preferred) or LTP (fallback).
+            sell_avg = float(row.get("sell_avg") or 0.0) if row else 0.0
+            ltp = float(row.get("ltp") or 0.0) if row else 0.0
+            exit_price = sell_avg if sell_avg > 0 else (ltp if ltp > 0 else plan.effective_entry)
+            entry = plan.effective_entry
+            is_long = plan.side in ("CE", "LONG")
+            qty_for_pnl = int(raw.get("last_seen_qty") or plan.qty or 0)
+            if is_long:
+                pnl = (exit_price - entry) * qty_for_pnl
+            else:
+                pnl = (entry - exit_price) * qty_for_pnl
+            try:
+                self.store.close_live_exit_plan(
+                    plan.id,
+                    exit_price=exit_price,
+                    exit_reason="external_close",
+                    realized_pnl=pnl,
+                    close_order_id=None,
+                )
+                self.store.add_mode_pnl("live", pnl_delta=pnl, trades_delta=1)
+            except Exception as e:  # noqa: BLE001
+                log.warning("live_exit_external_close_persist_failed", error=str(e), plan_id=plan.id)
+                continue
+            log.info(
+                "live_exit_external_close",
+                plan_id=plan.id,
+                symbol=plan.tradingsymbol,
+                side=plan.side,
+                qty=qty_for_pnl,
+                entry=round(entry, 4),
+                exit=round(exit_price, 4),
+                pnl=round(pnl, 2),
+                source=plan.source,
+            )
+            events.append(
+                AdoptionEvent(
+                    kind="external_close",
+                    plan_id=plan.id,
+                    tradingsymbol=plan.tradingsymbol,
+                    exchange=plan.exchange,
+                    symboltoken=plan.symboltoken,
+                    side=plan.side,
+                    qty=qty_for_pnl,
+                    entry_price=entry,
+                    exit_price=exit_price,
+                    realized_pnl=pnl,
+                    extra={"source": plan.source},
+                )
+            )
+        return events
 
     # ------------------------------------------------------------------
     # mark-to-market and trigger
@@ -500,7 +769,8 @@ class LiveExitManager:
             realized_pnl=pnl,
             exit_reason=reason,
             close_order_id=close_oid,
-            extra={"resp": _safe_json(resp)},
+            source=plan.source,
+            extra={"resp": _safe_json(resp), "source": plan.source},
         )
 
 
@@ -528,7 +798,59 @@ def _safe_json(obj: Any) -> Any:
         return None
 
 
+# Recognise the option suffix on Angel symbols: "...CE" / "...PE" (case
+# insensitive). Anything else is treated as a long cash leg.
+def _classify_side_from_symbol(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if s.endswith("CE"):
+        return "CE"
+    if s.endswith("PE"):
+        return "PE"
+    return "LONG"
+
+
+def _resolve_lot_size(master: Any, exchange: str, symboltoken: str, *, default_qty: int) -> int:
+    """Look up the contract's lot size from the master, falling back to 1.
+
+    For options the lot size matters because broker square-off needs the
+    same quantity granularity. If the master isn't available we treat the
+    broker's net_qty as a single lot (lot_size=1) — that still squares off
+    the right number of shares / contracts, just without a "lots" view.
+    """
+    if master is None:
+        return 1
+    try:
+        inst = master.resolve_by_token(exchange, symboltoken)
+    except Exception:  # noqa: BLE001
+        return 1
+    if inst is None:
+        return 1
+    try:
+        ls = int(getattr(inst, "lot_size", None) or 0)
+    except (TypeError, ValueError):
+        ls = 0
+    if ls > 0:
+        return ls
+    # If the master has no lot_size for a cash equity row, default to 1
+    # share/lot which is the right answer for NSE EQ.
+    return 1 if default_qty > 0 else 1
+
+
+def _resolve_underlying(master: Any, exchange: str, symboltoken: str, *, fallback: str) -> str:
+    """Get the underlying name (e.g. "NIFTY") for badge / decision context."""
+    if master is None:
+        return fallback
+    try:
+        inst = master.resolve_by_token(exchange, symboltoken)
+    except Exception:  # noqa: BLE001
+        return fallback
+    if inst is None:
+        return fallback
+    return str(getattr(inst, "name", "") or fallback)
+
+
 __all__ = [
+    "AdoptionEvent",
     "LiveExitConfig",
     "LiveExitEvent",
     "LiveExitManager",

@@ -133,8 +133,54 @@ class Settings(BaseSettings):
     # you want to keep a passive cash buffer.
     bot_use_capital_pct: float = Field(default=100.0, validation_alias="BOT_USE_CAPITAL_PCT")
     bot_min_signal_strength: float = Field(default=0.0, validation_alias="BOT_MIN_SIGNAL_STRENGTH")
+    # When true (default) the scanner drops OPTION rows whose 1-lot notional
+    # already exceeds the available cash. Those tokens stop counting toward
+    # the dashboard, decisions stream, brain analysis, and Angel rate-limit
+    # budget. Index spot rows and equities are always kept so the user can
+    # see what's moving even if they can't afford the option premium yet.
+    bot_hide_unaffordable_lots: bool = Field(
+        default=True, validation_alias="BOT_HIDE_UNAFFORDABLE_LOTS"
+    )
     bot_default_product: str = Field(default="INTRADAY", validation_alias="BOT_DEFAULT_PRODUCT")
     bot_default_variety: str = Field(default="NORMAL", validation_alias="BOT_DEFAULT_VARIETY")
+
+    # Backfill each watchlist symbol's candle aggregator from broker
+    # history at bot start so the brain has ≥5 5m + ≥2 15m bars on cycle 1
+    # — without this, every restart loses the in-memory aggregator and the
+    # bot sits in ``warmup`` for 25-30 minutes before grading any signal.
+    bot_warmup_from_history: bool = Field(
+        default=True, validation_alias="BOT_WARMUP_FROM_HISTORY"
+    )
+    bot_warmup_lookback_5m_min: int = Field(
+        default=360, validation_alias="BOT_WARMUP_LOOKBACK_5M_MIN"
+    )
+    bot_warmup_lookback_15m_min: int = Field(
+        default=2160, validation_alias="BOT_WARMUP_LOOKBACK_15M_MIN"
+    )
+    bot_warmup_lookback_1m_min: int = Field(
+        default=60, validation_alias="BOT_WARMUP_LOOKBACK_1M_MIN"
+    )
+    bot_warmup_concurrency: int = Field(
+        default=3, validation_alias="BOT_WARMUP_CONCURRENCY"
+    )
+
+    # Adopt long positions opened *directly on the Angel One platform* and
+    # manage their exits with the same SL/TP/max-hold the bot uses for its
+    # own trades. When a position the bot is managing disappears from the
+    # broker book (the user closed it manually) the bot records the close as
+    # ``external_close`` so realized P&L still flows into daily stats. Live
+    # mode only — never touches paper / dry-run state.
+    bot_adopt_external_positions: bool = Field(
+        default=True, validation_alias="BOT_ADOPT_EXTERNAL_POSITIONS"
+    )
+    # Comma-separated product codes the bot is willing to adopt. Adopting a
+    # CARRYFORWARD position by accident would leave a sell order behind on
+    # exit so we keep the default conservative: INTRADAY only. Set this to
+    # "INTRADAY,DELIVERY,CARRYFORWARD,MARGIN" to manage everything.
+    bot_adopt_product_types: str = Field(
+        default="INTRADAY",
+        validation_alias="BOT_ADOPT_PRODUCT_TYPES",
+    )
     bot_autostart: bool = Field(default=False, validation_alias="BOT_AUTOSTART")
     auto_connect_on_startup: bool = Field(default=True, validation_alias="AUTO_CONNECT_ON_STARTUP")
     auto_relogin_interval_s: float = Field(default=900.0, validation_alias="AUTO_RELOGIN_INTERVAL_S")

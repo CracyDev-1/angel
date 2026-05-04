@@ -4,14 +4,10 @@ import {
   apiGet,
   apiPost,
   type KillSwitchReport,
-  type MarketStatus,
-  type PaperPosition,
-  type PositionRow,
-  type PositionsResponse,
   type RateLimitSummary,
-  type ScannerBucket,
   type Snapshot,
   type UniverseBlock,
+  type WarmupBlock,
 } from "../lib/api";
 import { classOf, formatINR, formatTime } from "../lib/format";
 import PositionsPanel from "../components/PositionsPanel";
@@ -20,6 +16,10 @@ import KillSwitchModal from "../components/KillSwitchModal";
 import CandidateCard from "../components/CandidateCard";
 import DryrunCapital from "../components/DryrunCapital";
 import PaperTradesPanel from "../components/PaperTradesPanel";
+import WatchlistPanel from "../components/WatchlistPanel";
+import StocksPanel from "../components/StocksPanel";
+import SkipReasonsPanel from "../components/SkipReasonsPanel";
+import ClosedTradesPanel from "../components/ClosedTradesPanel";
 
 export default function LivePage() {
   const qc = useQueryClient();
@@ -58,11 +58,16 @@ export default function LivePage() {
   const cepe = data?.ce_pe_summary;
   const positions = data?.positions;
   const scan = data?.last_scan_summary;
-  const buckets = data?.scanner_by_kind?.buckets ?? [];
   const rate = data?.rate_limit;
   const isLive = !!data?.trading_enabled;
   const paper = data?.paper;
   const dryrun = data?.dryrun;
+  const scannerHits = data?.scanner ?? [];
+  const availableCash = funds?.available_cash ?? 0;
+  const optionEnabled = data?.universe?.kind_enabled?.OPTION ?? true;
+  const equityEnabled = data?.universe?.kind_enabled?.EQUITY ?? true;
+  const indexMarket = data?.market_hours?.OPTION ?? data?.market_hours?.INDEX;
+  const equityMarket = data?.market_hours?.EQUITY;
 
   const isAlive = !!data?.bot_running && !!data?.last_loop_at;
   const totalPnl = today?.net_pnl ?? 0;
@@ -90,8 +95,27 @@ export default function LivePage() {
               {isAlive ? plainCycleReason(scan?.reason) : "Hit Start trading in the header to begin."}
               {data?.last_loop_at ? ` • last update ${formatTime(data.last_loop_at)}` : ""}
             </div>
+            {(scan?.hidden_unaffordable ?? 0) > 0 || (scan?.index_unaffordable ?? 0) > 0 ? (
+              <div className="mt-0.5 text-[11px] text-slate-500">
+                {(scan?.hidden_unaffordable ?? 0) > 0 ? (
+                  <>
+                    Hidden {scan?.hidden_unaffordable} option contract
+                    {scan?.hidden_unaffordable === 1 ? "" : "s"} — 1-lot premium above your cash
+                  </>
+                ) : null}
+                {(scan?.hidden_unaffordable ?? 0) > 0 && (scan?.index_unaffordable ?? 0) > 0 ? " · " : ""}
+                {(scan?.index_unaffordable ?? 0) > 0 ? (
+                  <>
+                    Filtered {scan?.index_unaffordable} index{(scan?.index_unaffordable ?? 0) === 1 ? "" : "es"}
+                    {" "}whose ATM lot is above your cash
+                  </>
+                ) : null}
+                .
+              </div>
+            ) : null}
             <RateLimitChip rate={rate} />
             <UniverseChip universe={data?.universe} />
+            <WarmupChip warmup={data?.warmup} botRunning={!!data?.bot_running} />
           </div>
         </div>
 
@@ -117,156 +141,156 @@ export default function LivePage() {
         />
       ) : null}
 
-      {/* Money / P&L hero numbers */}
-      <section className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <BigCard
-          label="Money in your account"
-          value={formatINR(funds?.available_cash ?? 0)}
-          hint={
-            isLive
-              ? "Real broker cash. Updated every loop."
-              : dryrun && dryrun.capital_override > 0
-              ? `Real cash; sizing uses your dry-run override (${formatINR(dryrun.capital_override)}).`
-              : "Real broker cash. Dry-run sim is sizing against the same amount."
-          }
-          tone="neutral"
-        />
-        <BigCard
-          label={isLive ? "Live profit / loss today" : "Dry-run profit / loss today"}
-          value={formatINR(totalPnl)}
-          hint={`Realized ${formatINR(today?.realized_pnl ?? 0, { compact: true })} • Unrealized ${formatINR(today?.unrealized_pnl ?? 0, { compact: true })} • from ${pnlSourceLabel}`}
-          tone={totalPnl > 0 ? "good" : totalPnl < 0 ? "bad" : "neutral"}
-        />
-        <BigCard
-          label={isLive ? "Trades placed by bot today" : "Paper trades today"}
-          value={`${today?.trades_placed ?? 0}`}
-          hint={
-            isLive
-              ? `${today?.filled ?? 0} filled • ${today?.pending ?? 0} pending • ${today?.rejected ?? 0} rejected`
-              : `${today?.filled ?? 0} closed • ${paper?.open?.open_positions ?? 0} still open`
-          }
-          tone="neutral"
-        />
-      </section>
-
-      {/* Scanner buckets — Stocks / Indexes (commodities intentionally
-          excluded: each MCX symbol counts toward Angel's per-request token
-          cap and reliably triggers AB1004 once we add the option chain on
-          top). */}
-      <section>
-        <SectionTitle
-          title="What the bot is scanning"
-          hint="Number of instruments that fit your available cash for at least one lot."
-        />
-        <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
-          {["EQUITY", "INDEX"].map((k) => {
-            const toggleKey = k === "INDEX" ? "OPTION" : k;
-            const enabled = data?.universe?.kind_enabled?.[toggleKey as "EQUITY" | "OPTION" | "COMMODITY"] ?? true;
-            const market = data?.market_hours?.[toggleKey] ?? data?.market_hours?.[k];
-            return (
-              <CategoryCard
-                key={k}
-                kind={k}
-                bucket={findBucket(buckets, k)}
-                enabled={enabled}
-                pending={toggleKind.isPending}
-                onToggle={(v) => toggleKind.mutate({ [toggleKey]: v })}
-                market={market}
-              />
-            );
-          })}
+      {/* Money / P&L strip — compact, three numbers in one card */}
+      <section className="card overflow-hidden">
+        <div className="grid grid-cols-1 divide-y divide-white/5 sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+          <StripStat
+            label="Cash in account"
+            value={formatINR(funds?.available_cash ?? 0)}
+            hint={
+              isLive
+                ? "Real broker cash."
+                : dryrun && dryrun.capital_override > 0
+                ? `Sizing uses dry-run override ${formatINR(dryrun.capital_override, { compact: true })}.`
+                : "Real broker cash; dry-run sim sizes against this."
+            }
+            tone="neutral"
+          />
+          <StripStat
+            label={isLive ? "P&L today (live)" : "P&L today (dry-run)"}
+            value={formatINR(totalPnl)}
+            hint={`Realized ${formatINR(today?.realized_pnl ?? 0, { compact: true })} · Unrealized ${formatINR(today?.unrealized_pnl ?? 0, { compact: true })} · ${pnlSourceLabel}`}
+            tone={totalPnl > 0 ? "good" : totalPnl < 0 ? "bad" : "neutral"}
+          />
+          <StripStat
+            label={isLive ? "Trades placed today" : "Paper trades today"}
+            value={`${today?.trades_placed ?? 0}`}
+            hint={
+              isLive
+                ? `${today?.filled ?? 0} filled · ${today?.pending ?? 0} pending · ${today?.rejected ?? 0} rejected`
+                : `${today?.filled ?? 0} closed · ${paper?.open?.open_positions ?? 0} still open`
+            }
+            tone="neutral"
+          />
         </div>
       </section>
 
-      {/* Active trade(s) hero — always above brain analysis when something is live */}
-      <ActiveTradesHero
-        isLive={isLive}
-        positions={positions}
-        paperRows={paper?.open?.rows ?? []}
-      />
+      {/* OPEN + CLOSED POSITIONS — pinned to the top of the page so the user
+          always sees what they're holding and what just closed. Live mode
+          shows the broker book; dry-run shows the paper book. */}
+      <section className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <div className="xl:col-span-2 space-y-4">
+          {isLive ? (
+            <PositionsPanel positions={positions ?? null} liveExits={data?.live_exits ?? null} />
+          ) : (
+            <PaperTradesPanel paper={paper} />
+          )}
+        </div>
+        <div className="space-y-4">
+          <ClosedTradesPanel decisions={data?.decisions ?? []} isLive={isLive} />
+          <CePeMiniSummary
+            ceCount={cepe?.ce_open ?? 0}
+            peCount={cepe?.pe_open ?? 0}
+            ceCap={cepe?.capital_ce ?? 0}
+            peCap={cepe?.capital_pe ?? 0}
+            cePnl={cepe?.pnl_ce ?? 0}
+            pePnl={cepe?.pnl_pe ?? 0}
+          />
+        </div>
+      </section>
 
-      {/* Candidate cards — the BRAIN output for each instrument */}
+      {/* Compact watchlist — every instrument the bot watches in dense rows. */}
+      <section className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <div className="xl:col-span-2">
+          <WatchlistPanel
+            hits={scannerHits}
+            availableCash={availableCash}
+            market={indexMarket}
+            enabled={optionEnabled}
+            onToggle={(v) => toggleKind.mutate({ OPTION: v })}
+            togglePending={toggleKind.isPending}
+          />
+        </div>
+        <div>
+          <StocksPanel
+            hits={scannerHits}
+            availableCash={availableCash}
+            market={equityMarket}
+            enabled={equityEnabled}
+            onToggle={(v) => toggleKind.mutate({ EQUITY: v })}
+            togglePending={toggleKind.isPending}
+          />
+        </div>
+      </section>
+
+      {/* Brain analysis — collapsed by default, click any card to expand. */}
       {(() => {
         const allHits = data?.scanner ?? [];
-        // Affordability filter: hide cards whose one-lot cost exceeds available cash.
-        // INDEX hits are always kept because the actual trade is an ATM option
-        // (~₹2-15k premium per lot), not the index spot itself.
         const visibleHits = allHits.filter((row) => {
           if ((row.kind || "").toUpperCase() === "INDEX") return true;
+          if (row.is_affordable === false) return false;
           if ((row.affordable_lots ?? 0) >= 1) return true;
           return false;
         });
+        const sorted = visibleHits
+          .slice()
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
         const hiddenCount = allHits.length - visibleHits.length;
         return (
-          <section>
-            <SectionTitle
-              title="Brain analysis — what would the bot do?"
-              hint={
-                scan?.min_score
-                  ? `Each card shows the multi-factor score and the entry checks. The bot only trades when ALL checks pass and the score ≥ ${Math.round(scan.min_score * 100)}.`
-                  : "Each card shows the multi-factor score and the entry checks for one instrument."
-              }
-            />
-            {hiddenCount > 0 ? (
-              <div className="mt-2 text-[11px] text-slate-500">
-                Hiding{" "}
-                <span className="text-slate-300">{hiddenCount}</span> instrument
-                {hiddenCount === 1 ? "" : "s"} whose one-lot cost is above your available cash
-                of <span className="text-slate-300">{formatINR(funds?.available_cash ?? 0)}</span>.
+          <section className="card overflow-hidden">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-white/5 px-4 py-2.5">
+              <div className="flex items-baseline gap-2">
+                <h2 className="text-sm font-semibold tracking-wide text-slate-200">
+                  Brain analysis
+                </h2>
+                <span className="text-[11px] text-slate-500">
+                  {sorted.length} ranked
+                  {scan?.min_score ? (
+                    <> · pass ≥ {Math.round(scan.min_score * 100)} score</>
+                  ) : null}
+                  {hiddenCount > 0 ? (
+                    <> · {hiddenCount} hidden (1-lot &gt; cash)</>
+                  ) : null}
+                </span>
               </div>
-            ) : null}
-            <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-              {visibleHits.slice(0, 6).map((row, i) => (
-                <CandidateCard key={`${row.exchange}:${row.token}`} row={row} isTop={i === 0} />
-              ))}
-              {visibleHits.length === 0 ? (
-                <div className="col-span-full rounded-lg border border-dashed border-white/10 bg-slate-900/40 p-6 text-center text-sm text-slate-400">
-                  {allHits.length > 0
-                    ? `All ${allHits.length} scanned instruments need more cash than you have for one lot. Add funds, or adjust SCANNER_WATCHLIST_JSON to include cheaper symbols.`
-                    : data?.bot_running
-                    ? "Brain is warming up — needs ≥ 5 five-minute candles and ≥ 2 fifteen-minute candles to grade signals (10–30 minutes typically)."
-                    : "Click Start trading in the header to begin scanning."}
-                </div>
-              ) : null}
             </div>
+            {sorted.length === 0 ? (
+              <div className="p-5 text-center text-xs text-slate-500">
+                {allHits.length > 0
+                  ? `All ${allHits.length} scanned instruments need more cash than you have for one lot.`
+                  : data?.bot_running
+                  ? data?.warmup?.warmed_tokens && data.warmup.warmed_tokens > 0
+                    ? "Brain seeded from broker history — waiting for the next scan cycle to grade signals."
+                    : "Brain is warming up — fetching candles from the broker and waiting for ≥ 5 five-minute and ≥ 2 fifteen-minute bars."
+                  : "Click Start trading in the header to begin scanning."}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-2 p-3 lg:grid-cols-2 2xl:grid-cols-3">
+                {sorted.slice(0, 9).map((row, i) => (
+                  <CandidateCard key={`${row.exchange}:${row.token}`} row={row} isTop={i === 0} />
+                ))}
+              </div>
+            )}
           </section>
         );
       })()}
 
-      {/* CE / PE made */}
-      <section>
-        <SectionTitle title="Calls (CE) and Puts (PE) the bot is in" />
-        <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
-          <SidePill
-            label="Calls bought (CE)"
-            tone="good"
-            count={cepe?.ce_open ?? 0}
-            capital={cepe?.capital_ce ?? 0}
-            pnl={cepe?.pnl_ce ?? 0}
-          />
-          <SidePill
-            label="Puts bought (PE)"
-            tone="bad"
-            count={cepe?.pe_open ?? 0}
-            capital={cepe?.capital_pe ?? 0}
-            pnl={cepe?.pnl_pe ?? 0}
-          />
-        </div>
-      </section>
-
-      {/* Paper trades panel — only matters in dry-run */}
-      {!isLive ? <PaperTradesPanel paper={paper} /> : null}
-
-      {/* Open broker positions with per-row close */}
-      <PositionsPanel positions={positions ?? null} />
+      {/* Aggregated skip reasons — quickly tells the user why no trades fired */}
+      <SkipReasonsPanel decisions={data?.decisions ?? []} />
 
       {/* Bot reasoning stream — full transparency */}
-      <section className="card p-4">
-        <SectionTitle
-          title="What the bot is thinking (live)"
-          hint="One row per scan cycle and per trade decision. Plain English in the Reason column."
-        />
-        <div className="mt-3">
+      <section className="card overflow-hidden">
+        <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-white/5 px-4 py-2.5">
+          <div className="flex items-baseline gap-2">
+            <h2 className="text-sm font-semibold tracking-wide text-slate-200">
+              Bot decisions
+            </h2>
+            <span className="text-[11px] text-slate-500">
+              one row per scan cycle / placement attempt
+            </span>
+          </div>
+        </div>
+        <div className="p-3">
           <DecisionsTable rows={data?.decisions ?? []} />
         </div>
       </section>
@@ -280,10 +304,6 @@ export default function LivePage() {
       ) : null}
     </div>
   );
-}
-
-function findBucket(buckets: ScannerBucket[], kind: string): ScannerBucket | null {
-  return buckets.find((b) => b.kind.toUpperCase() === kind) || null;
 }
 
 function plainCycleReason(reason: string | undefined): string {
@@ -303,16 +323,7 @@ function plainCycleReason(reason: string | undefined): string {
   return `Cycle reason: ${reason}`;
 }
 
-function SectionTitle({ title, hint }: { title: string; hint?: string }) {
-  return (
-    <div>
-      <h2 className="text-sm font-semibold tracking-wide text-slate-200">{title}</h2>
-      {hint ? <div className="mt-1 text-xs text-slate-400">{hint}</div> : null}
-    </div>
-  );
-}
-
-function BigCard({
+function StripStat({
   label,
   value,
   hint,
@@ -325,427 +336,51 @@ function BigCard({
 }) {
   const valueClass =
     tone === "good" ? "text-emerald-300" : tone === "bad" ? "text-rose-300" : "text-slate-100";
-  const accent =
-    tone === "good"
-      ? "from-emerald-400/40 to-emerald-400/0"
-      : tone === "bad"
-      ? "from-rose-400/40 to-rose-400/0"
-      : "from-sky-400/30 to-sky-400/0";
   return (
-    <div className="card relative overflow-hidden p-5">
-      <div className={`absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r ${accent}`} />
-      <div className="stat-label">{label}</div>
-      <div className={`mt-2 text-3xl font-semibold tracking-tight ${valueClass}`}>{value}</div>
-      <div className="mt-2 text-xs text-slate-400">{hint}</div>
-    </div>
-  );
-}
-
-function CategoryCard({
-  kind,
-  bucket,
-  enabled,
-  pending,
-  onToggle,
-  market,
-}: {
-  kind: string;
-  bucket: ScannerBucket | null;
-  enabled: boolean;
-  pending: boolean;
-  onToggle: (next: boolean) => void;
-  market: MarketStatus | undefined;
-}) {
-  const friendly: Record<string, { title: string; emoji: string; help: string }> = {
-    EQUITY: { title: "Stocks", emoji: "📈", help: "NSE / BSE equities and stock options" },
-    INDEX: { title: "Indexes", emoji: "📊", help: "NIFTY, BANKNIFTY and similar" },
-    COMMODITY: { title: "Commodities", emoji: "🛢️", help: "MCX gold, crude oil, etc." },
-  };
-  const meta = friendly[kind] || { title: kind, emoji: "•", help: "" };
-  const total = bucket?.count ?? 0;
-  const tradable = bucket?.tradable ?? 0;
-  const empty = total === 0;
-  const marketOpen = market?.is_open ?? true;
-  // Card is dim when user disabled OR when market closed.
-  const dim = !enabled || !marketOpen;
-  return (
-    <div
-      className={`card relative overflow-hidden p-5 transition ${
-        dim ? "opacity-60" : ""
-      }`}
-    >
-      {!marketOpen ? (
-        <div className="absolute right-0 top-0 rounded-bl-md bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
-          Market closed
-        </div>
-      ) : (
-        <div className="absolute right-0 top-0 rounded-bl-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">
-          Market open
-        </div>
-      )}
-
-      <div className="flex items-start justify-between gap-3 pt-4">
-        <div>
-          <div className="text-xs uppercase tracking-wider text-slate-400">
-            {meta.emoji} {meta.title}
-          </div>
-          <div className="mt-2 flex items-baseline gap-2">
-            <div className="text-3xl font-semibold tracking-tight text-slate-100">{tradable}</div>
-            <div className="text-xs text-slate-400">/ {total} watched</div>
-          </div>
-          <div className="mt-1 text-xs text-slate-500">
-            {enabled ? "tradable with current cash" : "disabled — bot will not watch or trade"}
-          </div>
-        </div>
-        <div className="flex flex-col items-end gap-1">
-          <span className="text-[10px] uppercase tracking-wider text-slate-400">
-            Watch & trade
-          </span>
-          <KindToggle
-            enabled={enabled}
-            pending={pending}
-            onChange={(v) => onToggle(v)}
-            title={
-              kind === "INDEX"
-                ? "Watch & trade index ATM options (NIFTY/BANKNIFTY CE/PE)"
-                : `Watch & trade ${meta.title.toLowerCase()}`
-            }
-          />
-          <span className={`text-[10px] ${enabled ? "text-emerald-300" : "text-slate-400"}`}>
-            {enabled ? "ON" : "OFF"}
-          </span>
-        </div>
-      </div>
-
-      {/* Market hours line — always visible so the user knows the session window. */}
-      <div className="mt-3">
-        <MarketLine market={market} />
-      </div>
-
-      <div className="mt-3 min-h-[2.5rem]">
-        {!enabled ? (
-          <div className="text-xs text-slate-500">
-            Disabled by you. Re-enable to resume polling and trading.
-          </div>
-        ) : !marketOpen ? (
-          <div className="text-xs text-amber-200/80">
-            {market?.label ?? "Exchange"} is closed.{" "}
-            {market?.reason === "weekend"
-              ? "Reopens "
-              : market?.reason === "before_open"
-              ? "Opens at "
-              : "Reopens "}
-            <span className="font-semibold text-amber-200">{market?.opens_at_label ?? "soon"}</span>.
-          </div>
-        ) : empty ? (
-          <div className="text-xs text-slate-500">
-            None in the active universe.{" "}
-            <a href="/dashboard/universe" className="text-sky-300 underline">
-              Edit universe
-            </a>
-            .
-          </div>
-        ) : (
-          <div className="flex flex-wrap gap-1.5">
-            {(bucket?.names ?? []).map((n) => (
-              <span key={n} className="pill-blue text-[11px]">{n}</span>
-            ))}
-            {bucket?.top_name ? (
-              <span className="ml-auto text-[11px] text-slate-400">
-                strongest: <span className="text-slate-200">{bucket.top_name}</span>
-              </span>
-            ) : null}
-          </div>
-        )}
-      </div>
-      <div className="mt-3 text-[11px] text-slate-500">{meta.help}</div>
-    </div>
-  );
-}
-
-type HeroTrade = {
-  key: string;
-  symbol: string;
-  side: "CE" | "PE" | "-";
-  qty: number;
-  entry: number | null;
-  ltp: number | null;
-  pnl: number | null;
-  capital: number;
-  source: "live" | "paper";
-  opened_at: string | null;
-};
-
-function buildHeroTrades(
-  isLive: boolean,
-  positions: PositionsResponse | undefined | null,
-  paperRows: PaperPosition[],
-): HeroTrade[] {
-  if (isLive) {
-    const rows: PositionRow[] = (positions?.rows ?? []).filter((r) => Math.abs(r.net_qty) > 0);
-    return rows.map((r) => ({
-      key: `live:${r.exchange}:${r.symboltoken}`,
-      symbol: r.tradingsymbol,
-      side: r.side,
-      qty: r.net_qty,
-      entry: r.buy_avg ?? r.sell_avg ?? null,
-      ltp: r.ltp,
-      pnl: r.pnl,
-      capital: r.capital_used ?? 0,
-      source: "live",
-      opened_at: null,
-    }));
-  }
-  return paperRows.map((p) => ({
-    key: `paper:${p.exchange}:${p.symboltoken}`,
-    symbol: p.tradingsymbol,
-    side: p.side,
-    qty: p.qty,
-    entry: p.entry_price,
-    ltp: p.last_price,
-    pnl: p.unrealized_pnl,
-    capital: p.capital_used,
-    source: "paper",
-    opened_at: p.opened_at,
-  }));
-}
-
-function ActiveTradesHero({
-  isLive,
-  positions,
-  paperRows,
-}: {
-  isLive: boolean;
-  positions: PositionsResponse | undefined | null;
-  paperRows: PaperPosition[];
-}) {
-  const trades = buildHeroTrades(isLive, positions, paperRows);
-  if (trades.length === 0) {
-    return (
-      <section className="card border border-white/5 p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <h2 className="text-sm font-semibold tracking-wide text-slate-200">
-              Active trade
-            </h2>
-            <div className="mt-1 text-xs text-slate-400">
-              No open {isLive ? "broker" : "paper"} positions right now. The bot is scanning —
-              your active trade will appear here the moment it enters one.
-            </div>
-          </div>
-          <div className="rounded-md bg-slate-800/60 px-3 py-1.5 text-[11px] uppercase tracking-wider text-slate-400">
-            idle
-          </div>
-        </div>
-      </section>
-    );
-  }
-
-  const totalPnl = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
-  const totalCap = trades.reduce((s, t) => s + (t.capital ?? 0), 0);
-  const tone = totalPnl > 0 ? "good" : totalPnl < 0 ? "bad" : "neutral";
-  const accent =
-    tone === "good"
-      ? "from-emerald-400/40 to-emerald-400/0"
-      : tone === "bad"
-      ? "from-rose-400/40 to-rose-400/0"
-      : "from-sky-400/40 to-sky-400/0";
-
-  return (
-    <section className="card relative overflow-hidden border border-white/10 p-5">
-      <div className={`absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r ${accent}`} />
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold tracking-wide text-slate-100">
-            Active trade{trades.length > 1 ? `s (${trades.length})` : ""}
-          </h2>
-          <div className="mt-0.5 text-[11px] uppercase tracking-wider text-slate-400">
-            {isLive ? "Live broker positions" : "Paper positions (dry-run)"}
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-4 text-right">
-          <Stat label="Capital deployed" value={formatINR(totalCap)} />
-          <Stat
-            label={trades.length > 1 ? "Combined P&L" : "P&L"}
-            value={formatINR(totalPnl)}
-            tone={tone}
-          />
-        </div>
-      </div>
-      <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-        {trades.map((t) => (
-          <ActiveTradeCard key={t.key} trade={t} />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "good" | "bad" | "neutral";
-}) {
-  const cls =
-    tone === "good"
-      ? "text-emerald-300"
-      : tone === "bad"
-      ? "text-rose-300"
-      : "text-slate-100";
-  return (
-    <div>
-      <div className="text-[10px] uppercase tracking-wider text-slate-400">{label}</div>
-      <div className={`text-lg font-semibold tabular-nums ${cls}`}>{value}</div>
-    </div>
-  );
-}
-
-function ActiveTradeCard({ trade }: { trade: HeroTrade }) {
-  const sideTone =
-    trade.side === "CE" ? "text-emerald-300" : trade.side === "PE" ? "text-rose-300" : "text-slate-300";
-  const pnl = trade.pnl ?? 0;
-  const pnlTone =
-    pnl > 0 ? "text-emerald-300" : pnl < 0 ? "text-rose-300" : "text-slate-200";
-  const move =
-    trade.entry && trade.entry > 0 && trade.ltp != null
-      ? ((trade.ltp - trade.entry) / trade.entry) * 100
-      : null;
-  const moveSign = move == null ? "" : move > 0 ? "+" : "";
-  return (
-    <div className="rounded-lg border border-white/10 bg-slate-900/40 p-4">
-      <div className="flex items-start justify-between gap-2">
-        <div>
-          <div className="font-semibold tracking-tight text-slate-100">{trade.symbol}</div>
-          <div className="mt-0.5 flex items-center gap-2 text-[11px]">
-            <span className={trade.side === "CE" ? "pill-green" : trade.side === "PE" ? "pill-red" : "pill-blue"}>
-              {trade.side}
-            </span>
-            <span className="text-slate-400">qty {trade.qty}</span>
-            {trade.opened_at ? (
-              <span className="text-slate-500">since {formatTime(trade.opened_at)}</span>
-            ) : null}
-          </div>
-        </div>
-        <div className="text-right">
-          <div className={`text-xl font-semibold tabular-nums ${pnlTone}`}>
-            {formatINR(pnl)}
-          </div>
-          <div className="text-[11px] text-slate-400">unrealized P&L</div>
-        </div>
-      </div>
-      <div className="mt-3 grid grid-cols-3 gap-3 text-[11px]">
-        <Mini label="Entry" value={trade.entry != null ? formatINR(trade.entry) : "—"} />
-        <Mini
-          label="LTP"
-          value={trade.ltp != null ? formatINR(trade.ltp) : "—"}
-          extra={
-            move == null
-              ? ""
-              : `${moveSign}${move.toFixed(2)}%`
-          }
-          extraTone={
-            move == null || Math.abs(move) < 1e-6
-              ? "neutral"
-              : move > 0
-              ? "good"
-              : "bad"
-          }
-        />
-        <Mini label="Capital" value={formatINR(trade.capital)} />
-      </div>
-      <div className={`mt-2 text-[10px] uppercase tracking-wider ${sideTone}`}>
-        {trade.source === "live" ? "Real money" : "Simulated (dry-run)"}
-      </div>
-    </div>
-  );
-}
-
-function Mini({
-  label,
-  value,
-  extra,
-  extraTone,
-}: {
-  label: string;
-  value: string;
-  extra?: string;
-  extraTone?: "good" | "bad" | "neutral";
-}) {
-  const cls =
-    extraTone === "good"
-      ? "text-emerald-300"
-      : extraTone === "bad"
-      ? "text-rose-300"
-      : "text-slate-400";
-  return (
-    <div className="rounded-md bg-slate-950/40 px-2 py-1.5">
+    <div className="px-4 py-3">
       <div className="text-[10px] uppercase tracking-wider text-slate-500">{label}</div>
-      <div className="font-semibold tabular-nums text-slate-100">{value}</div>
-      {extra ? <div className={`text-[10px] tabular-nums ${cls}`}>{extra}</div> : null}
-    </div>
-  );
-}
-
-function MarketLine({ market }: { market: MarketStatus | undefined }) {
-  if (!market) return null;
-  if (market.is_open) {
-    return (
-      <div className="text-[11px] text-emerald-300/90">
-        {market.label} open · closes {market.closes_at_label}
+      <div className={`mt-1 text-xl font-semibold tabular-nums tracking-tight ${valueClass}`}>
+        {value}
       </div>
-    );
-  }
-  return (
-    <div className="text-[11px] text-amber-300/90">
-      {market.label} closed ·{" "}
-      {market.reason === "weekend"
-        ? "weekend — reopens "
-        : market.reason === "before_open"
-        ? "opens "
-        : "reopens "}
-      {market.opens_at_label}
+      <div className="mt-1 text-[10px] text-slate-500">{hint}</div>
     </div>
   );
 }
 
-function KindToggle({
-  enabled,
-  pending,
-  onChange,
-  title,
+function CePeMiniSummary({
+  ceCount,
+  peCount,
+  ceCap,
+  peCap,
+  cePnl,
+  pePnl,
 }: {
-  enabled: boolean;
-  pending: boolean;
-  onChange: (next: boolean) => void;
-  title: string;
+  ceCount: number;
+  peCount: number;
+  ceCap: number;
+  peCap: number;
+  cePnl: number;
+  pePnl: number;
 }) {
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={enabled}
-      title={title}
-      disabled={pending}
-      onClick={() => onChange(!enabled)}
-      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition focus:outline-none focus:ring-2 focus:ring-sky-400/50 ${
-        enabled ? "bg-emerald-500/80" : "bg-slate-600/60"
-      } ${pending ? "opacity-60" : ""}`}
-    >
-      <span
-        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
-          enabled ? "translate-x-5" : "translate-x-0.5"
-        }`}
-      />
-      <span className="sr-only">{enabled ? "Disable" : "Enable"} {title}</span>
-    </button>
+    <div className="card overflow-hidden">
+      <div className="border-b border-white/5 px-4 py-2.5">
+        <h2 className="text-sm font-semibold tracking-wide text-slate-200">
+          Calls vs Puts
+        </h2>
+        <div className="text-[11px] text-slate-500">
+          Direction breakdown of currently held positions.
+        </div>
+      </div>
+      <div className="grid grid-cols-2 divide-x divide-white/5">
+        <SideMini label="Calls (CE)" tone="good" count={ceCount} capital={ceCap} pnl={cePnl} />
+        <SideMini label="Puts (PE)" tone="bad" count={peCount} capital={peCap} pnl={pePnl} />
+      </div>
+    </div>
   );
 }
 
-function SidePill({
+function SideMini({
   label,
   tone,
   count,
@@ -759,23 +394,18 @@ function SidePill({
   pnl: number;
 }) {
   const headClass = tone === "good" ? "text-emerald-300" : "text-rose-300";
-  const accent =
-    tone === "good"
-      ? "from-emerald-400/40 to-emerald-400/0"
-      : "from-rose-400/40 to-rose-400/0";
   return (
-    <div className="card relative overflow-hidden p-5">
-      <div className={`absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r ${accent}`} />
-      <div className={`text-xs uppercase tracking-wider ${headClass}`}>{label}</div>
-      <div className="mt-2 flex items-baseline gap-2">
-        <div className="text-3xl font-semibold text-slate-100">{count}</div>
-        <div className="text-xs text-slate-400">open positions</div>
+    <div className="px-4 py-3">
+      <div className={`text-[10px] uppercase tracking-wider ${headClass}`}>{label}</div>
+      <div className="mt-1 flex items-baseline gap-1.5">
+        <div className="text-xl font-semibold tabular-nums text-slate-100">{count}</div>
+        <div className="text-[10px] text-slate-500">open</div>
       </div>
-      <div className="mt-2 text-sm text-slate-300">
-        Capital used <span className="font-semibold">{formatINR(capital)}</span>
+      <div className="mt-1 text-[11px] text-slate-400">
+        Capital <span className="tabular-nums text-slate-200">{formatINR(capital, { compact: true })}</span>
       </div>
-      <div className={`text-sm ${classOf(pnl)}`}>
-        Open P&amp;L <span className="font-semibold">{formatINR(pnl)}</span>
+      <div className={`text-[11px] ${classOf(pnl)}`}>
+        P&amp;L <span className="font-semibold tabular-nums">{formatINR(pnl)}</span>
       </div>
     </div>
   );
@@ -839,6 +469,29 @@ function UniverseChip({ universe }: { universe: UniverseBlock | undefined }) {
           ⚠ {(r.indices_missing.length + r.stocks_missing.length + r.atm_missing.length)} unresolved
         </span>
       ) : null}
+    </div>
+  );
+}
+
+function WarmupChip({
+  warmup,
+  botRunning,
+}: {
+  warmup: WarmupBlock | undefined;
+  botRunning: boolean;
+}) {
+  if (!warmup || !botRunning) return null;
+  if (!warmup.from_history) return null;
+  if (warmup.warmed_tokens === 0) {
+    return (
+      <div className="mt-1 text-[10px] uppercase tracking-wider text-amber-300">
+        Brain warmup: history fetch pending — collecting live ticks
+      </div>
+    );
+  }
+  return (
+    <div className="mt-1 text-[10px] uppercase tracking-wider text-emerald-300/80">
+      Brain warmed from broker history · {warmup.seeded_aggregators}/{warmup.warmed_tokens} tokens seeded
     </div>
   );
 }

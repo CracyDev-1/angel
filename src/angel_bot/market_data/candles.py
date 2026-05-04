@@ -113,6 +113,56 @@ class CandleAggregator:
             cur.low = min(cur.low, price)
             cur.c = price
 
+    def seed_history(
+        self,
+        *,
+        candles_1m: list[Candle] | None = None,
+        candles_5m: list[Candle] | None = None,
+        candles_15m: list[Candle] | None = None,
+    ) -> None:
+        """Bulk-load historical candles into each timeframe deque.
+
+        Used at bot startup to backfill warmup state from the broker's
+        historical-candle API so the brain can grade signals on cycle 1
+        instead of waiting 25-30 minutes for the in-memory aggregator to
+        rebuild ≥5 5m bars and ≥2 15m bars from live ticks.
+
+        Existing in-progress bars (``_cur_*``) are cleared because the
+        seeded candles already cover their bucket. Session high/low/twap
+        are recomputed from the freshest seeded data so the brain's TWAP
+        and intraday-range checks have realistic numbers immediately.
+        """
+        def _seed(deck: deque[Candle], rows: list[Candle] | None) -> None:
+            if not rows:
+                return
+            deck.clear()
+            for c in rows[-deck.maxlen :] if deck.maxlen else rows:
+                deck.append(c)
+
+        _seed(self._1m, candles_1m)
+        _seed(self._5m, candles_5m)
+        _seed(self._15m, candles_15m)
+        self._cur_1m = None
+        self._cur_5m = None
+        self._cur_15m = None
+
+        # Reset session aggregates from the seeded data. Prefer 1m when
+        # available (highest resolution), otherwise 5m, otherwise 15m.
+        seed = candles_1m or candles_5m or candles_15m or []
+        if not seed:
+            return
+        today_iso = (seed[-1].ts.date()).isoformat()
+        same_day = [c for c in seed if c.ts.date().isoformat() == today_iso]
+        ref = same_day or seed
+        highs = [c.h for c in ref]
+        lows = [c.low for c in ref]
+        closes = [c.c for c in ref if c.c]
+        self._session_day = today_iso
+        self.session_high = max(highs) if highs else None
+        self.session_low = min(lows) if lows else None
+        self._twap_sum = sum(closes)
+        self._twap_n = len(closes) or 0
+
     # ------------------------------------------------------------------
     # snapshots
     # ------------------------------------------------------------------

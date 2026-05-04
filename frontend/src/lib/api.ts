@@ -123,6 +123,13 @@ export type ScannerHit = {
   capital_short_for_one_lot: number | null;
   in_trade_value_range: boolean;
   capital_range_reason: string | null;
+  underlying?: string;
+  expiry?: string;
+  strike?: number;
+  option_side?: "CE" | "PE" | "";
+  offset?: number;
+  tradingsymbol?: string;
+  is_affordable?: boolean;
   score: number;
   score_breakdown: ScoreBreakdown;
   signal_side: "BUY_CALL" | "BUY_PUT" | "NO_TRADE";
@@ -229,6 +236,8 @@ export type ScanSummary = {
   reason: string;
   top: ScanSummaryTop[];
   min_score?: number;
+  hidden_unaffordable?: number;
+  index_unaffordable?: number;
 };
 
 export type ScannerBucket = {
@@ -424,6 +433,41 @@ export type Snapshot = {
   dryrun?: DryrunBlock;
   universe?: UniverseBlock;
   market_hours?: Record<string, MarketStatus>;
+  live_exits?: LiveExitsBlock;
+  warmup?: WarmupBlock;
+};
+
+export type WarmupBlock = {
+  from_history: boolean;
+  seeded_aggregators: number;
+  warmed_tokens: number;
+};
+
+export type LiveExitPlanRow = {
+  plan_id: number;
+  tradingsymbol: string;
+  exchange: string;
+  symboltoken: string;
+  side: "CE" | "PE" | "LONG" | string;
+  qty: number;
+  lots: number;
+  lot_size: number;
+  fill_price: number | null;
+  planned_entry: number | null;
+  stop_price: number;
+  target_price: number;
+  max_hold_minutes: number;
+  opened_at: string | null;
+  filled_at: string | null;
+  source: "bot" | "adopted" | string;
+  underlying: string | null;
+  kind: string | null;
+};
+
+export type LiveExitsBlock = {
+  open: LiveExitPlanRow[];
+  managed_count: number;
+  adopted_count: number;
 };
 
 export type MarketStatus = {
