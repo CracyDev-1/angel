@@ -67,6 +67,20 @@ class Settings(BaseSettings):
     llm_top_n_candidates: int = Field(
         default=3, validation_alias="LLM_TOP_N_CANDIDATES"
     )
+    # When True (and OPENAI_API_KEY set), the classifier may return stop_loss_pct,
+    # take_profit_pct, max_hold_minutes for each TAKE — clamped to the ranges
+    # below and applied to live + paper exits (overrides PAPER_* defaults).
+    llm_exit_params_enabled: bool = Field(
+        default=True, validation_alias="LLM_EXIT_PARAMS_ENABLED"
+    )
+    # Clamps for LLM-suggested exits (fractions of option premium). Aligned
+    # with intraday index options: wide enough to avoid normal premium noise.
+    llm_exit_sl_pct_min: float = Field(default=0.08, validation_alias="LLM_EXIT_SL_PCT_MIN")
+    llm_exit_sl_pct_max: float = Field(default=0.15, validation_alias="LLM_EXIT_SL_PCT_MAX")
+    llm_exit_tp_pct_min: float = Field(default=0.15, validation_alias="LLM_EXIT_TP_PCT_MIN")
+    llm_exit_tp_pct_max: float = Field(default=0.30, validation_alias="LLM_EXIT_TP_PCT_MAX")
+    llm_exit_hold_min: int = Field(default=15, validation_alias="LLM_EXIT_HOLD_MIN")
+    llm_exit_hold_max: int = Field(default=30, validation_alias="LLM_EXIT_HOLD_MAX")
 
     # 0 = auto: use live broker available cash. Any positive value overrides.
     risk_capital_rupees: float = Field(default=0.0, validation_alias="RISK_CAPITAL_RUPEES")
@@ -84,12 +98,6 @@ class Settings(BaseSettings):
     risk_max_trades_per_hour: int = Field(
         default=0, validation_alias="RISK_MAX_TRADES_PER_HOUR"
     )
-    # Cooldown after a losing close: refuse new entries for this many
-    # minutes. 0 disables the cooldown.
-    risk_loss_cooldown_minutes: int = Field(
-        default=10, validation_alias="RISK_LOSS_COOLDOWN_MINUTES"
-    )
-
     # Legacy name — still respected for backwards-compat. Prefer
     # INSTRUMENT_MASTER_PATH below (works for JSON + CSV).
     instrument_master_csv: str | None = Field(default=None, validation_alias="INSTRUMENT_MASTER_CSV")
@@ -181,7 +189,7 @@ class Settings(BaseSettings):
     # and can starve order/LTP calls. We only backfill this many *new* keys
     # per refresh cycle; the rest are picked up on later cycles.
     bot_warmup_delta_max_keys: int = Field(
-        default=8, validation_alias="BOT_WARMUP_DELTA_MAX_KEYS"
+        default=4, validation_alias="BOT_WARMUP_DELTA_MAX_KEYS"
     )
 
     # Adopt long positions opened *directly on the Angel One platform* and
@@ -300,15 +308,66 @@ class Settings(BaseSettings):
     dryrun_capital_override: float = Field(
         default=0.0, validation_alias="DRYRUN_CAPITAL_OVERRIDE"
     )
-    # Swing-friendlier defaults for index options: tight scalp settings
-    # (0.6% / 1.2% / 25m) get stopped out by normal premium noise and
-    # round-trip costs. Widen via .env if you want a different profile.
-    paper_stop_loss_pct: float = Field(default=0.015, validation_alias="PAPER_STOP_LOSS_PCT")
-    paper_take_profit_pct: float = Field(default=0.04, validation_alias="PAPER_TAKE_PROFIT_PCT")
-    paper_max_hold_minutes: int = Field(default=55, validation_alias="PAPER_MAX_HOLD_MINUTES")
+    # Intraday index-option BUY defaults (fractions of option premium, not
+    # underlying). Tight SL/TP gets chopped by normal premium wobble + theta;
+    # ~10% / ~20% / ~20m matches typical intraday risk-reward for liquid CE/PE.
+    paper_stop_loss_pct: float = Field(default=0.10, validation_alias="PAPER_STOP_LOSS_PCT")
+    paper_take_profit_pct: float = Field(default=0.20, validation_alias="PAPER_TAKE_PROFIT_PCT")
+    paper_max_hold_minutes: int = Field(default=20, validation_alias="PAPER_MAX_HOLD_MINUTES")
     paper_max_open_positions: int = Field(
         default=5, validation_alias="PAPER_MAX_OPEN_POSITIONS"
     )
+
+    # Dynamic exits (score + volatility/momentum on ScannerHit). When True,
+    # SL/TP/max-hold ignore LLM exit fields — same triple drives risk + paper + live.
+    exit_dynamic_enabled: bool = Field(default=False, validation_alias="EXIT_DYNAMIC_ENABLED")
+    exit_dynamic_score_mid: float = Field(default=0.5, validation_alias="EXIT_DYNAMIC_SCORE_MID")
+    exit_dynamic_score_high: float = Field(default=0.7, validation_alias="EXIT_DYNAMIC_SCORE_HIGH")
+    exit_dynamic_sl_weak: float = Field(default=0.10, validation_alias="EXIT_DYNAMIC_SL_WEAK")
+    exit_dynamic_tp_weak: float = Field(default=0.15, validation_alias="EXIT_DYNAMIC_TP_WEAK")
+    exit_dynamic_hold_weak: int = Field(default=20, validation_alias="EXIT_DYNAMIC_HOLD_WEAK")
+    exit_dynamic_sl_mid: float = Field(default=0.10, validation_alias="EXIT_DYNAMIC_SL_MID")
+    exit_dynamic_tp_mid: float = Field(default=0.20, validation_alias="EXIT_DYNAMIC_TP_MID")
+    exit_dynamic_hold_mid: int = Field(default=25, validation_alias="EXIT_DYNAMIC_HOLD_MID")
+    exit_dynamic_sl_strong: float = Field(default=0.12, validation_alias="EXIT_DYNAMIC_SL_STRONG")
+    exit_dynamic_tp_strong: float = Field(default=0.28, validation_alias="EXIT_DYNAMIC_TP_STRONG")
+    exit_dynamic_hold_strong: int = Field(default=28, validation_alias="EXIT_DYNAMIC_HOLD_STRONG")
+    # Normalized volatility (0..1) from brain ScoreBreakdown — adjust exits, do not
+    # duplicate brain entry filters unless ultra-low skip is explicitly enabled.
+    exit_dynamic_vol_low: float = Field(default=0.33, validation_alias="EXIT_DYNAMIC_VOL_LOW")
+    exit_dynamic_vol_high: float = Field(default=0.66, validation_alias="EXIT_DYNAMIC_VOL_HIGH")
+    exit_dynamic_vol_low_tp_factor: float = Field(
+        default=0.95, validation_alias="EXIT_DYNAMIC_VOL_LOW_TP_FACTOR"
+    )
+    exit_dynamic_vol_low_hold_trim: int = Field(
+        default=3, validation_alias="EXIT_DYNAMIC_VOL_LOW_HOLD_TRIM"
+    )
+    exit_dynamic_vol_high_sl_add: float = Field(
+        default=0.02, validation_alias="EXIT_DYNAMIC_VOL_HIGH_SL_ADD"
+    )
+    exit_dynamic_vol_high_tp_add: float = Field(
+        default=0.05, validation_alias="EXIT_DYNAMIC_VOL_HIGH_TP_ADD"
+    )
+    exit_dynamic_momentum_high: float = Field(default=0.60, validation_alias="EXIT_DYNAMIC_MOMENTUM_HIGH")
+    exit_dynamic_hold_momentum_cap: int = Field(
+        default=15, validation_alias="EXIT_DYNAMIC_HOLD_MOMENTUM_CAP"
+    )
+    exit_dynamic_sl_max: float = Field(default=0.18, validation_alias="EXIT_DYNAMIC_SL_MAX")
+    exit_dynamic_tp_max: float = Field(default=0.40, validation_alias="EXIT_DYNAMIC_TP_MAX")
+    exit_dynamic_hold_min: int = Field(default=10, validation_alias="EXIT_DYNAMIC_HOLD_MIN")
+    exit_dynamic_hold_max: int = Field(default=35, validation_alias="EXIT_DYNAMIC_HOLD_MAX")
+    exit_dynamic_skip_ultra_low_vol: bool = Field(
+        default=False, validation_alias="EXIT_DYNAMIC_SKIP_ULTRA_LOW_VOL"
+    )
+    exit_dynamic_vol_ultra_low: float = Field(
+        default=0.12, validation_alias="EXIT_DYNAMIC_VOL_ULTRA_LOW"
+    )
+
+    # Trailing stop on option premium (long CE/PE): raises stop_price toward peak;
+    # never below initial SL. Take-profit unchanged in v1.
+    trail_stop_enabled: bool = Field(default=False, validation_alias="TRAIL_STOP_ENABLED")
+    trail_stop_pct: float = Field(default=0.10, validation_alias="TRAIL_STOP_PCT")
+    trail_arm_min_profit_pct: float = Field(default=0.05, validation_alias="TRAIL_ARM_MIN_PROFIT_PCT")
 
     # ------------------------- RATE LIMITS ------------------------------
     # Client-side guard for the published Angel One quotas
@@ -324,7 +383,7 @@ class Settings(BaseSettings):
     # Historical candles share Angel's global gateway budget with LTP / RMS /
     # orders; this gap keeps us under the observed 403 threshold in practice.
     rate_limit_candle_min_gap_s: float = Field(
-        default=0.4, validation_alias="RATE_LIMIT_CANDLE_MIN_GAP_S"
+        default=0.75, validation_alias="RATE_LIMIT_CANDLE_MIN_GAP_S"
     )
 
     log_format: str = Field(default="console", validation_alias="LOG_FORMAT")

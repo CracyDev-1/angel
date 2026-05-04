@@ -90,6 +90,46 @@ def sanitize_context(ctx: Any) -> Any:
     return ctx
 
 
+def clamp_llm_exit_params(
+    settings: Settings,
+    *,
+    stop_loss_pct: float | None,
+    take_profit_pct: float | None,
+    max_hold_minutes: int | None,
+) -> tuple[float | None, float | None, int | None]:
+    """Clamp model-suggested exits to configured bounds. None = omit override."""
+    if not settings.llm_exit_params_enabled:
+        return None, None, None
+    out_sl: float | None = None
+    out_tp: float | None = None
+    out_mh: int | None = None
+    if stop_loss_pct is not None:
+        try:
+            x = float(stop_loss_pct)
+        except (TypeError, ValueError):
+            x = settings.paper_stop_loss_pct
+        lo = float(settings.llm_exit_sl_pct_min)
+        hi = float(settings.llm_exit_sl_pct_max)
+        out_sl = max(lo, min(hi, x))
+    if take_profit_pct is not None:
+        try:
+            x = float(take_profit_pct)
+        except (TypeError, ValueError):
+            x = settings.paper_take_profit_pct
+        lo = float(settings.llm_exit_tp_pct_min)
+        hi = float(settings.llm_exit_tp_pct_max)
+        out_tp = max(lo, min(hi, x))
+    if max_hold_minutes is not None:
+        try:
+            m = int(max_hold_minutes)
+        except (TypeError, ValueError):
+            m = int(settings.paper_max_hold_minutes)
+        lo = int(settings.llm_exit_hold_min)
+        hi = int(settings.llm_exit_hold_max)
+        out_mh = max(lo, min(hi, m))
+    return out_sl, out_tp, out_mh
+
+
 def _disabled(reason: str) -> LlmDecision:
     """Helper for short-circuit paths that should pass-through (no veto)."""
     return LlmDecision(verdict="YES", allowed=True, reason=reason, source="disabled")
@@ -226,6 +266,10 @@ class LlmClassification:
     reason: str
     source: str                          # "openai" / "disabled" / "no_key" / "error" / "fail_closed"
     raw: dict[str, Any] = field(default_factory=dict)
+    # Optional exit overrides (fractions of premium; minutes). Clamped in filter.py.
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    max_hold_minutes: int | None = None
 
     @property
     def allowed(self) -> bool:
@@ -235,13 +279,20 @@ class LlmClassification:
         return self.allowed and self.confidence >= float(threshold)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "decision": self.decision,
             "confidence": round(self.confidence, 3),
             "type": self.pattern_type,
             "reason": self.reason,
             "source": self.source,
         }
+        if self.stop_loss_pct is not None:
+            d["stop_loss_pct"] = round(self.stop_loss_pct, 4)
+        if self.take_profit_pct is not None:
+            d["take_profit_pct"] = round(self.take_profit_pct, 4)
+        if self.max_hold_minutes is not None:
+            d["max_hold_minutes"] = int(self.max_hold_minutes)
+        return d
 
 
 def _classifier_disabled(reason: str) -> LlmClassification:
@@ -295,6 +346,17 @@ async def llm_classify_setup(
 
     safe_ctx = sanitize_context(market_context)
 
+    exit_instr = ""
+    if settings.llm_exit_params_enabled:
+        exit_instr = (
+            " When decision is TAKE, include numeric fields stop_loss_pct, "
+            "take_profit_pct, max_hold_minutes. They apply to LONG option premium "
+            "(stop below entry, target above). Index options need room for normal "
+            "premium noise — prefer stop_loss_pct roughly 0.08-0.15, take_profit_pct "
+            "0.15-0.30, max_hold_minutes 15-30 for intraday; TP often ~2x SL after "
+            "broker round-trip. Widen TP on clean trends, tighter in chop."
+        )
+
     system = (
         "You are a probabilistic trade-quality classifier for an existing "
         "rule-based intraday options bot focused on 5-minute setups. The "
@@ -303,11 +365,18 @@ async def llm_classify_setup(
         "with EXACTLY one JSON object: "
         '{"decision":"TAKE"|"SKIP","confidence":0.0..1.0,'
         '"type":"breakout"|"pullback"|"continuation"|"other",'
-        '"reason":"<=120 chars"}. '
+        '"reason":"<=120 chars"'
+        + (
+            ',"stop_loss_pct":<number>,"take_profit_pct":<number>,"max_hold_minutes":<integer>'
+            if settings.llm_exit_params_enabled
+            else ""
+        )
+        + "}. "
         "Use TAKE only when the structure is clean and confluent. "
         "Use SKIP when the move is exhausted, against the higher-timeframe bias, "
         "or the setup is ambiguous. confidence reflects your probability that "
         "the trade plays out within the next 1-3 5m bars."
+        + exit_instr
     )
     user = json.dumps(
         {
@@ -372,6 +441,18 @@ async def llm_classify_setup(
         confidence = max(0.0, min(1.0, confidence))
         reason = str(parsed.get("reason", "")).strip()[:200] or "no_reason"
 
+        raw_sl = raw_tp = raw_mh = None
+        if decision_raw == "TAKE" and settings.llm_exit_params_enabled:
+            raw_sl = parsed.get("stop_loss_pct")
+            raw_tp = parsed.get("take_profit_pct")
+            raw_mh = parsed.get("max_hold_minutes")
+        sl_c, tp_c, mh_c = clamp_llm_exit_params(
+            settings,
+            stop_loss_pct=raw_sl,
+            take_profit_pct=raw_tp,
+            max_hold_minutes=raw_mh,
+        )
+
         return LlmClassification(
             decision=decision_raw,        # type: ignore[arg-type]
             confidence=confidence,
@@ -379,6 +460,9 @@ async def llm_classify_setup(
             reason=reason,
             source="openai",
             raw={"model": settings.openai_model},
+            stop_loss_pct=sl_c,
+            take_profit_pct=tp_c,
+            max_hold_minutes=mh_c,
         )
     finally:
         if own_client:

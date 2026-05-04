@@ -1,9 +1,8 @@
 """RiskEngine persistence tests.
 
-Recent-entries (per-hour cap) and last-loss-at (post-loss cooldown) used to
-live in-memory only, so a process restart inside a trading session forgot
-both — letting the bot bypass its own caps until a full hour had passed.
-These tests pin the new write-through-to-SQLite behaviour.
+Recent-entries (per-hour cap) used to live in-memory only, so a process
+restart inside a trading session forgot the cap. These tests pin the
+write-through-to-SQLite behaviour.
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ def settings() -> Settings:
         RISK_MAX_DAILY_LOSS_PCT=10.0,
         RISK_MAX_TRADES_PER_DAY=999,
         RISK_MAX_TRADES_PER_HOUR=2,        # easy to hit in a test
-        RISK_LOSS_COOLDOWN_MINUTES=15,     # easy to detect
     )
 
 
@@ -93,50 +91,6 @@ def test_evaluate_new_trade_blocks_when_hourly_cap_persisted(
     decision2 = r2.evaluate_new_trade(entry=100.0, stop=99.0, lot_size=1)
     assert decision2.allowed is False
     assert "max_trades_hour" in decision2.reason
-
-
-# ---------------------------------------------------------------------------
-# record_close → SQLite → restore + cooldown still active
-# ---------------------------------------------------------------------------
-
-
-def test_losing_close_persists_cooldown_and_restores(
-    store: StateStore, settings: Settings
-) -> None:
-    r1 = RiskEngine(settings, store=store)
-    loss_at = datetime.now(timezone.utc) - timedelta(minutes=2)
-    r1.record_close(realized_pnl=-500.0, when=loss_at)
-    cooling, remaining = r1.in_loss_cooldown()
-    assert cooling is True
-    assert remaining > 0
-
-    # Fresh engine instance — cooldown must survive the restart.
-    r2 = RiskEngine(settings, store=store)
-    r2.sync_from_store(store)
-    cooling2, remaining2 = r2.in_loss_cooldown()
-    assert cooling2 is True
-    assert remaining2 > 0
-
-
-def test_winning_close_does_not_set_cooldown(store: StateStore, settings: Settings) -> None:
-    r1 = RiskEngine(settings, store=store)
-    r1.record_close(realized_pnl=+250.0)
-    assert r1.in_loss_cooldown() == (False, 0.0)
-    assert store.get_risk_state()["last_loss_at"] is None
-
-
-def test_evaluate_new_trade_blocks_during_persisted_cooldown(
-    store: StateStore, settings: Settings
-) -> None:
-    r1 = RiskEngine(settings, store=store)
-    r1.record_close(realized_pnl=-100.0)
-
-    r2 = RiskEngine(settings, store=store)
-    r2.sync_from_store(store)
-    r2.set_broker_cash(100_000.0)
-    d = r2.evaluate_new_trade(entry=100.0, stop=99.0, lot_size=1)
-    assert d.allowed is False
-    assert "loss_cooldown" in d.reason
 
 
 # ---------------------------------------------------------------------------

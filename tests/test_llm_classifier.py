@@ -149,3 +149,54 @@ async def test_classifier_no_key_short_circuits():
     )
     assert res.decision == "TAKE"
     assert res.source == "no_key"
+
+
+@pytest.mark.asyncio
+async def test_classifier_take_includes_clamped_exit_params():
+    s = _settings()
+    client = _fake_openai_client(
+        json.dumps(
+            {
+                "decision": "TAKE",
+                "confidence": 0.8,
+                "type": "breakout",
+                "reason": "ok",
+                "stop_loss_pct": 0.5,
+                "take_profit_pct": 0.001,
+                "max_hold_minutes": 999,
+            }
+        )
+    )
+    res = await llm_classify_setup(
+        market_context={}, proposed_signal="x",
+        proposed_pattern="breakout", settings=s, client=client,
+    )
+    assert res.stop_loss_pct == pytest.approx(float(s.llm_exit_sl_pct_max))
+    assert res.take_profit_pct == pytest.approx(float(s.llm_exit_tp_pct_min))
+    assert res.max_hold_minutes == int(s.llm_exit_hold_max)
+
+
+@pytest.mark.asyncio
+async def test_classifier_skip_ignores_exit_param_keys():
+    s = _settings()
+    client = _fake_openai_client(
+        json.dumps(
+            {
+                "decision": "SKIP",
+                "confidence": 0.9,
+                "type": "breakout",
+                "reason": "x",
+                "stop_loss_pct": 0.02,
+                "take_profit_pct": 0.1,
+                "max_hold_minutes": 60,
+            }
+        )
+    )
+    res = await llm_classify_setup(
+        market_context={}, proposed_signal="x",
+        proposed_pattern="breakout", settings=s, client=client,
+    )
+    assert res.decision == "SKIP"
+    assert res.stop_loss_pct is None
+    assert res.take_profit_pct is None
+    assert res.max_hold_minutes is None

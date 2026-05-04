@@ -11,10 +11,13 @@ from angel_bot.exits.live import (
     LiveExitManager,
     LiveExitPlan,
 )
+from angel_bot.exits.params import ExitPlan, resolve_exit_plan
 
 __all__ = [
+    "ExitPlan",
     "LiveExitConfig",
     "LiveExitEvent",
     "LiveExitManager",
     "LiveExitPlan",
+    "resolve_exit_plan",
 ]

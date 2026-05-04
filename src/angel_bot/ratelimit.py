@@ -77,9 +77,10 @@ ENDPOINT_LIMITS: dict[str, list[tuple[int, float]]] = {
     "/rest/secure/angelbroking/gtt/v1/ruleDetails": [(10, 1.0), (500, 60.0), (5000, 3600.0)],
     "/rest/secure/angelbroking/gtt/v1/ruleList": [(10, 1.0), (500, 60.0), (5000, 3600.0)],
     # Historical / option greeks
-    # Stricter than the published 3/sec in practice when combined with
-    # LTP, getPosition, and order-reconcile calls on the same session.
-    "/rest/secure/angelbroking/historical/v1/getCandleData": [(2, 1.0), (150, 60.0), (5000, 3600.0)],
+    # Angel's gateway enforces a *global* budget across quote/RMS/orders.
+    # In practice even ~1/sec candle pulls plus LTP batches triggered 403s.
+    # One slot per 2s (≈30/min) stays well under broker behaviour in prod.
+    "/rest/secure/angelbroking/historical/v1/getCandleData": [(1, 2.0), (120, 60.0), (4000, 3600.0)],
     "/rest/secure/angelbroking/marketData/v1/optionGreek": [(1, 1.0)],
 }
 
@@ -289,7 +290,11 @@ class RateLimiter:
         _stuff(self._endpoint_buckets.get(path, []))
         if path in ORDER_PATHS:
             _stuff(self._group_buckets.get("orders", []))
-        log.warning("rate_limit_backoff", path=path, sleep_s=round(retry_after_s, 3))
+        # Historical 403s are expected occasionally when the gateway is hot;
+        # log at info so real problems stay visible at warning.
+        evt = "historical_rate_limit_backoff" if "getCandleData" in path else "rate_limit_backoff"
+        logfn = log.info if "getCandleData" in path else log.warning
+        logfn(evt, path=path, sleep_s=round(retry_after_s, 3))
 
     # ------------------------------------------------------------------
     _warned_unknown: set[str] = set()

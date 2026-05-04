@@ -13,6 +13,7 @@ from angel_bot.config import Settings, get_settings
 from angel_bot.decisions import Decision, DecisionLog
 from angel_bot.execution.orders import DuplicateOrderGuard, build_order_payload, validate_order_payload
 from angel_bot.exits.live import LiveExitConfig, LiveExitManager
+from angel_bot.exits.params import resolve_exit_plan
 from angel_bot.instruments.loader import MasterStatus, ensure_local_master
 from angel_bot.instruments.master import Instrument, InstrumentMaster
 from angel_bot.instruments.universe import BuildReport, UniverseBuilder, UniverseSpec
@@ -1183,9 +1184,6 @@ class TradingRuntime:
                                 dry_run=True,
                             )
                         )
-                        # Feed the post-loss cooldown timer.
-                        self.risk.record_close(realized_pnl=float(ev.realized_pnl or 0.0))
-
                     # Adopt long broker positions opened directly on the
                     # Angel One platform (mobile / web) so the bot can manage
                     # their SL / TP / max-hold exactly like its own trades.
@@ -1218,7 +1216,6 @@ class TradingRuntime:
                                 )
                                 placed = True
                                 price = ae.entry_price
-                                pnl_chunk = 0.0
                             elif ae.kind == "qty_resync":
                                 prev = ae.extra.get("prev_qty")
                                 reason = (
@@ -1227,7 +1224,6 @@ class TradingRuntime:
                                 )
                                 placed = False
                                 price = ae.entry_price
-                                pnl_chunk = 0.0
                             else:  # external_close
                                 reason = (
                                     f"external_close {ae.tradingsymbol}: "
@@ -1235,8 +1231,6 @@ class TradingRuntime:
                                 )
                                 placed = True
                                 price = ae.exit_price or ae.entry_price
-                                pnl_chunk = float(ae.realized_pnl or 0.0)
-                                self.risk.record_close(realized_pnl=pnl_chunk)
                             self.decisions.add(
                                 Decision(
                                     ts=DecisionLog.now_iso(),
@@ -1266,8 +1260,7 @@ class TradingRuntime:
                     # max-hold for every position the bot opened in live mode.
                     # Always runs (even in dry-run) so a session that flipped
                     # back to dry-run with positions still open still gets
-                    # them managed. Each closure also feeds the post-loss
-                    # cooldown.
+                    # them managed.
                     try:
                         live_closures = await self.live_exits.mark_and_close(api)
                     except Exception as e:  # noqa: BLE001 — never crash the loop
@@ -1301,9 +1294,6 @@ class TradingRuntime:
                                 },
                             )
                         )
-                        self.risk.record_close(realized_pnl=float(lev.realized_pnl or 0.0))
-
-                    self._record_scan_summary(hits, positions, available, deployable)
 
                     # NEW: rank → take TOP-N → process each independently. The
                     # max-concurrent + per-hour caps inside _consider_trade
@@ -1746,6 +1736,14 @@ class TradingRuntime:
                 source="error",
             )
 
+    def _llm_effective_exit_params(self, llm: LlmClassification) -> tuple[float, float, int]:
+        """Merge LLM-suggested exits with paper defaults (used for risk + open)."""
+        s = self.settings
+        sl = float(llm.stop_loss_pct) if llm.stop_loss_pct is not None else float(s.paper_stop_loss_pct)
+        tp = float(llm.take_profit_pct) if llm.take_profit_pct is not None else float(s.paper_take_profit_pct)
+        mh = int(llm.max_hold_minutes) if llm.max_hold_minutes is not None else int(s.paper_max_hold_minutes)
+        return sl, tp, mh
+
     def _record_scan_summary(
         self,
         hits: list[ScannerHit],
@@ -1899,37 +1897,18 @@ class TradingRuntime:
             )
             return
 
-        # ---- Risk gate (uses option premium as the entry, paper SL pct) ----
-        nominal_stop = (
-            exec_price * (1 - s.paper_stop_loss_pct)
-            if signal == "BUY_CALL"
-            else exec_price * (1 + s.paper_stop_loss_pct)
-        )
-        decision = self.risk.evaluate_new_trade(entry=exec_price, stop=nominal_stop, lot_size=lot_size)
-        if not decision.allowed:
-            self._record_skip(hit=hit, signal=signal, reason=f"risk:{decision.reason}", price=exec_price)
-            return
-
-        risk_lots = decision.quantity // lot_size
-        chosen_lots = max(0, min(risk_lots, affordable_lots))
-        if chosen_lots < 1:
-            self._record_skip(hit=hit, signal=signal, reason="zero_lots_after_funds_cap", price=exec_price)
-            return
-        chosen_qty = chosen_lots * lot_size
-        capital_used = exec_price * chosen_qty
+        # ------------------------------------------------------------------
+        # LLM CLASSIFIER — before risk sizing so stop width can affect risk lots.
+        # Returns {decision, confidence, type}; optional stop_loss_pct / take_profit_pct
+        # / max_hold_minutes for TAKE. We require TAKE and confidence >= threshold.
+        # When the LLM is disabled or no key is set, short-circuits to TAKE@1.0.
+        # ------------------------------------------------------------------
         side = "CE" if signal == "BUY_CALL" else "PE"
-
-        # ------------------------------------------------------------------
-        # LLM CLASSIFIER — primary decision-quality filter (5m pipeline).
-        # Returns {decision, confidence, type}. We require:
-        #   decision == TAKE  AND  confidence >= LLM_DECISION_THRESHOLD.
-        # When the LLM is disabled or no key is set, this short-circuits to
-        # TAKE@1.0 so the trade flows through. Fail-closed/open is honored.
-        # ------------------------------------------------------------------
+        llm_capital = exec_price * affordable_lots * lot_size
         llm_dec = await self._run_llm_classifier(
             hit=hit, exec_inst=exec_inst, signal=signal, side=side,
-            exec_price=exec_price, lot_size=lot_size, chosen_lots=chosen_lots,
-            capital_used=capital_used, deployable=deployable,
+            exec_price=exec_price, lot_size=lot_size, chosen_lots=affordable_lots,
+            capital_used=llm_capital, deployable=deployable,
         )
         threshold = float(s.llm_decision_threshold)
         if not llm_dec.passes(threshold):
@@ -1943,6 +1922,69 @@ class TradingRuntime:
                 extra={"llm": llm_dec.to_dict(), "exec_symbol": exec_inst.tradingsymbol},
             )
             return
+
+        # Exit parameters — single triple for risk sizing + paper + live.
+        # Dynamic mode: score/vol/momentum from ScannerHit (ignores LLM exit fields).
+        # Legacy: LLM optional overrides merged with PAPER_* via _llm_effective_exit_params.
+        if s.exit_dynamic_enabled:
+            dyn = resolve_exit_plan(hit, s)
+            if dyn is None:
+                self._record_skip(
+                    hit=hit, signal=signal,
+                    reason="exit_policy:ultra_low_volatility",
+                    price=exec_price,
+                    extra={
+                        "llm": llm_dec.to_dict(),
+                        "exec_symbol": exec_inst.tradingsymbol,
+                    },
+                )
+                return
+            sl_pct = dyn.stop_loss_pct
+            tp_pct = dyn.take_profit_pct
+            max_hold_m = int(dyn.max_hold_minutes)
+            exit_plan_extra = {
+                **dyn.meta,
+                "stop_loss_pct": sl_pct,
+                "take_profit_pct": tp_pct,
+                "max_hold_minutes": max_hold_m,
+            }
+            paper_sl: float | None = sl_pct
+            paper_tp: float | None = tp_pct
+            paper_mh: int | None = max_hold_m
+            live_sl: float | None = sl_pct
+            live_tp: float | None = tp_pct
+            live_mh: int | None = max_hold_m
+        else:
+            sl_pct, tp_pct, max_hold_m = self._llm_effective_exit_params(llm_dec)
+            exit_plan_extra = {
+                "source": "llm_or_paper",
+                "stop_loss_pct": sl_pct,
+                "take_profit_pct": tp_pct,
+                "max_hold_minutes": max_hold_m,
+            }
+            paper_sl = llm_dec.stop_loss_pct
+            paper_tp = llm_dec.take_profit_pct
+            paper_mh = llm_dec.max_hold_minutes
+            live_sl = llm_dec.stop_loss_pct
+            live_tp = llm_dec.take_profit_pct
+            live_mh = llm_dec.max_hold_minutes
+
+        # Long option premium (CE or PE): stop is below entry.
+        nominal_stop = exec_price * (1.0 - sl_pct)
+
+        # ---- Risk gate (option premium as entry; SL% matches execution plan) ----
+        decision = self.risk.evaluate_new_trade(entry=exec_price, stop=nominal_stop, lot_size=lot_size)
+        if not decision.allowed:
+            self._record_skip(hit=hit, signal=signal, reason=f"risk:{decision.reason}", price=exec_price)
+            return
+
+        risk_lots = decision.quantity // lot_size
+        chosen_lots = max(0, min(risk_lots, affordable_lots))
+        if chosen_lots < 1:
+            self._record_skip(hit=hit, signal=signal, reason="zero_lots_after_funds_cap", price=exec_price)
+            return
+        chosen_qty = chosen_lots * lot_size
+        capital_used = exec_price * chosen_qty
 
         # ------------------------------------------------------------------
         # DRY-RUN: open a paper position on the EXECUTABLE instrument
@@ -1965,6 +2007,9 @@ class TradingRuntime:
                         lot_size=lot_size,
                         capital_at_open=deployable,
                         reason=f"{reason} ({hit.name})",
+                        stop_loss_pct=paper_sl,
+                        take_profit_pct=paper_tp,
+                        max_hold_minutes=paper_mh,
                     )
                 )
             except Exception as e:  # noqa: BLE001
@@ -1997,7 +2042,11 @@ class TradingRuntime:
                 price=exec_price, qty=chosen_qty, lots=chosen_lots,
                 capital=capital_used, side=side,
                 placed=True, dry_run=True, broker_order_id=f"PAPER-{pid}",
-                extra={"llm": llm_dec.to_dict(), "underlying": hit.name},
+                extra={
+                    "llm": llm_dec.to_dict(),
+                    "underlying": hit.name,
+                    "exit_plan": exit_plan_extra,
+                },
             )
             # Update risk-engine entry count for the per-hour cap.
             self.risk.record_entry()
@@ -2054,6 +2103,9 @@ class TradingRuntime:
                     planned_entry=exec_price,
                     product=s.bot_default_product,
                     variety=s.bot_default_variety,
+                    sl_pct=live_sl,
+                    tp_pct=live_tp,
+                    max_hold_minutes=live_mh,
                 )
             except Exception as e:  # noqa: BLE001 — never block the trade on plan persistence
                 log.warning("live_exit_register_failed", error=str(e), broker_order_id=oid)
@@ -2063,7 +2115,12 @@ class TradingRuntime:
             price=exec_price, qty=chosen_qty, lots=chosen_lots,
             capital=capital_used, side=side,
             placed=bool(oid), dry_run=False, broker_order_id=oid,
-            extra={"resp": _redact(resp), "underlying": hit.name, "llm": llm_dec.to_dict()},
+            extra={
+                "resp": _redact(resp),
+                "underlying": hit.name,
+                "llm": llm_dec.to_dict(),
+                "exit_plan": exit_plan_extra,
+            },
         )
         if oid:
             self.risk.record_entry()

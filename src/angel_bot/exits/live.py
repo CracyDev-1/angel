@@ -17,9 +17,8 @@ real broker positions opened by the bot. The flow is:
          (scanner.latest_prices first, broker positions table second),
        * trigger a market reverse order via ``close_position_row`` when SL,
          TP or max-hold fires,
-       * record realized P&L into ``daily_stats_mode['live']`` and feed the
-         loss into ``RiskEngine.record_close`` so the post-loss cooldown is
-         respected.
+       * record realized P&L into ``daily_stats_mode['live']`` for the
+         dashboard and daily loss limits.
 
 The square-off uses MARKET orders for the same lot count we opened with —
 the close P&L is recorded against the LTP at trigger time which is the
@@ -35,7 +34,9 @@ from typing import Any, Callable
 
 import structlog
 
+from angel_bot.config import get_settings
 from angel_bot.execution.orders import build_order_payload, validate_order_payload
+from angel_bot.exits.trailing import trailing_stop_update_long_premium
 from angel_bot.instruments.master import Instrument
 from angel_bot.orders.tracker import extract_place_order_id
 from angel_bot.smart_client import SmartApiClient
@@ -53,9 +54,9 @@ log = structlog.get_logger(__name__)
 class LiveExitConfig:
     """Mirrors PaperConfig so live behaves identically to dry-run."""
 
-    stop_loss_pct: float = 0.015     # 1.5% adverse from FILL price
-    take_profit_pct: float = 0.04    # 4% favorable from FILL price
-    max_hold_minutes: int = 55       # session-end style timeout
+    stop_loss_pct: float = 0.10      # % adverse on option premium from fill
+    take_profit_pct: float = 0.20    # % favorable on option premium from fill
+    max_hold_minutes: int = 20       # time exit (intraday index options)
 
 
 @dataclass
@@ -79,6 +80,8 @@ class LiveExitPlan:
     stop_price: float
     target_price: float
     max_hold_minutes: int
+    initial_stop_price: float
+    peak_premium: float
     product: str
     variety: str
     opened_at: datetime
@@ -88,6 +91,9 @@ class LiveExitPlan:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> LiveExitPlan:
+        fp = float(row["fill_price"]) if row.get("fill_price") is not None else None
+        planned = float(row["planned_entry"])
+        eff_ref = fp if fp is not None else planned
         return cls(
             id=int(row["id"]),
             open_order_id=str(row["open_order_id"]),
@@ -101,12 +107,20 @@ class LiveExitPlan:
             qty=int(row["qty"]),
             lots=int(row["lots"]),
             lot_size=int(row["lot_size"]),
-            planned_entry=float(row["planned_entry"]),
-            fill_price=float(row["fill_price"]) if row.get("fill_price") is not None else None,
+            planned_entry=planned,
+            fill_price=fp,
             filled_at=_parse_iso(row.get("filled_at")),
             stop_price=float(row["stop_price"]),
             target_price=float(row["target_price"]),
             max_hold_minutes=int(row["max_hold_minutes"]),
+            initial_stop_price=float(
+                row["initial_stop_price"]
+                if row.get("initial_stop_price") is not None
+                else row["stop_price"]
+            ),
+            peak_premium=float(
+                row["peak_premium"] if row.get("peak_premium") is not None else eff_ref
+            ),
             product=str(row["product"]),
             variety=str(row["variety"]),
             opened_at=_parse_iso(row.get("opened_at")) or datetime.now(UTC),
@@ -250,6 +264,8 @@ class LiveExitManager:
                 "stop_price": stop,
                 "target_price": target,
                 "max_hold_minutes": mh,
+                "initial_stop_price": stop,
+                "peak_premium": planned_entry,
                 "product": product,
                 "variety": variety,
             }
@@ -402,6 +418,8 @@ class LiveExitManager:
                         "stop_price": stop,
                         "target_price": target,
                         "max_hold_minutes": max_hold_minutes,
+                        "initial_stop_price": stop,
+                        "peak_premium": entry,
                         "product": prod,
                         "variety": default_variety,
                         "opened_at": now.isoformat(),
@@ -522,8 +540,7 @@ class LiveExitManager:
     ) -> list[LiveExitEvent]:
         """Iterate every open plan; close those whose SL / TP / max-hold fires.
 
-        Returns the list of events, useful for the runtime to record into the
-        decisions log and feed into ``RiskEngine.record_close``.
+        Returns the list of events for the runtime to log in the decisions stream.
         """
         rows = self.store.list_open_live_exit_plans()
         if not rows:
@@ -542,14 +559,17 @@ class LiveExitManager:
             self._maybe_backfill_fill(plan)
 
             # 2) get the freshest premium we can.
-            price = self._lookup_price(plan)
-            if price is None:
+            lookup_price = self._lookup_price(plan)
+            if lookup_price is None:
                 # No fresh price this cycle — only max-hold can still trigger.
                 if not self._max_hold_elapsed(plan, now):
                     continue
                 # We trigger square-off but at the planned entry as a stand-in
                 # so realized_pnl is honest (worst-case 0). Logged.
                 price = plan.effective_entry
+            else:
+                price = lookup_price
+                self._apply_trailing_to_plan(plan, price)
 
             ev = await self._maybe_exit(api, plan, price, now)
             if ev is not None:
@@ -559,6 +579,29 @@ class LiveExitManager:
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+
+    def _apply_trailing_to_plan(self, plan: LiveExitPlan, last_price: float) -> None:
+        settings = get_settings()
+        if not settings.trail_stop_enabled:
+            return
+        entry = plan.effective_entry
+        new_peak, new_stop = trailing_stop_update_long_premium(
+            enabled=True,
+            trail_pct=settings.trail_stop_pct,
+            arm_profit_pct=settings.trail_arm_min_profit_pct,
+            entry=entry,
+            last_price=last_price,
+            initial_stop=plan.initial_stop_price,
+            peak=plan.peak_premium,
+            current_stop=plan.stop_price,
+        )
+        if new_peak == plan.peak_premium and new_stop == plan.stop_price:
+            return
+        self.store.update_live_exit_trailing_stop(
+            plan.id, peak_premium=new_peak, stop_price=new_stop
+        )
+        plan.peak_premium = new_peak
+        plan.stop_price = new_stop
 
     def _maybe_backfill_fill(self, plan: LiveExitPlan) -> None:
         """Pull avg_price/fill time from bot_orders and persist into the plan
@@ -603,10 +646,19 @@ class LiveExitManager:
                     """
                     UPDATE live_exit_plans
                     SET fill_price = ?, filled_at = COALESCE(filled_at, ?),
-                        stop_price = ?, target_price = ?
+                        stop_price = ?, target_price = ?,
+                        initial_stop_price = ?, peak_premium = ?
                     WHERE id = ? AND closed_at IS NULL
                     """,
-                    (avg_f, str(row["updated_at"] or ""), new_stop, new_target, plan.id),
+                    (
+                        avg_f,
+                        str(row["updated_at"] or ""),
+                        new_stop,
+                        new_target,
+                        new_stop,
+                        avg_f,
+                        plan.id,
+                    ),
                 )
         except Exception as e:  # noqa: BLE001
             log.warning("live_exit_backfill_update_failed", error=str(e))
@@ -614,6 +666,8 @@ class LiveExitManager:
         plan.fill_price = avg_f
         plan.stop_price = new_stop
         plan.target_price = new_target
+        plan.initial_stop_price = new_stop
+        plan.peak_premium = avg_f
         if plan.filled_at is None and row["updated_at"]:
             plan.filled_at = _parse_iso(str(row["updated_at"])) or plan.filled_at
         log.info(

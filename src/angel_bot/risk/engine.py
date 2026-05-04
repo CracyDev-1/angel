@@ -48,8 +48,6 @@ class RiskState:
     # Rolling list of UTC timestamps of recent ENTRY events (any close type),
     # used to enforce the per-hour cap. Trimmed on every check.
     recent_entries: list[datetime] = field(default_factory=list)
-    # Last losing close (UTC); used to enforce post-loss cooldown.
-    last_loss_at: datetime | None = None
 
 
 class RiskEngine:
@@ -57,8 +55,7 @@ class RiskEngine:
         self.settings = settings or get_settings()
         self.state = RiskState()
         # Optional store reference enables write-through persistence of
-        # ``recent_entries`` and ``last_loss_at`` so the per-hour cap and
-        # post-loss cooldown survive a process restart.
+        # ``recent_entries`` so the per-hour cap survives a process restart.
         self._store: StateStore | None = store
         self._restored_from_store: bool = False
 
@@ -81,19 +78,12 @@ class RiskEngine:
             self._restored_from_store = True
 
     def _restore_persistent(self, store: StateStore) -> None:
-        """Rehydrate ``recent_entries`` (within the 1h window) and
-        ``last_loss_at`` from SQLite."""
+        """Rehydrate ``recent_entries`` (within the 1h window) from SQLite."""
         try:
             snap = store.get_risk_state()
         except Exception as e:  # noqa: BLE001
             log.warning("risk_state_restore_failed", error=str(e))
             return
-
-        last_loss_iso = snap.get("last_loss_at")
-        if last_loss_iso:
-            t = _parse_iso(last_loss_iso)
-            if t is not None:
-                self.state.last_loss_at = t
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
         loaded: list[datetime] = []
@@ -137,33 +127,12 @@ class RiskEngine:
             except Exception as e:  # noqa: BLE001
                 log.warning("risk_persist_entry_failed", error=str(e))
 
-    def record_close(self, *, realized_pnl: float, when: datetime | None = None) -> None:
-        """Record a closed trade. Losing closes start the cooldown timer."""
-        if realized_pnl < 0:
-            t = when or datetime.now(timezone.utc)
-            self.state.last_loss_at = t
-            if self._store is not None:
-                try:
-                    self._store.upsert_risk_last_loss(t.isoformat())
-                except Exception as e:  # noqa: BLE001
-                    log.warning("risk_persist_loss_failed", error=str(e))
-
     def trades_last_hour(self, now: datetime | None = None) -> int:
         now = now or datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=1)
         # Trim while we're here so the list doesn't grow unboundedly.
         self.state.recent_entries = [t for t in self.state.recent_entries if t >= cutoff]
         return len(self.state.recent_entries)
-
-    def in_loss_cooldown(self, now: datetime | None = None) -> tuple[bool, float]:
-        """Returns (in_cooldown, seconds_remaining)."""
-        mins = max(0, int(self.settings.risk_loss_cooldown_minutes))
-        if mins <= 0 or self.state.last_loss_at is None:
-            return False, 0.0
-        now = now or datetime.now(timezone.utc)
-        elapsed = (now - self.state.last_loss_at).total_seconds()
-        remaining = mins * 60 - elapsed
-        return remaining > 0, max(0.0, remaining)
 
     def effective_capital(self) -> float:
         """Capital base for sizing + daily loss cap.
@@ -201,14 +170,7 @@ class RiskEngine:
                     False, 0,
                     f"max_trades_hour ({n_hour}/{s.risk_max_trades_per_hour})",
                 )
-        # 4) post-loss cooldown
-        cooling, remaining = self.in_loss_cooldown()
-        if cooling:
-            return RiskDecision(
-                False, 0,
-                f"loss_cooldown ({int(remaining // 60)}m{int(remaining % 60)}s left)",
-            )
-        # 5) capital + daily-loss kill switch
+        # 4) capital + daily-loss kill switch
         capital = self.effective_capital()
         if capital <= 0:
             return RiskDecision(False, 0, "no_capital")
@@ -216,7 +178,7 @@ class RiskEngine:
         if self.state.realized_pnl_today <= loss_cap:
             return RiskDecision(False, 0, "max_daily_loss")
 
-        # 6) position sizing from stop distance
+        # 5) position sizing from stop distance
         qty = position_size_for_stop(
             capital=capital,
             risk_pct=s.risk_per_trade_pct,

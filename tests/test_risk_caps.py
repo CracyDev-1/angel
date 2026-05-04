@@ -1,5 +1,5 @@
-"""Tests for the new risk-engine controls: hourly cap, post-loss cooldown,
-N concurrent positions, and capital effective-source resolution."""
+"""Tests for the new risk-engine controls: hourly cap, N concurrent positions,
+and capital effective-source resolution."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -19,7 +19,6 @@ def _settings(**overrides) -> Settings:
         RISK_MAX_TRADES_PER_DAY="12",
         RISK_ONE_POSITION_AT_A_TIME="false",
         RISK_MAX_TRADES_PER_HOUR="3",
-        RISK_LOSS_COOLDOWN_MINUTES="10",
         BOT_MAX_CONCURRENT_POSITIONS="3",
     )
     base.update(overrides)
@@ -103,37 +102,6 @@ def test_zero_daily_cap_disables_throttle():
     d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
     assert d.allowed
     assert "max_trades_today" not in d.reason
-
-
-def test_post_loss_cooldown_blocks_new_entries():
-    s = _settings(RISK_LOSS_COOLDOWN_MINUTES="10")
-    e = RiskEngine(s)
-    e.set_broker_cash(100_000)
-    e.record_close(realized_pnl=-500.0)
-    cooling, remaining = e.in_loss_cooldown()
-    assert cooling
-    assert remaining > 0
-    d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
-    assert not d.allowed
-    assert "loss_cooldown" in d.reason
-
-
-def test_winning_close_does_not_trigger_cooldown():
-    s = _settings()
-    e = RiskEngine(s)
-    e.set_broker_cash(100_000)
-    e.record_close(realized_pnl=+500.0)
-    cooling, _ = e.in_loss_cooldown()
-    assert not cooling
-
-
-def test_zero_cooldown_setting_disables_cooldown():
-    s = _settings(RISK_LOSS_COOLDOWN_MINUTES="0")
-    e = RiskEngine(s)
-    e.set_broker_cash(100_000)
-    e.record_close(realized_pnl=-1000.0)
-    cooling, _ = e.in_loss_cooldown()
-    assert not cooling
 
 
 def test_effective_capital_uses_broker_cash_when_setting_is_zero():

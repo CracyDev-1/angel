@@ -205,9 +205,19 @@ class ScannerEngine:
                         todate=to_str,
                     )
                 except Exception as e:  # noqa: BLE001 — never crash startup on warmup
-                    log.warning(
+                    msg_l = str(e).lower()
+                    is_rl = (
+                        "exceeding access rate" in msg_l
+                        or "exceeding rate" in msg_l
+                        or "rate limit" in msg_l
+                        or ("non-json" in msg_l and "403" in msg_l)
+                    )
+                    logfn = log.info if is_rl else log.warning
+                    logfn(
                         "scanner_warmup_history_error",
-                        exchange=ex, symboltoken=tok, interval_min=interval_min,
+                        exchange=ex,
+                        symboltoken=tok,
+                        interval_min=interval_min,
                         error=str(e),
                     )
                     return []

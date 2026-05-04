@@ -25,6 +25,8 @@ from typing import Any
 
 import structlog
 
+from angel_bot.config import get_settings
+from angel_bot.exits.trailing import trailing_stop_update_long_premium
 from angel_bot.state.store import StateStore
 
 log = structlog.get_logger(__name__)
@@ -32,9 +34,9 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class PaperConfig:
-    stop_loss_pct: float = 0.015     # 1.5% adverse move from entry
-    take_profit_pct: float = 0.04    # 4% favorable move from entry
-    max_hold_minutes: int = 55       # session timeout for a paper trade
+    stop_loss_pct: float = 0.10      # % adverse move on option premium from entry
+    take_profit_pct: float = 0.20    # % favorable move on option premium from entry
+    max_hold_minutes: int = 20       # time exit if SL/TP not hit (intraday)
     max_open_positions: int = 5      # safety cap
 
 
@@ -51,6 +53,10 @@ class PaperOpenRequest:
     lot_size: int
     capital_at_open: float
     reason: str
+    # Optional overrides (e.g. from LLM). When None, PaperConfig defaults apply.
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    max_hold_minutes: int | None = None
 
 
 @dataclass
@@ -88,8 +94,11 @@ class PaperTrader:
         # side. The previous CE/PE branch inverted the stops on puts
         # which made paper PE trades book the wrong sign on P&L (and,
         # via the same logic in live.py, real trades too).
-        stop = req.entry_price * (1 - self.config.stop_loss_pct)
-        target = req.entry_price * (1 + self.config.take_profit_pct)
+        sl_p = self.config.stop_loss_pct if req.stop_loss_pct is None else float(req.stop_loss_pct)
+        tp_p = self.config.take_profit_pct if req.take_profit_pct is None else float(req.take_profit_pct)
+        mh = self.config.max_hold_minutes if req.max_hold_minutes is None else int(req.max_hold_minutes)
+        stop = req.entry_price * (1 - sl_p)
+        target = req.entry_price * (1 + tp_p)
         qty = req.lots * req.lot_size
         capital_used = req.entry_price * qty
         pid = self.store.open_paper_position(
@@ -109,6 +118,9 @@ class PaperTrader:
                 "capital_used": capital_used,
                 "capital_at_open": req.capital_at_open,
                 "reason_at_open": req.reason,
+                "max_hold_minutes": mh,
+                "initial_stop_price": stop,
+                "peak_premium": req.entry_price,
             }
         )
         log.info(
@@ -161,6 +173,7 @@ class PaperTrader:
             price = latest_prices.get(key)
             if price is not None:
                 self.store.update_paper_mark(int(r["id"]), float(price))
+                r = self._apply_paper_trail(r, float(price))
             else:
                 # No fresh price for this symbol this cycle — try max-hold check below.
                 price = float(r.get("last_price") or r["entry_price"])
@@ -169,6 +182,34 @@ class PaperTrader:
             if ev:
                 events.append(ev)
         return events
+
+    def _apply_paper_trail(self, row: dict[str, Any], last_price: float) -> dict[str, Any]:
+        settings = get_settings()
+        if not settings.trail_stop_enabled:
+            return row
+        entry = float(row["entry_price"])
+        initial = float(row.get("initial_stop_price") or row["stop_price"])
+        peak = float(row.get("peak_premium") or entry)
+        current_stop = float(row["stop_price"])
+        new_peak, new_stop = trailing_stop_update_long_premium(
+            enabled=True,
+            trail_pct=settings.trail_stop_pct,
+            arm_profit_pct=settings.trail_arm_min_profit_pct,
+            entry=entry,
+            last_price=last_price,
+            initial_stop=initial,
+            peak=peak,
+            current_stop=current_stop,
+        )
+        if new_peak == peak and new_stop == current_stop:
+            return row
+        self.store.update_paper_trailing_stop(
+            int(row["id"]), peak_premium=new_peak, stop_price=new_stop
+        )
+        out = dict(row)
+        out["peak_premium"] = new_peak
+        out["stop_price"] = new_stop
+        return out
 
     def _maybe_exit(
         self,
@@ -190,7 +231,9 @@ class PaperTrader:
         elif target is not None and last_price >= float(target):
             reason = "target"
 
-        if reason is None and held_minutes >= self.config.max_hold_minutes:
+        if reason is None and held_minutes >= float(
+            row.get("max_hold_minutes") or self.config.max_hold_minutes
+        ):
             reason = "session_end"
 
         if reason is None:

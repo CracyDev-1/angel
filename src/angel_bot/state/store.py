@@ -94,7 +94,10 @@ class StateStore:
                   exit_price REAL,
                   exit_reason TEXT,     -- 'stop' | 'target' | 'manual' | 'session_end'
                   realized_pnl REAL,
-                  reason_at_open TEXT
+                  reason_at_open TEXT,
+                  max_hold_minutes INTEGER,
+                  initial_stop_price REAL,
+                  peak_premium REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_open ON paper_positions(closed_at);
 
@@ -125,6 +128,8 @@ class StateStore:
                   stop_price REAL NOT NULL,
                   target_price REAL NOT NULL,
                   max_hold_minutes INTEGER NOT NULL,
+                  initial_stop_price REAL,
+                  peak_premium REAL,
                   product TEXT NOT NULL,
                   variety TEXT NOT NULL,
                   opened_at TEXT NOT NULL,  -- when the plan was created
@@ -137,8 +142,8 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_live_exit_open
                   ON live_exit_plans(closed_at);
 
-                -- Persistent fragments of RiskState so per-hour cap and
-                -- post-loss cooldown survive a process restart.
+                -- Persistent fragment of RiskState so the per-hour cap
+                -- survives a process restart.
                 CREATE TABLE IF NOT EXISTS risk_entries (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   entered_at TEXT NOT NULL
@@ -188,10 +193,62 @@ class StateStore:
                 # formula. Without this, the back-fill below would run
                 # every startup and double-flip rows.
                 ("pnl_long_only_v1", "ALTER TABLE live_exit_plans ADD COLUMN pnl_long_only_v1 INTEGER"),
+                (
+                    "initial_stop_price",
+                    "ALTER TABLE live_exit_plans ADD COLUMN initial_stop_price REAL",
+                ),
+                (
+                    "peak_premium",
+                    "ALTER TABLE live_exit_plans ADD COLUMN peak_premium REAL",
+                ),
             ]
             for name, ddl in plan_migrations:
                 if name not in plan_cols:
                     con.execute(ddl)
+
+            paper_cols = self._table_columns(con, "paper_positions")
+            paper_migrations = [
+                (
+                    "max_hold_minutes",
+                    "ALTER TABLE paper_positions ADD COLUMN max_hold_minutes INTEGER",
+                ),
+                (
+                    "initial_stop_price",
+                    "ALTER TABLE paper_positions ADD COLUMN initial_stop_price REAL",
+                ),
+                (
+                    "peak_premium",
+                    "ALTER TABLE paper_positions ADD COLUMN peak_premium REAL",
+                ),
+            ]
+            for name, ddl in paper_migrations:
+                if name not in paper_cols:
+                    con.execute(ddl)
+
+            # Back-fill trailing-stop columns for open rows (idempotent).
+            try:
+                con.execute(
+                    """
+                    UPDATE paper_positions
+                    SET initial_stop_price = COALESCE(initial_stop_price, stop_price),
+                        peak_premium = COALESCE(peak_premium, entry_price)
+                    WHERE closed_at IS NULL
+                      AND (initial_stop_price IS NULL OR peak_premium IS NULL)
+                    """
+                )
+                con.execute(
+                    """
+                    UPDATE live_exit_plans
+                    SET initial_stop_price = COALESCE(initial_stop_price, stop_price),
+                        peak_premium = COALESCE(
+                            peak_premium, COALESCE(fill_price, planned_entry)
+                        )
+                    WHERE closed_at IS NULL
+                      AND (initial_stop_price IS NULL OR peak_premium IS NULL)
+                    """
+                )
+            except Exception:  # noqa: BLE001 — best-effort on odd schemas
+                pass
 
             # ----- One-shot back-fill: long-only PnL for every closed plan -----
             # Earlier builds of the exit manager treated a PE BUY as a
@@ -472,8 +529,10 @@ class StateStore:
                   exchange, symboltoken, tradingsymbol, kind, side, signal,
                   lots, lot_size, qty, entry_price, stop_price, target_price,
                   capital_used, capital_at_open, opened_at,
-                  last_price, last_marked_at, reason_at_open
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  last_price, last_marked_at, reason_at_open,
+                  max_hold_minutes,
+                  initial_stop_price, peak_premium
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     p["exchange"],
@@ -494,6 +553,9 @@ class StateStore:
                     float(p["entry_price"]),
                     now,
                     p.get("reason_at_open"),
+                    p.get("max_hold_minutes"),
+                    p.get("initial_stop_price", p.get("stop_price")),
+                    p.get("peak_premium", p.get("entry_price")),
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -518,6 +580,20 @@ class StateStore:
             con.execute(
                 "UPDATE paper_positions SET last_price = ?, last_marked_at = ? WHERE id = ? AND closed_at IS NULL",
                 (float(last_price), now, int(pid)),
+            )
+
+    def update_paper_trailing_stop(
+        self, pid: int, *, peak_premium: float, stop_price: float
+    ) -> None:
+        """Persist ratcheted peak and working stop for open paper positions."""
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE paper_positions
+                SET peak_premium = ?, stop_price = ?
+                WHERE id = ? AND closed_at IS NULL
+                """,
+                (float(peak_premium), float(stop_price), int(pid)),
             )
 
     def close_paper_position(
@@ -571,8 +647,9 @@ class StateStore:
                   qty, lots, lot_size,
                   planned_entry, fill_price, filled_at,
                   stop_price, target_price, max_hold_minutes,
+                  initial_stop_price, peak_premium,
                   product, variety, opened_at, source, last_seen_qty
-                ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?)
+                ) VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, ?)
                 """,
                 (
                     str(p["open_order_id"]),
@@ -592,6 +669,12 @@ class StateStore:
                     float(p["stop_price"]),
                     float(p["target_price"]),
                     int(p["max_hold_minutes"]),
+                    float(p.get("initial_stop_price", p["stop_price"])),
+                    float(
+                        p.get("peak_premium")
+                        if p.get("peak_premium") is not None
+                        else p["planned_entry"]
+                    ),
                     str(p["product"]),
                     str(p["variety"]),
                     p.get("opened_at") or now,
@@ -699,6 +782,20 @@ class StateStore:
                 (int(last_seen_qty), int(plan_id)),
             )
 
+    def update_live_exit_trailing_stop(
+        self, plan_id: int, *, peak_premium: float, stop_price: float
+    ) -> None:
+        """Persist ratcheted peak and working stop for open live exit plans."""
+        with self._connect() as con:
+            con.execute(
+                """
+                UPDATE live_exit_plans
+                SET peak_premium = ?, stop_price = ?
+                WHERE id = ? AND closed_at IS NULL
+                """,
+                (float(peak_premium), float(stop_price), int(plan_id)),
+            )
+
     def update_live_exit_plan_fill(
         self, *, open_order_id: str, fill_price: float, filled_at: str | None = None
     ) -> None:
@@ -767,28 +864,12 @@ class StateStore:
             ).fetchall()
             return [str(r["entered_at"]) for r in rows]
 
-    def upsert_risk_last_loss(self, when_iso: str | None) -> None:
-        """Set / clear the last losing-close timestamp. ``None`` clears it."""
-        with self._connect() as con:
-            con.execute(
-                """
-                INSERT INTO risk_state (id, last_loss_at) VALUES (1, ?)
-                ON CONFLICT(id) DO UPDATE SET last_loss_at = excluded.last_loss_at
-                """,
-                (when_iso,),
-            )
-
     def get_risk_state(self) -> dict[str, Any]:
-        """Snapshot of the persisted RiskState fragment."""
+        """Snapshot of the persisted RiskState fragment (rolling entry timestamps)."""
         with self._connect() as con:
-            row = con.execute(
-                "SELECT last_loss_at FROM risk_state WHERE id = 1"
-            ).fetchone()
-            last_loss = str(row["last_loss_at"]) if row and row["last_loss_at"] else None
             entries_rows = con.execute(
                 "SELECT entered_at FROM risk_entries ORDER BY entered_at ASC"
             ).fetchall()
         return {
-            "last_loss_at": last_loss,
             "recent_entries": [str(r["entered_at"]) for r in entries_rows],
         }

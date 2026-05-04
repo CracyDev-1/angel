@@ -30,6 +30,12 @@ RMS_PATH = "/rest/secure/angelbroking/user/v1/getRMS"
 POSITION_PATH = "/rest/secure/angelbroking/order/v1/getPosition"
 HOLDING_PATH = "/rest/secure/angelbroking/portfolio/v1/getHolding"
 HISTORICAL_PATH = "/rest/secure/angelbroking/historical/v1/getCandleData"
+# When Angel returns 403 on getCandleData, back the limiter off longer than
+# for quote endpoints — the gateway shares a global budget.
+HISTORICAL_RATE_LIMIT_COOLDOWN_S = 5.0
+# Pause before the single retry in _after_rate_limit (first attempt already
+# received note_rate_limited's synthetic reservations).
+HISTORICAL_RETRY_PAUSE_S = 1.0
 
 # Angel historical-candle ``interval`` values. Keys are the minute counts the
 # bot already uses internally so callers can ask for a given step without
@@ -289,7 +295,9 @@ class SmartApiClient:
         """One bounded retry after a broker-side 403/rate-limit. The limiter
         already inserted a back-off; historical candles need extra slack vs
         other endpoints because Angel's gateway aggregates quotas globally."""
-        await asyncio.sleep(0.45 if path == HISTORICAL_PATH else 0.12)
+        await asyncio.sleep(
+            HISTORICAL_RETRY_PAUSE_S if path == HISTORICAL_PATH else 0.12
+        )
         log.info("smartapi_retry_after_rate_limit", path=path)
         return await fn()
 
@@ -333,7 +341,12 @@ class SmartApiClient:
                 # auth-retry path doesn't try to refresh JWT.
                 if r.status_code == 403:
                     get_rate_limiter().note_rate_limited(
-                        path, retry_after_s=2.5 if path == HISTORICAL_PATH else 1.5
+                        path,
+                        retry_after_s=(
+                            HISTORICAL_RATE_LIMIT_COOLDOWN_S
+                            if path == HISTORICAL_PATH
+                            else 1.5
+                        ),
                     )
                     raise AngelHttpError(
                         f"Rate limited by broker (HTTP 403, empty body) for {path}",
@@ -363,16 +376,30 @@ class SmartApiClient:
                 rate_limited = looks_rate_limited(status_code=r.status_code, body=raw_text)
                 if rate_limited:
                     get_rate_limiter().note_rate_limited(
-                        path, retry_after_s=2.5 if path == HISTORICAL_PATH else 1.5
+                        path,
+                        retry_after_s=(
+                            HISTORICAL_RATE_LIMIT_COOLDOWN_S
+                            if path == HISTORICAL_PATH
+                            else 1.5
+                        ),
                     )
-                log.warning(
-                    "smartapi_non_json_response",
-                    path=path,
-                    status_code=r.status_code,
-                    content_type=r.headers.get("content-type"),
-                    body_preview=raw_text[:500],
-                    final_url=str(r.url),
-                )
+                if rate_limited and path == HISTORICAL_PATH:
+                    log.info(
+                        "smartapi_historical_rate_limit_plain_text",
+                        path=path,
+                        status_code=r.status_code,
+                        body_preview=raw_text[:300],
+                        final_url=str(r.url),
+                    )
+                else:
+                    log.warning(
+                        "smartapi_non_json_response",
+                        path=path,
+                        status_code=r.status_code,
+                        content_type=r.headers.get("content-type"),
+                        body_preview=raw_text[:500],
+                        final_url=str(r.url),
+                    )
                 # Pass the raw text through as ``body`` so the auth-vs-rate-
                 # limit classifier upstream can match the message phrase
                 # ("Access denied because of exceeding access rate") and
@@ -397,7 +424,12 @@ class SmartApiClient:
 
         if looks_rate_limited(status_code=r.status_code, body=payload):
             get_rate_limiter().note_rate_limited(
-                path, retry_after_s=2.5 if path == HISTORICAL_PATH else 1.5
+                path,
+                retry_after_s=(
+                    HISTORICAL_RATE_LIMIT_COOLDOWN_S
+                    if path == HISTORICAL_PATH
+                    else 1.5
+                ),
             )
             raise AngelHttpError(
                 f"Rate limited by broker for {path}",
