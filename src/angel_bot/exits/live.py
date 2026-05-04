@@ -223,13 +223,15 @@ class LiveExitManager:
         tp_p = self.config.take_profit_pct if tp_pct is None else tp_pct
         mh = self.config.max_hold_minutes if max_hold_minutes is None else max_hold_minutes
         side_u = side.upper()
-        is_long = side_u in ("CE", "LONG")
-        if is_long:
-            stop = planned_entry * (1.0 - sl_p)
-            target = planned_entry * (1.0 + tp_p)
-        else:
-            stop = planned_entry * (1.0 + sl_p)
-            target = planned_entry * (1.0 - tp_p)
+        # The bot only places BUYs — long the premium for both CE and PE
+        # (a PE BUY is bullish on the put, NOT a short of the underlying
+        # at the strike). Stop is below entry, target is above entry,
+        # for every plan we open. The previous CE-vs-PE branch inverted
+        # SL/TP for puts which made losing PE positions trigger
+        # "target" (booking phantom profit) and winning ones trigger
+        # "stop" (booking phantom losses).
+        stop = planned_entry * (1.0 - sl_p)
+        target = planned_entry * (1.0 + tp_p)
         plan_id = self.store.create_live_exit_plan(
             {
                 "open_order_id": open_order_id,
@@ -365,18 +367,16 @@ class LiveExitManager:
 
             side = _classify_side_from_symbol(sym)
             signal = "BUY_CALL" if side != "PE" else "BUY_PUT"
-            is_long = side in ("CE", "LONG")
 
             lot_size = _resolve_lot_size(master, ex, tok, default_qty=net_qty)
             lots = max(1, net_qty // max(1, lot_size))
             underlying = _resolve_underlying(master, ex, tok, fallback=sym)
 
-            if is_long:
-                stop = entry * (1.0 - sl_pct)
-                target = entry * (1.0 + tp_pct)
-            else:
-                stop = entry * (1.0 + sl_pct)
-                target = entry * (1.0 - tp_pct)
+            # Adopted broker positions are always BUYs (long premium /
+            # long shares); SL is below entry, target above entry. See
+            # comment in register_open for the full rationale.
+            stop = entry * (1.0 - sl_pct)
+            target = entry * (1.0 + tp_pct)
 
             synthetic_id = (
                 f"ADOPTED:{ex}:{tok}:{int(now.timestamp() * 1000)}"
@@ -464,12 +464,11 @@ class LiveExitManager:
             ltp = float(row.get("ltp") or 0.0) if row else 0.0
             exit_price = sell_avg if sell_avg > 0 else (ltp if ltp > 0 else plan.effective_entry)
             entry = plan.effective_entry
-            is_long = plan.side in ("CE", "LONG")
             qty_for_pnl = int(raw.get("last_seen_qty") or plan.qty or 0)
-            if is_long:
-                pnl = (exit_price - entry) * qty_for_pnl
-            else:
-                pnl = (entry - exit_price) * qty_for_pnl
+            # See comment in _send_close: a PE BUY is LONG the option,
+            # not short. PnL is (exit - entry) * qty for every position
+            # the bot opens or adopts.
+            pnl = (exit_price - entry) * qty_for_pnl
             try:
                 self.store.close_live_exit_plan(
                     plan.id,
@@ -593,14 +592,10 @@ class LiveExitManager:
         if avg_f <= 0:
             return
         # Re-derive SL/TP from the actual fill price so a slipped open doesn't
-        # silently widen the live risk-per-trade.
-        is_long = plan.side in ("CE", "LONG")
-        if is_long:
-            new_stop = avg_f * (1.0 - self.config.stop_loss_pct)
-            new_target = avg_f * (1.0 + self.config.take_profit_pct)
-        else:
-            new_stop = avg_f * (1.0 + self.config.stop_loss_pct)
-            new_target = avg_f * (1.0 - self.config.take_profit_pct)
+        # silently widen the live risk-per-trade. Long-only: stop below
+        # entry, target above entry, regardless of CE / PE / LONG.
+        new_stop = avg_f * (1.0 - self.config.stop_loss_pct)
+        new_target = avg_f * (1.0 + self.config.take_profit_pct)
         try:
             with self.store._connect() as con:  # noqa: SLF001
                 con.execute(
@@ -643,17 +638,14 @@ class LiveExitManager:
         return (now - ref).total_seconds() >= plan.max_hold_minutes * 60
 
     def _decide_reason(self, plan: LiveExitPlan, price: float, now: datetime) -> str | None:
-        is_long = plan.side in ("CE", "LONG")
-        if is_long:
-            if price <= plan.stop_price:
-                return "stop"
-            if price >= plan.target_price:
-                return "target"
-        else:
-            if price >= plan.stop_price:
-                return "stop"
-            if price <= plan.target_price:
-                return "target"
+        # Long-only trigger: hit the stop when price falls *below* it,
+        # hit the target when price rises *above* it. Same rule for CE,
+        # PE and cash long. The CE-vs-PE branch in the old code was the
+        # original source of the sign-flipped P&L on put trades.
+        if price <= plan.stop_price:
+            return "stop"
+        if price >= plan.target_price:
+            return "target"
         if self._max_hold_elapsed(plan, now):
             return "session_end"
         return None
@@ -717,12 +709,15 @@ class LiveExitManager:
             return None
 
         close_oid = extract_place_order_id(resp) if isinstance(resp, dict) else None
-        is_long = plan.side in ("CE", "LONG")
+        # The bot only ever opens BUYs (long premium for CE *and* PE,
+        # long shares for cash equity). Profit on a BUY is always
+        # (exit - entry) * qty regardless of CE / PE / LONG. The old
+        # code branched on side and inverted the sign for PE — that's
+        # how a losing PE trade (bought 100, sold 98) was being booked
+        # as a +200 *profit* instead of a -200 loss, and why the
+        # dashboard's PnL diverged from Angel One.
         entry = plan.effective_entry
-        if is_long:
-            pnl = (exit_price - entry) * plan.qty
-        else:
-            pnl = (entry - exit_price) * plan.qty
+        pnl = (exit_price - entry) * plan.qty
 
         # Persist close + per-mode realized P&L.
         self.store.close_live_exit_plan(

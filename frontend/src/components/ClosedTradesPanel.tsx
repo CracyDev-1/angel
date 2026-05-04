@@ -1,9 +1,14 @@
-import type { DecisionRow } from "../lib/api";
+import type { DecisionRow, LiveClosedRow } from "../lib/api";
 import { classOf, formatINR, formatTime } from "../lib/format";
 
 type Props = {
   decisions: DecisionRow[];
   isLive: boolean;
+  // Authoritative SQL-backed list of today's closed live trades. When
+  // present, the panel sources its rows from here instead of parsing
+  // the (in-memory, capped at 120) decision stream — that's how the
+  // panel and the realized-pnl tile stay perfectly consistent.
+  liveClosed?: LiveClosedRow[];
 };
 
 type ClosedRow = {
@@ -55,6 +60,24 @@ function parseClose(d: DecisionRow): ClosedRow | null {
   };
 }
 
+function fromLiveClosed(r: LiveClosedRow): ClosedRow {
+  // The bot stamps "external_close" on plans that the user squared off
+  // on Angel One directly; surface that in the UI so it's clearly
+  // distinguishable from a bot-driven stop / target.
+  const isExternal = (r.exit_reason || "").toLowerCase() === "external_close";
+  return {
+    ts: r.ts,
+    symbol: r.tradingsymbol,
+    side: r.side,
+    qty: r.qty,
+    exitPrice: r.exit_price || null,
+    pnl: Number.isFinite(r.realized_pnl) ? r.realized_pnl : 0,
+    reason: isExternal ? "external" : (r.exit_reason || "exit"),
+    source: isExternal ? "external" : "live",
+    rawReason: r.exit_reason || "",
+  };
+}
+
 const REASON_LABEL: Record<string, string> = {
   stop: "Stop loss",
   target: "Take profit",
@@ -75,11 +98,23 @@ const REASON_TONE: Record<string, string> = {
   exit: "border-slate-500/30 bg-slate-700/30 text-slate-300",
 };
 
-export default function ClosedTradesPanel({ decisions, isLive }: Props) {
-  const all = decisions
-    .map(parseClose)
-    .filter((x): x is ClosedRow => x !== null)
-    .filter((x) => (isLive ? x.source !== "paper" : x.source === "paper"));
+export default function ClosedTradesPanel({ decisions, isLive, liveClosed }: Props) {
+  let all: ClosedRow[];
+  if (isLive && liveClosed && liveClosed.length > 0) {
+    // Prefer the SQL-backed list — it never disagrees with the
+    // realized-pnl tile and survives bot restarts mid-session.
+    all = liveClosed.map(fromLiveClosed);
+  } else if (isLive) {
+    // Live mode but no closed-today rows from the backend (or empty
+    // list). Don't fall through to decision-parsing: showing 0 closed
+    // trades is the correct, consistent answer.
+    all = [];
+  } else {
+    all = decisions
+      .map(parseClose)
+      .filter((x): x is ClosedRow => x !== null)
+      .filter((x) => x.source === "paper");
+  }
 
   const totalPnl = all.reduce((s, r) => s + r.pnl, 0);
   const wins = all.filter((r) => r.pnl > 0).length;

@@ -82,6 +82,29 @@ def test_old_entries_drop_out_of_hourly_window():
     assert e.trades_last_hour() == 1
 
 
+def test_zero_hourly_cap_disables_throttle():
+    """Default behaviour must allow unlimited entries when the cap is 0."""
+    s = _settings(RISK_MAX_TRADES_PER_HOUR="0")
+    e = RiskEngine(s)
+    e.set_broker_cash(100_000)
+    now = datetime.now(timezone.utc)
+    for i in range(20):
+        e.record_entry(now - timedelta(seconds=i))
+    d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
+    assert d.allowed
+    assert "max_trades_hour" not in d.reason
+
+
+def test_zero_daily_cap_disables_throttle():
+    s = _settings(RISK_MAX_TRADES_PER_DAY="0")
+    e = RiskEngine(s)
+    e.set_broker_cash(100_000)
+    e.state.trades_today = 50  # would have blown past the legacy 12/day cap
+    d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
+    assert d.allowed
+    assert "max_trades_today" not in d.reason
+
+
 def test_post_loss_cooldown_blocks_new_entries():
     s = _settings(RISK_LOSS_COOLDOWN_MINUTES="10")
     e = RiskEngine(s)

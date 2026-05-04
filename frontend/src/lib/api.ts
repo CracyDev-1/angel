@@ -266,6 +266,7 @@ export type BotToday = {
   pending: number;
   filled: number;
   rejected: number;
+  closed_today?: number;
   unrealized_pnl: number;
   realized_pnl: number;
   net_pnl: number;
@@ -435,6 +436,24 @@ export type Snapshot = {
   market_hours?: Record<string, MarketStatus>;
   live_exits?: LiveExitsBlock;
   warmup?: WarmupBlock;
+  live_closed_today?: LiveClosedRow[];
+};
+
+export type LiveClosedRow = {
+  ts: string;
+  opened_at: string;
+  tradingsymbol: string;
+  exchange: string;
+  symboltoken: string;
+  side: string;
+  qty: number;
+  lots: number;
+  entry_price: number;
+  exit_price: number;
+  exit_reason: string;
+  realized_pnl: number;
+  source: "bot" | "adopted" | string;
+  underlying: string;
 };
 
 export type WarmupBlock = {

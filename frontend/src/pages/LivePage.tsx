@@ -187,7 +187,11 @@ export default function LivePage() {
           )}
         </div>
         <div className="space-y-4">
-          <ClosedTradesPanel decisions={data?.decisions ?? []} isLive={isLive} />
+          <ClosedTradesPanel
+            decisions={data?.decisions ?? []}
+            isLive={isLive}
+            liveClosed={data?.live_closed_today ?? []}
+          />
           <CePeMiniSummary
             ceCount={cepe?.ce_open ?? 0}
             peCount={cepe?.pe_open ?? 0}

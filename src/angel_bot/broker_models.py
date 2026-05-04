@@ -63,32 +63,99 @@ def _classify_option(symbol: str) -> str:
     return "-"
 
 
-def normalize_positions(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Normalize getPosition response. Splits CE / PE buckets and computes capital used.
+def normalize_positions(
+    payload: dict[str, Any],
+    *,
+    fresh_prices: dict[tuple[str, str], float] | None = None,
+) -> dict[str, Any]:
+    """Normalize ``getPosition`` response into a UI-friendly shape.
+
+    P&L resolution order (most-trustworthy first), per row:
+
+      1. ``realised + unrealised`` if both fields are present — this is
+         exactly what Angel One's app shows.
+      2. ``mark_to_market`` recomputed from the freshest LTP we have
+         (scanner cache via ``fresh_prices`` first, broker's own ``ltp``
+         second) and the broker's avg-buy/sell. Beats Angel's ``pnl``
+         field for open positions because the broker snapshot lags by
+         several seconds during fast tape.
+      3. ``pnl`` field straight from the broker (last resort — already
+         stale by the time we render it but at least non-zero).
+
+    We *never* fall back to ``netvalue``: that field is sell_amount –
+    buy_amount, which for an open BUY position equals -buy_amount and
+    has nothing to do with P&L. The previous implementation did this
+    fallback and that's why bot's "live PnL" diverged wildly from the
+    Angel One app — for a fresh fill where Angel hadn't populated
+    ``pnl`` yet we'd display a "loss" equal to the entire buy notional.
+
+    ``fresh_prices`` (optional): scanner LTP cache keyed by
+    ``(exchange, symboltoken)`` so the runtime can pass a sub-second
+    fresh price for every position and we don't depend on the broker's
+    refresh cadence.
     """
     data = payload.get("data") if isinstance(payload, dict) else None
     rows: list[dict[str, Any]] = data if isinstance(data, list) else []
+    fresh = fresh_prices or {}
     out_rows: list[dict[str, Any]] = []
     capital_ce = 0.0
     capital_pe = 0.0
     pnl_total = 0.0
+    realized_total = 0.0
+    unrealized_total = 0.0
     open_positions = 0
 
     for r in rows:
         if not isinstance(r, dict):
             continue
         sym = str(r.get("tradingsymbol") or r.get("symbolname") or r.get("symbol") or "").strip()
+        ex = str(r.get("exchange") or "").upper()
+        tok = str(r.get("symboltoken") or r.get("symbolToken") or "")
         side = _classify_option(sym)
         net_qty = _i(r.get("netqty") or r.get("netQty") or r.get("buyqty", 0))
         buy_qty = _i(r.get("buyqty"))
         sell_qty = _i(r.get("sellqty"))
         buy_avg = _f(r.get("totalbuyavgprice") or r.get("buyavgprice"))
         sell_avg = _f(r.get("totalsellavgprice") or r.get("sellavgprice"))
-        ltp = _f(r.get("ltp") or r.get("lastprice"))
-        pnl = _f(r.get("pnl") or r.get("netvalue"))
-        if pnl is None and ltp is not None and buy_avg is not None:
-            pnl = (ltp - buy_avg) * (net_qty or buy_qty)
+        broker_ltp = _f(r.get("ltp") or r.get("lastprice"))
+        scanner_ltp = fresh.get((ex, tok)) if ex and tok else None
+        # Prefer the scanner cache for mark-to-market when available; it
+        # was polled from the broker's market-data endpoint at most one
+        # cycle ago, whereas getPosition's ``ltp`` is whatever Angel's
+        # backend last cached against the position record.
+        ltp = scanner_ltp if scanner_ltp is not None and scanner_ltp > 0 else broker_ltp
+
+        realised = _f(r.get("realised") or r.get("realized"))
+        unrealised = _f(r.get("unrealised") or r.get("unrealized"))
+        broker_pnl = _f(r.get("pnl"))
+
+        # Step 1: trust explicit realised + unrealised when present.
+        if realised is not None or unrealised is not None:
+            pnl = (realised or 0.0) + (unrealised or 0.0)
+            pnl_source = "broker_realised_unrealised"
+        # Step 2: mark to market with whatever LTP is freshest.
+        elif ltp is not None and ltp > 0 and buy_avg is not None and (net_qty or buy_qty):
+            qty_for_mtm = net_qty if net_qty != 0 else buy_qty
+            pnl = (ltp - buy_avg) * qty_for_mtm
+            # Synthetic split: any closed leg's realised P&L is
+            # (sell_avg - buy_avg) × sell_qty; the remainder is
+            # unrealised on the remaining qty. Keeps the dashboard
+            # numbers tied back to ground truth.
+            if sell_qty and sell_avg is not None and buy_avg is not None:
+                realised = (sell_avg - buy_avg) * sell_qty
+                unrealised = pnl - realised
+            else:
+                unrealised = pnl
+                realised = 0.0
+            pnl_source = "mark_to_market"
+        # Step 3: last-resort broker total. NEVER fall back to netvalue.
+        elif broker_pnl is not None:
+            pnl = broker_pnl
+            pnl_source = "broker_pnl"
+        else:
+            pnl = None
+            pnl_source = "unknown"
+
         capital_used = 0.0
         if buy_qty and buy_avg:
             capital_used = buy_qty * buy_avg
@@ -100,12 +167,16 @@ def normalize_positions(payload: dict[str, Any]) -> dict[str, Any]:
             open_positions += 1
         if pnl is not None:
             pnl_total += pnl
+        if realised is not None:
+            realized_total += realised
+        if unrealised is not None:
+            unrealized_total += unrealised
 
         out_rows.append(
             {
                 "tradingsymbol": sym,
-                "exchange": str(r.get("exchange") or "").upper(),
-                "symboltoken": str(r.get("symboltoken") or r.get("symbolToken") or ""),
+                "exchange": ex,
+                "symboltoken": tok,
                 "side": side,
                 "net_qty": net_qty,
                 "buy_qty": buy_qty,
@@ -113,8 +184,13 @@ def normalize_positions(payload: dict[str, Any]) -> dict[str, Any]:
                 "buy_avg": buy_avg,
                 "sell_avg": sell_avg,
                 "ltp": ltp,
+                "broker_ltp": broker_ltp,
+                "scanner_ltp": scanner_ltp,
                 "capital_used": capital_used,
                 "pnl": pnl,
+                "realised_pnl": realised,
+                "unrealised_pnl": unrealised,
+                "pnl_source": pnl_source,
                 "producttype": r.get("producttype") or r.get("productType"),
             }
         )
@@ -126,6 +202,8 @@ def normalize_positions(payload: dict[str, Any]) -> dict[str, Any]:
         "capital_used_pe": capital_pe,
         "capital_used_total": capital_ce + capital_pe,
         "pnl_total": pnl_total,
+        "realized_pnl_total": realized_total,
+        "unrealized_pnl_total": unrealized_total,
     }
 
 

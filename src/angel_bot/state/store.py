@@ -183,10 +183,47 @@ class StateStore:
             plan_migrations = [
                 ("source", "ALTER TABLE live_exit_plans ADD COLUMN source TEXT DEFAULT 'bot'"),
                 ("last_seen_qty", "ALTER TABLE live_exit_plans ADD COLUMN last_seen_qty INTEGER"),
+                # ``pnl_long_only_v1`` is a marker flag — non-NULL means
+                # we already recomputed realized_pnl with the long-only
+                # formula. Without this, the back-fill below would run
+                # every startup and double-flip rows.
+                ("pnl_long_only_v1", "ALTER TABLE live_exit_plans ADD COLUMN pnl_long_only_v1 INTEGER"),
             ]
             for name, ddl in plan_migrations:
                 if name not in plan_cols:
                     con.execute(ddl)
+
+            # ----- One-shot back-fill: long-only PnL for every closed plan -----
+            # Earlier builds of the exit manager treated a PE BUY as a
+            # short and inverted the realized P&L sign. The dashboard's
+            # "Closed today" panel now reads directly from this table,
+            # so anything stamped by the buggy code would still display
+            # the wrong sign. We rewrite each closed row with the
+            # corrected formula  (exit - entry) * qty  exactly once.
+            for row in con.execute(
+                """
+                SELECT id, qty, fill_price, planned_entry, exit_price, realized_pnl
+                FROM live_exit_plans
+                WHERE closed_at IS NOT NULL
+                  AND (pnl_long_only_v1 IS NULL OR pnl_long_only_v1 = 0)
+                """
+            ).fetchall():
+                qty = int(row["qty"] or 0)
+                entry = float(row["fill_price"] or row["planned_entry"] or 0.0)
+                exit_p = float(row["exit_price"] or 0.0)
+                if qty <= 0 or entry <= 0 or exit_p <= 0:
+                    # Insufficient data to recompute — leave the stored
+                    # PnL alone but mark so we don't keep retrying.
+                    con.execute(
+                        "UPDATE live_exit_plans SET pnl_long_only_v1 = 1 WHERE id = ?",
+                        (int(row["id"]),),
+                    )
+                    continue
+                corrected = (exit_p - entry) * qty
+                con.execute(
+                    "UPDATE live_exit_plans SET realized_pnl = ?, pnl_long_only_v1 = 1 WHERE id = ?",
+                    (float(corrected), int(row["id"])),
+                )
 
     def log_order(
         self,
@@ -570,6 +607,47 @@ class StateStore:
                 "SELECT * FROM live_exit_plans WHERE closed_at IS NULL ORDER BY id DESC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def list_closed_live_plans_since(
+        self, since_iso: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Closed live exit plans (bot- or user-initiated) since ``since_iso``.
+
+        This is the canonical source for the dashboard's "Closed today"
+        panel — backed by SQLite so it survives restarts and never falls
+        out of an in-memory log buffer the way the decision stream does.
+        ``since_iso`` should be the ISO-formatted start of the trading
+        day in IST (Angel's reporting timezone).
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM live_exit_plans
+                WHERE closed_at IS NOT NULL AND closed_at >= ?
+                ORDER BY closed_at DESC
+                LIMIT ?
+                """,
+                (str(since_iso), int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def closed_live_pnl_since(self, since_iso: str) -> tuple[int, float]:
+        """Return (count, summed realized PnL) for closed plans since
+        ``since_iso``. Used to make the dashboard's "PnL today" tile
+        consistent with the closed-trade list — both come from this
+        single SQL aggregate now."""
+        with self._connect() as con:
+            row = con.execute(
+                """
+                SELECT COUNT(*) AS n, COALESCE(SUM(realized_pnl), 0.0) AS pnl
+                FROM live_exit_plans
+                WHERE closed_at IS NOT NULL AND closed_at >= ?
+                """,
+                (str(since_iso),),
+            ).fetchone()
+            if row is None:
+                return (0, 0.0)
+            return (int(row["n"] or 0), float(row["pnl"] or 0.0))
 
     def find_open_live_exit_plan_by_token(
         self, *, exchange: str, symboltoken: str

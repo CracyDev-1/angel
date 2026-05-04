@@ -81,13 +81,31 @@ def test_call_hits_stop_records_loss(store: StateStore) -> None:
     assert pnl == pytest.approx(-10.0)
 
 
-def test_put_hits_target_when_price_drops(store: StateStore) -> None:
+def test_put_buy_hits_target_when_premium_rises(store: StateStore) -> None:
+    """PE BUY is LONG the option premium, exactly like CE BUY.
+
+    Regression test for the PnL sign-flip bug. The bot only ever buys
+    options, so a PE position profits when the *premium* goes up — not
+    when the underlying goes down. Stop is below entry, target is
+    above entry, PnL = (exit - entry) * qty for both CE and PE.
+    """
     trader = PaperTrader(store, PaperConfig(stop_loss_pct=0.01, take_profit_pct=0.02))
-    _open_put(trader, entry=200.0)  # PE wants price down
-    events = trader.mark_and_close({("NSE", "8888"): 196.0})  # -2% -> target
+    _open_put(trader, entry=200.0)
+    events = trader.mark_and_close({("NSE", "8888"): 204.0})  # +2% -> target
     assert len(events) == 1
     assert events[0].exit_reason == "target"
-    assert events[0].realized_pnl == pytest.approx((200.0 - 196.0) * 5)
+    assert events[0].realized_pnl == pytest.approx((204.0 - 200.0) * 5)
+
+
+def test_put_buy_hits_stop_when_premium_drops(store: StateStore) -> None:
+    """A losing PE BUY (premium drops) must record a NEGATIVE pnl."""
+    trader = PaperTrader(store, PaperConfig(stop_loss_pct=0.01, take_profit_pct=0.02))
+    _open_put(trader, entry=200.0)
+    events = trader.mark_and_close({("NSE", "8888"): 197.0})  # -1.5% -> stop
+    assert len(events) == 1
+    assert events[0].exit_reason == "stop"
+    assert events[0].realized_pnl == pytest.approx((197.0 - 200.0) * 5)
+    assert events[0].realized_pnl < 0
 
 
 def test_session_timeout_closes_at_max_hold(store: StateStore) -> None:

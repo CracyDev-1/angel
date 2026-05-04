@@ -82,15 +82,14 @@ class PaperTrader:
     def open(self, req: PaperOpenRequest) -> int:
         """Persist a new paper position. Returns its DB id."""
         side = req.side.upper()
-        is_call = side == "CE"
-        # Stop / target are derived from entry_price and configured percentages.
-        # For CE we expect price to go up; for PE, down.
-        if is_call:
-            stop = req.entry_price * (1 - self.config.stop_loss_pct)
-            target = req.entry_price * (1 + self.config.take_profit_pct)
-        else:
-            stop = req.entry_price * (1 + self.config.stop_loss_pct)
-            target = req.entry_price * (1 - self.config.take_profit_pct)
+        # The bot only opens BUYs — CE BUY *and* PE BUY are both LONG
+        # the option premium. Profit comes from the premium going up,
+        # so stop is below entry and target is above entry for either
+        # side. The previous CE/PE branch inverted the stops on puts
+        # which made paper PE trades book the wrong sign on P&L (and,
+        # via the same logic in live.py, real trades too).
+        stop = req.entry_price * (1 - self.config.stop_loss_pct)
+        target = req.entry_price * (1 + self.config.take_profit_pct)
         qty = req.lots * req.lot_size
         capital_used = req.entry_price * qty
         pid = self.store.open_paper_position(
@@ -177,23 +176,19 @@ class PaperTrader:
         last_price: float,
         now: datetime,
     ) -> PaperCloseEvent | None:
-        side = str(row["side"]).upper()
         stop = row.get("stop_price")
         target = row.get("target_price")
         opened_at = _parse_iso(row.get("opened_at"))
         held_minutes = ((now - opened_at).total_seconds() / 60.0) if opened_at else 0.0
 
+        # Long-only: stop fires when price falls below stop, target
+        # fires when price rises above target. Same rule for CE and PE
+        # since both are option BUYs.
         reason: str | None = None
-        if side == "CE":
-            if stop is not None and last_price <= float(stop):
-                reason = "stop"
-            elif target is not None and last_price >= float(target):
-                reason = "target"
-        else:  # PE
-            if stop is not None and last_price >= float(stop):
-                reason = "stop"
-            elif target is not None and last_price <= float(target):
-                reason = "target"
+        if stop is not None and last_price <= float(stop):
+            reason = "stop"
+        elif target is not None and last_price >= float(target):
+            reason = "target"
 
         if reason is None and held_minutes >= self.config.max_hold_minutes:
             reason = "session_end"
@@ -206,7 +201,9 @@ class PaperTrader:
         side = str(row["side"]).upper()
         qty = int(row["qty"])
         entry = float(row["entry_price"])
-        pnl = (exit_price - entry) * qty if side == "CE" else (entry - exit_price) * qty
+        # Long-only PnL — same formula for CE and PE since the bot
+        # only ever BUYs the option.
+        pnl = (exit_price - entry) * qty
         pid = int(row["id"])
         self.store.close_paper_position(
             pid,

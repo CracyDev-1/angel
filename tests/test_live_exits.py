@@ -116,18 +116,38 @@ def test_call_take_profit_triggers(store: StateStore, fake_api: AsyncMock) -> No
     assert events[0].realized_pnl == pytest.approx((102.5 - 100.0) * 50)
 
 
-def test_put_stop_loss_uses_inverse_direction(store: StateStore, fake_api: AsyncMock) -> None:
+def test_put_buy_is_long_premium(store: StateStore, fake_api: AsyncMock) -> None:
+    """PE BUY is LONG the premium — same SL/TP shape as CE BUY.
+
+    Regression test for the sign-flip bug: previously the manager
+    inverted SL/TP and PnL on PE (treating it as a short of the
+    underlying). A PE buyer wants the premium to *rise*, so stop is
+    below entry and profit comes from exit > entry.
+    """
+    # PE entry 100 → stop = 99 (premium falling is bad). Mark 98.5 → stop.
     mgr = LiveExitManager(
         store,
         LiveExitConfig(stop_loss_pct=0.01, take_profit_pct=0.02, max_hold_minutes=60),
-        # PE entry 100 → stop = 101 (price RISING is bad). Mark 101.5 → stop.
-        price_lookup=lambda ex, tok: 101.5,
+        price_lookup=lambda ex, tok: 98.5,
     )
     _register_call_plan(mgr, side="PE", entry=100.0)
     events = asyncio.run(mgr.mark_and_close(fake_api))
     assert events[0].exit_reason == "stop"
-    # PE pnl = (entry - exit) * qty = (100 - 101.5) * 50 = -75.
+    # PE BUY pnl = (exit - entry) * qty = (98.5 - 100) * 50 = -75.
     assert events[0].realized_pnl == pytest.approx(-75.0)
+
+
+def test_put_buy_target_when_premium_rises(store: StateStore, fake_api: AsyncMock) -> None:
+    """A PE BUY at 100 should hit target when premium rises to 102."""
+    mgr = LiveExitManager(
+        store,
+        LiveExitConfig(stop_loss_pct=0.01, take_profit_pct=0.02, max_hold_minutes=60),
+        price_lookup=lambda ex, tok: 102.5,
+    )
+    _register_call_plan(mgr, side="PE", entry=100.0)
+    events = asyncio.run(mgr.mark_and_close(fake_api))
+    assert events[0].exit_reason == "target"
+    assert events[0].realized_pnl == pytest.approx((102.5 - 100.0) * 50)
 
 
 def test_max_hold_session_end_triggers_even_without_price(

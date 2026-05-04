@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time as dtime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -32,6 +32,24 @@ from angel_bot.smart_client import SmartApiClient
 from angel_bot.state.store import StateStore
 
 log = structlog.get_logger(__name__)
+
+# Asia/Kolkata is fixed UTC+5:30 with no DST. Used to compute the
+# "trading day" boundary the dashboard reports against — must match
+# Angel One's app, which rolls over at IST midnight.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_day_start_iso() -> str:
+    """ISO-formatted UTC timestamp for 00:00 IST today.
+
+    The live_exit_plans table stores ``closed_at`` as ISO UTC, so we
+    convert IST midnight to UTC (=18:30 UTC the previous day) before
+    comparing. Returns a string suitable for direct SQL string
+    comparison since both ends are zero-padded ISO.
+    """
+    now_ist = datetime.now(_IST)
+    midnight_ist = datetime.combine(now_ist.date(), dtime(0, 0, tzinfo=_IST))
+    return midnight_ist.astimezone(UTC).isoformat()
 
 
 class TradingRuntime:
@@ -671,14 +689,28 @@ class TradingRuntime:
 
     async def refresh_positions(self) -> dict[str, Any]:
         api = self.smart_client()
+        empty = {
+            "rows": [], "open_positions": 0,
+            "capital_used_ce": 0.0, "capital_used_pe": 0.0, "capital_used_total": 0.0,
+            "pnl_total": 0.0, "realized_pnl_total": 0.0, "unrealized_pnl_total": 0.0,
+        }
         if not api:
-            return {"rows": [], "open_positions": 0, "capital_used_ce": 0.0, "capital_used_pe": 0.0, "capital_used_total": 0.0, "pnl_total": 0.0}
+            return empty
+        # Pass the scanner's fresh LTP cache so unrealized P&L on open
+        # positions is marked-to-market against the latest tick rather
+        # than the broker's slower getPosition snapshot. This is what
+        # makes the dashboard's "live PnL" track Angel One's app.
+        fresh: dict[tuple[str, str], float] = {}
+        try:
+            fresh = self.scanner.latest_prices() if hasattr(self.scanner, "latest_prices") else {}
+        except Exception:  # noqa: BLE001
+            fresh = {}
         try:
             payload = await api.get_position()
-            self.last_positions = normalize_positions(payload)
+            self.last_positions = normalize_positions(payload, fresh_prices=fresh)
         except Exception as e:
             log.warning("positions_error", error=str(e))
-            self.last_positions = self.last_positions or {"rows": [], "open_positions": 0, "capital_used_ce": 0.0, "capital_used_pe": 0.0, "capital_used_total": 0.0, "pnl_total": 0.0, "error": str(e)}
+            self.last_positions = self.last_positions or {**empty, "error": str(e)}
         return self.last_positions or {}
 
     async def reconcile_orders(self) -> int:
@@ -713,6 +745,9 @@ class TradingRuntime:
             "scanner_by_kind": self._scanner_by_kind(),
             "ce_pe_summary": self._ce_pe_summary(positions),
             "bot_today": self._bot_today_summary(positions),
+            # Authoritative closed-today list. SQL-backed so it survives
+            # restarts and never disagrees with the realized-pnl tile.
+            "live_closed_today": self._live_closed_today(),
             "recent_orders": summarize_orders_for_ui(self.store.recent_orders(50)),
             "decisions": [d.to_dict() for d in self.decisions.recent(120)],
             "daily": self._daily_stats(),
@@ -879,6 +914,42 @@ class TradingRuntime:
                 ordered.append(v)
         return {"buckets": ordered}
 
+    def _live_closed_today(self) -> list[dict[str, Any]]:
+        """Closed live exit plans since IST midnight, in dashboard shape.
+
+        Each row has the fields the ClosedTradesPanel needs to render
+        without parsing decision-log strings: tradingsymbol, side, qty,
+        entry, exit, realized P&L, exit reason, source ('bot' or
+        'adopted'), and ISO close timestamp.
+        """
+        try:
+            raw = self.store.list_closed_live_plans_since(_ist_day_start_iso(), limit=200)
+        except Exception as e:  # noqa: BLE001 — never crash the snapshot
+            log.warning("snapshot_closed_today_failed", error=str(e))
+            return []
+        out: list[dict[str, Any]] = []
+        for r in raw:
+            try:
+                out.append({
+                    "ts": r.get("closed_at") or "",
+                    "opened_at": r.get("opened_at") or "",
+                    "tradingsymbol": r.get("tradingsymbol") or "",
+                    "exchange": r.get("exchange") or "",
+                    "symboltoken": r.get("symboltoken") or "",
+                    "side": (r.get("side") or "").upper(),
+                    "qty": int(r.get("qty") or 0),
+                    "lots": int(r.get("lots") or 0),
+                    "entry_price": float(r.get("fill_price") or r.get("planned_entry") or 0.0),
+                    "exit_price": float(r.get("exit_price") or 0.0),
+                    "exit_reason": r.get("exit_reason") or "",
+                    "realized_pnl": float(r.get("realized_pnl") or 0.0),
+                    "source": (r.get("source") or "bot").lower(),
+                    "underlying": r.get("underlying") or "",
+                })
+            except Exception:  # noqa: BLE001 — skip malformed row
+                continue
+        return out
+
     def _ce_pe_summary(self, positions: dict[str, Any]) -> dict[str, Any]:
         rows = positions.get("rows") or []
         ce_open = pe_open = 0
@@ -918,15 +989,34 @@ class TradingRuntime:
         if self._runtime_trading_enabled:
             rows = [r for r in self.store.bot_orders_today() if (r.get("mode") or "live").lower() == "live"]
             trades_placed = len(rows)
-            unrealized = float(positions.get("pnl_total") or 0.0)
-            realized_today, _ = (self.store.get_mode_daily_stats("live")[1], 0)
-            realized_today = self.store.get_mode_daily_stats("live")[1]
+            # Use the broker's split unrealised so we don't double-count
+            # realised legs that already live in daily_stats_mode["live"].
+            # Falls back to the row-level total minus the broker's
+            # realised total if the explicit unrealised field is missing.
+            unrealized = float(
+                positions.get("unrealized_pnl_total")
+                if positions.get("unrealized_pnl_total") is not None
+                else (
+                    float(positions.get("pnl_total") or 0.0)
+                    - float(positions.get("realized_pnl_total") or 0.0)
+                )
+            )
+            # Single source of truth: sum realized P&L from the closed
+            # live_exit_plans rows since the IST trading-day boundary.
+            # The legacy daily_stats_mode["live"] accumulator could drift
+            # away from the visible "Closed today" list (in-memory
+            # decision buffer flushes after 120 events; SQLite never
+            # forgets) — and the user rightly called out that mismatch.
+            n_closed, realized_today = self.store.closed_live_pnl_since(
+                _ist_day_start_iso()
+            )
             return {
                 "mode": "live",
                 "trades_placed": trades_placed,
                 "pending": len([r for r in rows if (r.get("lifecycle_status") or "").lower() not in ("executed", "complete", "cancelled", "rejected")]),
                 "filled": len([r for r in rows if (r.get("lifecycle_status") or "").lower() in ("executed", "complete")]),
                 "rejected": len([r for r in rows if (r.get("lifecycle_status") or "").lower() == "rejected"]),
+                "closed_today": n_closed,
                 "unrealized_pnl": unrealized,
                 "realized_pnl": realized_today,
                 "net_pnl": realized_today + unrealized,
