@@ -40,6 +40,12 @@ from angel_bot.market_data.candles import Candle, CandleAggregator, RetestBreako
 from angel_bot.strategy.indicators import wilder_adx, wilder_atr
 
 
+# Minimum candle depth for regime gate + evaluate warmup (aggregated buckets / closed 5m).
+MIN_REGIME_BUCKETS_5M = 10
+MIN_REGIME_BUCKETS_15M = 5
+MIN_REGIME_CLOSED_5M = 10
+
+
 # ----------------------------------------------------------------------
 # config / weights (read from .env via Settings, but defaults live here)
 # ----------------------------------------------------------------------
@@ -71,7 +77,7 @@ class BrainConfig:
     # ADX on closed 5m bars (Wilder). If None from insufficient data, gate skipped.
     # Set regime_adx_min to 0.0 to disable ADX gate.
     regime_adx_period: int = 14
-    regime_adx_min: float = 20.0
+    regime_adx_min: float = 11.0
     # When |price−TWAP|/TWAP exceeds reference_max_distance_pct, allow only if trend strong + fresh leg.
     regime_extension_adx_min: float = 22.0
     # Block when last-N 5m range is below this fraction of ATR(14) (dead tape).
@@ -158,11 +164,15 @@ class BrainConfig:
     retest_max_retrace_fraction: float = 0.50    # vs breakout candle range
     retest_engulf_body_min: float = 0.45         # body/range for engulfing rejection
 
-    # Fail-closed regime: treat missing ADX/ATR/slope/TWAP as NO_TRADE (see unified_regime_gate).
+    # Fail-closed regime: thin structure / missing slope TWAP blocks trading;
+    # missing ADX/ATR may warn + fallback (see unified_regime_gate).
     regime_fail_closed_indicators: bool = True
     regime_require_twap: bool = True
     # Global staleness: abort pending retest/setup when closed-bar age exceeds this (0 = disabled).
     signal_max_age_closed_bars: int = 3
+
+    # Closed 5m swing bias: block CALL when BEARISH, block PUT when BULLISH (selective mode only).
+    structure_bias_filter_enabled: bool = True
 
 
 # ----------------------------------------------------------------------
@@ -317,17 +327,55 @@ def _recent_high_low_range_5m(c5_closed: list[Candle], *, last_n: int = 5) -> fl
     return float(hi - lo)
 
 
+def _detect_structure_bias(c5_closed: list[Candle]) -> str:
+    """Return ``BULLISH`` | ``BEARISH`` | ``NEUTRAL`` from closed 5m closes only."""
+    if not c5_closed or len(c5_closed) < 25:
+        return "NEUTRAL"
+    closes = [b.c for b in c5_closed]
+    recent = closes[-20:-1]
+    last = closes[-1]
+    last_swing_high = max(recent)
+    last_swing_low = min(recent)
+    broke_up = last > last_swing_high
+    broke_down = last < last_swing_low
+    if broke_up and not broke_down:
+        return "BULLISH"
+    if broke_down and not broke_up:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _confirm_structure_bias(c5_closed: list[Candle], prev_bias: str | None) -> str:
+    """One closed-bar confirmation; bias flips only after a full candle beyond the window."""
+    if not c5_closed or len(c5_closed) < 26:
+        return prev_bias or "NEUTRAL"
+    closes = [b.c for b in c5_closed]
+    prev_c = closes[-2]
+    curr = closes[-1]
+    recent = closes[-21:-2]
+    swing_high = max(recent)
+    swing_low = min(recent)
+    if prev_c < swing_low and curr <= prev_c:
+        return "BEARISH"
+    if prev_c > swing_high and curr >= prev_c:
+        return "BULLISH"
+    return prev_bias or "NEUTRAL"
+
+
 def unified_regime_gate(
     cfg: BrainConfig,
     agg: CandleAggregator,
     last_price: float | None,
+    out_diagnostics: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """STEP 1–7 unified regime (selective mode).
 
     Returns (True, reason) when entries should be blocked, else (False, "").
 
-    When ``regime_fail_closed_indicators`` is True, missing ADX/ATR/15m slope/TWAP
-    blocks trading (fail-closed). Thin candle history uses ``regime:data_missing``.
+    Critical blocks: insufficient candle depth, missing 15m slope (``regime:missing_slope``),
+    chop/extension/flat-HTF. Missing Wilder ADX/ATR is non-blocking (warnings + fallbacks).
+    ``regime:low_adx`` applies only when ADX is actually computed and trend is weak on both
+    structure and momentum dimensions—strong 15m slope or recent range vs ATR bypasses it.
     """
     if not cfg.selective_entry_enabled:
         return False, ""
@@ -336,49 +384,57 @@ def unified_regime_gate(
 
     c1, c5, c15 = agg.all_candles_including_partial()
     c5_closed = agg.snapshot_lists()[1]
-    need_hist = max(cfg.regime_adx_period * 2, cfg.atr_period + 1)
 
-    # STEP 1: insufficient *closed* 5m structure for indicators
-    if len(c5) < 5 or len(c15) < 3:
+    # STEP 1 — depth + optional TWAP only (warmup-scale gates live in evaluate too).
+    if len(c5) < MIN_REGIME_BUCKETS_5M or len(c15) < MIN_REGIME_BUCKETS_15M:
         if cfg.regime_fail_closed_indicators:
-            return True, "regime:data_missing"
+            return True, "regime:missing_slope"
         return False, ""
 
     if cfg.regime_fail_closed_indicators:
-        if len(c5_closed) < need_hist:
-            return True, "regime:data_missing"
-        adx_fc = wilder_adx(c5_closed, period=cfg.regime_adx_period)
-        atr_fc = wilder_atr(c5_closed, period=cfg.atr_period)
-        if adx_fc is None:
-            return True, "indicator:adx_missing"
-        if atr_fc is None:
-            return True, "indicator:atr_missing"
-        n15_fc = min(10, len(c15))
-        if n15_fc < 3:
-            return True, "indicator:slope_missing"
-        m15_fc = [b.c for b in c15[-n15_fc:]]
-        if _slope(m15_fc) is None:
-            return True, "indicator:slope_missing"
+        if len(c5_closed) < MIN_REGIME_CLOSED_5M:
+            return True, "regime:missing_slope"
         if cfg.regime_require_twap:
             tw_fc = agg.session_twap
             if tw_fc is None or tw_fc <= 0:
-                return True, "regime:data_missing"
+                return True, "regime:missing_slope"
 
-    # STEP 2: slope on last 8–10 fifteen-minute closes (requires ≥3 bars).
+    # STEP 2 — 15m slope: unknown structure → hard block (never treat as flat trend).
     n15 = min(10, len(c15))
     if n15 < 3:
         if cfg.regime_fail_closed_indicators:
-            return True, "indicator:slope_missing"
+            return True, "regime:missing_slope"
         return False, ""
     m15_closes = [b.c for b in c15[-n15:]]
     slope_15m_raw = _slope(m15_closes)
-    if cfg.regime_fail_closed_indicators and slope_15m_raw is None:
-        return True, "indicator:slope_missing"
-    slope_15m = float(slope_15m_raw or 0.0)
+    if slope_15m_raw is None:
+        return True, "regime:missing_slope"
+    slope_15m = float(slope_15m_raw)
 
-    adx_5m = wilder_adx(c5_closed, period=cfg.regime_adx_period)
-    atr_5m = wilder_atr(c5_closed, period=cfg.atr_period)
+    adx_raw = wilder_adx(c5_closed, period=cfg.regime_adx_period)
+    atr_raw = wilder_atr(c5_closed, period=cfg.atr_period)
+    adx_missing_raw = adx_raw is None
+    adx_5m = adx_raw
+    atr_5m = atr_raw
     recent_range = _recent_high_low_range_5m(c5_closed, last_n=5)
+
+    if adx_5m is None:
+        if out_diagnostics is not None:
+            out_diagnostics["warn_adx_missing"] = True
+        adx_5m = 0.0
+
+    if atr_5m is None:
+        if out_diagnostics is not None:
+            out_diagnostics["warn_atr_missing"] = True
+        try:
+            if len(c5_closed) >= 5:
+                highs = [b.h for b in c5_closed[-5:]]
+                lows = [b.low for b in c5_closed[-5:]]
+                atr_5m = max(highs) - min(lows)
+            else:
+                atr_5m = 0.0
+        except Exception:
+            atr_5m = 0.0
 
     twap = agg.session_twap
     dist: float | None = None
@@ -388,16 +444,18 @@ def unified_regime_gate(
     # STEP 3 — hard rejection
     if cfg.regime_global_flat_slope_eps > 0 and abs(slope_15m) < cfg.regime_global_flat_slope_eps:
         return True, "regime:flat_htf"
-    if cfg.regime_adx_min > 0:
-        if adx_5m is None:
-            if cfg.regime_fail_closed_indicators:
-                return True, "indicator:adx_missing"
-        elif adx_5m < cfg.regime_adx_min:
+    # low_adx only when Wilder ADX exists; missing ADX never maps to low_adx.
+    if cfg.regime_adx_min > 0 and not adx_missing_raw and adx_5m < cfg.regime_adx_min:
+        eps = cfg.regime_global_flat_slope_eps
+        structure_strong = eps <= 0 or abs(slope_15m) >= eps
+        momentum_strong = (
+            atr_5m > 0
+            and recent_range is not None
+            and recent_range >= cfg.regime_recent_vol_atr_ratio * atr_5m
+        )
+        if not structure_strong and not momentum_strong:
             return True, "regime:low_adx"
-    if atr_5m is None:
-        if cfg.regime_fail_closed_indicators:
-            return True, "indicator:atr_missing"
-    elif (
+    if (
         atr_5m > 0
         and recent_range is not None
         and recent_range < cfg.regime_recent_vol_atr_ratio * atr_5m
@@ -437,20 +495,43 @@ def unified_regime_gate(
                 spike_ok = rng_last <= cfg.breakout_spike_range_mult * avg_r
 
         fresh = move_pct < cfg.breakout_max_extension_pct
-        adx_strong = adx_5m is not None and adx_5m > cfg.regime_extension_adx_min
+        adx_strong = adx_missing_raw or (adx_5m > cfg.regime_extension_adx_min)
         if not (fresh and spike_ok and adx_strong):
             return True, "regime:twap_extended_weak"
 
     return False, ""
 
 
+_REGIME_DATA_WARMUP_REASONS: frozenset[str] = frozenset({"regime:missing_slope"})
+
+
+def regime_data_inputs_ready(
+    cfg: BrainConfig,
+    agg: CandleAggregator,
+    last_price: float | None,
+) -> bool:
+    """True when thin history does not block with ``regime:missing_slope`` only.
+
+    Other regime vetoes (low ADX, chop, etc.) still mean indicators are *loaded*.
+    """
+    if not cfg.selective_entry_enabled:
+        return True
+    if last_price is None or last_price <= 0:
+        return False
+    blocked, reason = unified_regime_gate(cfg, agg, last_price)
+    if not blocked:
+        return True
+    return reason not in _REGIME_DATA_WARMUP_REASONS
+
+
 def pre_brain_regime_blocks(
     cfg: BrainConfig,
     agg: CandleAggregator,
     last_price: float | None,
+    out_diagnostics: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Scanner-side regime veto — mirrors :func:`unified_regime_gate`."""
-    return unified_regime_gate(cfg, agg, last_price)
+    """Thin wrapper around :func:`unified_regime_gate` (tests / callers); scanner uses ``evaluate``."""
+    return unified_regime_gate(cfg, agg, last_price, out_diagnostics)
 
 
 def _fail_retest_breakout_state(agg: CandleAggregator) -> None:
@@ -722,10 +803,11 @@ def _entry_check_atr_breakout(
 
 
 class BrainEngine:
-    """Stateless evaluator. State (candles) lives in CandleAggregator."""
+    """Evaluator: candle state lives on ``CandleAggregator``; confirmed structure bias is kept here."""
 
     def __init__(self, config: BrainConfig | None = None) -> None:
         self.config = config or BrainConfig()
+        self._market_bias: str = "NEUTRAL"
 
     # ---------- score (used for ranking, side-independent) ----------
 
@@ -858,11 +940,16 @@ class BrainEngine:
 
         c1, c5, c15 = agg.all_candles_including_partial()
 
+        # Warmup depth: full regime alignment only in selective mode (production).
+        # Legacy/tests often disable selective — keep the lighter 5 / 3 bucket minimum there.
+        sel = cfg.selective_entry_enabled
+        req5 = MIN_REGIME_BUCKETS_5M if sel else 5
+        req15 = MIN_REGIME_BUCKETS_15M if sel else 3
         # Need enough warmup for multi-timeframe rules. We also require at
         # least one 1m bar because the pattern-detection block below indexes
         # ``c1[-1]`` for the last 1m candle — historical-candle backfill
         # may seed only 5m + 15m for instruments with no 1m history.
-        if len(c5) < 5 or len(c15) < 3 or len(c1) < 1:
+        if len(c5) < req5 or len(c15) < req15 or len(c1) < 1:
             score = self.score_instrument(last_price=last_price, agg=agg)
             diag["score_inputs"] = score.inputs
             return BrainOutput(
@@ -875,7 +962,8 @@ class BrainEngine:
                         EntryCheck(
                             "warmup",
                             False,
-                            f"need>=5 5m, >=3 15m, >=1 1m (have {len(c5)}/{len(c15)}/{len(c1)})",
+                            f"need>={req5} 5m, >={req15} 15m, >=1 1m "
+                            f"(have {len(c5)}/{len(c15)}/{len(c1)})",
                         )
                     ],
                 ),
@@ -883,8 +971,11 @@ class BrainEngine:
             )
 
         c5_closed = agg.snapshot_lists()[1]
-        need_rb = max(cfg.regime_adx_period * 2, cfg.atr_period + 1)
-        if cfg.selective_entry_enabled and cfg.regime_fail_closed_indicators and len(c5_closed) < need_rb:
+        if (
+            cfg.selective_entry_enabled
+            and cfg.regime_fail_closed_indicators
+            and len(c5_closed) < MIN_REGIME_CLOSED_5M
+        ):
             score = self.score_instrument(last_price=last_price, agg=agg)
             diag["score_inputs"] = score.inputs
             return BrainOutput(
@@ -897,7 +988,7 @@ class BrainEngine:
                         EntryCheck(
                             "warmup",
                             False,
-                            f"need>={need_rb} closed 5m bars for regime indicators (have {len(c5_closed)})",
+                            f"need>={MIN_REGIME_CLOSED_5M} closed 5m bars for regime (have {len(c5_closed)})",
                         )
                     ],
                 ),
@@ -962,9 +1053,9 @@ class BrainEngine:
                 diag,
             )
 
-        # ---- unified regime gate (same logic as scanner pre_brain / STEP 1–7) ----
+        # ---- unified regime gate (STEP 1–7); scanner does not duplicate this ----
         if cfg.selective_entry_enabled:
-            regime_block, regime_reason = unified_regime_gate(cfg, agg, last_price)
+            regime_block, regime_reason = unified_regime_gate(cfg, agg, last_price, diag)
             if regime_block:
                 score = self.score_instrument(last_price=last_price, agg=agg)
                 diag["score_inputs"] = score.inputs
@@ -1003,7 +1094,7 @@ class BrainEngine:
                 0.0,
                 0.0,
                 {
-                    "reason": "entry:late",
+                    "reason": "entry:late_extension",
                     "extension_precheck_max_pct": max(chase_hi_pre, chase_lo_pre) * 100.0,
                 },
             )
@@ -1012,7 +1103,7 @@ class BrainEngine:
                 score,
                 Signal(
                     "NO_TRADE",
-                    "entry:late",
+                    "entry:late_extension",
                     0.0,
                     filters
                     + [
@@ -1130,6 +1221,27 @@ class BrainEngine:
                 allow_put = slope_15m <= -dir_eps
         else:
             allow_call = allow_put = True
+
+        allow_call_directional = allow_call
+        allow_put_directional = allow_put
+
+        raw_structure_bias = _detect_structure_bias(c5_closed)
+        self._market_bias = _confirm_structure_bias(c5_closed, self._market_bias)
+        diag["structure_bias_raw"] = raw_structure_bias
+        diag["structure_bias"] = self._market_bias
+
+        structure_blocked_call = False
+        structure_blocked_put = False
+        if cfg.structure_bias_filter_enabled and cfg.selective_entry_enabled:
+            if self._market_bias == "BEARISH":
+                if allow_call:
+                    structure_blocked_call = True
+                allow_call = False
+            elif self._market_bias == "BULLISH":
+                if allow_put:
+                    structure_blocked_put = True
+                allow_put = False
+
         diag["allow_call"] = allow_call
         diag["allow_put"] = allow_put
 
@@ -1465,16 +1577,37 @@ class BrainEngine:
                     ("scalp", "BUY_PUT", put_scalp_checks, "scalp_put_5m_momentum")
                 )
 
+        if cfg.structure_bias_filter_enabled and cfg.selective_entry_enabled:
+            filtered_candidates: list[tuple[str, str, list[EntryCheck], str]] = []
+            for row in candidates:
+                pat, side, checks, reason = row
+                if side == "BUY_CALL" and not allow_call:
+                    continue
+                if side == "BUY_PUT" and not allow_put:
+                    continue
+                filtered_candidates.append(row)
+            candidates = filtered_candidates
+
         if not candidates:
+            no_side_reason = "directional:no_side"
+            if cfg.structure_bias_filter_enabled and cfg.selective_entry_enabled:
+                if structure_blocked_call or structure_blocked_put:
+                    no_side_reason = f"bias_block:{self._market_bias}"
             return BrainOutput(
                 score_out,
                 Signal(
                     "NO_TRADE",
-                    "directional:no_side",
+                    no_side_reason,
                     0.0,
                     filters,
                     "other",
-                    {"allow_call": allow_call, "allow_put": allow_put},
+                    {
+                        "allow_call": allow_call,
+                        "allow_put": allow_put,
+                        "allow_call_directional": allow_call_directional,
+                        "allow_put_directional": allow_put_directional,
+                        "structure_bias": self._market_bias,
+                    },
                 ),
                 diag,
             )

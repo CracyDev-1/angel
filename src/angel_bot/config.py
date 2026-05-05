@@ -152,23 +152,22 @@ class Settings(BaseSettings):
     bot_default_variety: str = Field(default="NORMAL", validation_alias="BOT_DEFAULT_VARIETY")
 
     # Backfill each watchlist symbol's candle aggregator from broker
-    # history at bot start so the brain has ≥5 5m + ≥2 15m bars on cycle 1
+    # history at bot start so the brain has ≥10 5m + ≥5 15m buckets on cycle 1
     # — without this, every restart loses the in-memory aggregator and the
-    # bot sits in ``warmup`` for 25-30 minutes before grading any signal.
+    # bot sits in ``warmup`` before grading any signal.
     # Runs as a background task so the auto-trader loop starts scanning
     # immediately (live-tick polls + brain grades each instrument as soon
     # as its seed lands).
     bot_warmup_from_history: bool = Field(
         default=True, validation_alias="BOT_WARMUP_FROM_HISTORY"
     )
-    # Tight lookback windows — just enough to clear the brain's warmup
-    # gate (≥5 5m bars + ≥2 15m bars). 90 min of 5m → ~18 bars, 6 h of
-    # 15m → ~24 bars (handles Monday morning when Friday closes still
-    # count). Default 1m lookback is 0 minutes: the live-tick scanner
-    # populates the first 1m bar within seconds, so paying for a
-    # historical-API call for it is wasted rate budget on every restart.
+    # Tight lookback windows — enough for ≥10 5m / ≥5 15m buckets after seed.
+    # 120 min of 5m → ~24 bars; 6 h of 15m → ~24 bars (Monday morning gaps).
+    # Default 1m lookback is 0 minutes: the live-tick scanner populates the
+    # first 1m bar within seconds, so paying for a historical-API call for it
+    # is wasted rate budget on every restart.
     bot_warmup_lookback_5m_min: int = Field(
-        default=90, validation_alias="BOT_WARMUP_LOOKBACK_5M_MIN"
+        default=120, validation_alias="BOT_WARMUP_LOOKBACK_5M_MIN"
     )
     bot_warmup_lookback_15m_min: int = Field(
         default=360, validation_alias="BOT_WARMUP_LOOKBACK_15M_MIN"
@@ -278,7 +277,8 @@ class Settings(BaseSettings):
         default=0.018, validation_alias="STRATEGY_REFERENCE_MAX_DISTANCE_PCT"
     )
     # Unified regime gate (brain selective mode): ADX floor, extension ADX, recent-range vs ATR.
-    strategy_regime_adx_min: float = Field(default=18.0, validation_alias="STRATEGY_REGIME_ADX_MIN")
+    # Intraday index options often show ADX < 18 during transitions; ~11 is a softer floor (set 0 to disable).
+    strategy_regime_adx_min: float = Field(default=11.0, validation_alias="STRATEGY_REGIME_ADX_MIN")
     strategy_regime_extension_adx_min: float = Field(
         default=22.0, validation_alias="STRATEGY_REGIME_EXTENSION_ADX_MIN"
     )

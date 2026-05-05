@@ -9,7 +9,19 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from angel_bot.market_data.candles import CandleAggregator
-from angel_bot.strategy.brain import BrainConfig, BrainEngine
+from angel_bot.strategy.brain import BrainConfig, BrainEngine, regime_data_inputs_ready
+
+
+def test_regime_data_inputs_ready_selective_off_counts_ready_without_bars():
+    agg = CandleAggregator()
+    cfg = BrainConfig(selective_entry_enabled=False)
+    assert regime_data_inputs_ready(cfg, agg, None) is True
+
+
+def test_regime_data_inputs_ready_thin_history_false_when_selective():
+    agg = CandleAggregator()
+    cfg = BrainConfig(selective_entry_enabled=True, regime_fail_closed_indicators=True)
+    assert regime_data_inputs_ready(cfg, agg, 100.0) is False
 
 
 def _push_path(agg: CandleAggregator, start: datetime, prices: list[float], step_s: int = 5) -> None:

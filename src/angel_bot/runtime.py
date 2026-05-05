@@ -809,6 +809,7 @@ class TradingRuntime:
                 "from_history": bool(self.settings.bot_warmup_from_history),
                 "seeded_aggregators": int(self._warmup_seeded),
                 "warmed_tokens": len(self._warmed_keys),
+                **self.scanner.regime_data_readiness(),
             },
         }
 

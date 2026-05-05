@@ -3,7 +3,7 @@
 Per cycle:
   1. fetch LTP for every symbol in the watchlist
   2. push the LTP into the symbol's CandleAggregator (1m / 5m / 15m + session high/low + TWAP)
-  3. ask BrainEngine to score and signal each symbol
+  3. ask BrainEngine.evaluate for each symbol (ranking + regime inside the brain)
   4. emit ScannerHit rows sorted by score so the runtime can pick the best
 """
 
@@ -26,7 +26,7 @@ from angel_bot.strategy.brain import (
     BrainOutput,
     EntryCheck,
     Signal,
-    pre_brain_regime_blocks,
+    regime_data_inputs_ready,
 )
 
 # Asia/Kolkata is UTC+5:30 with no DST. Angel's historical-candle API expects
@@ -35,6 +35,9 @@ from angel_bot.strategy.brain import (
 IST = timezone(timedelta(hours=5, minutes=30))
 
 log = structlog.get_logger(__name__)
+
+# OPTION rows on these underlyings use the INDEX candle aggregator + spot for brain.evaluate.
+_INDEX_SIGNAL_UNDERLYINGS: frozenset[str] = frozenset({"NIFTY", "BANKNIFTY", "SENSEX"})
 
 
 def _dedupe_buy_signals_one_per_underlying(hits: list[ScannerHit]) -> None:
@@ -179,9 +182,8 @@ class ScannerEngine:
 
         Defaults are deliberately small to minimise total warmup time
         without losing signal quality:
-          * 5m: 90-minute lookback → ~18 bars (brain needs ≥5)
-          * 15m: 6-hour lookback → ~24 bars (brain needs ≥2; longer lookback
-            is needed because Friday closes count for Monday morning).
+          * 5m: default lookback targets ≥10 closed bars for regime alignment
+          * 15m: 6-hour lookback → ~24 bars (brain needs ≥5 fifteen-minute buckets)
           * 1m: skipped by default (``lookback_1m_minutes=0``) — the brain
             only needs ``len(c1) >= 1`` and the live-tick scanner provides
             that within seconds. Saves N getCandleData calls per restart.
@@ -328,6 +330,84 @@ class ScannerEngine:
             out[(h.exchange.upper(), str(h.token))] = float(h.last_price)
         return out
 
+    def _index_agg_key_for_underlying(self, underlying: str) -> str | None:
+        """Watchlist key ``EXCHANGE:TOKEN`` for an INDEX row matching ``underlying``."""
+        u = underlying.strip().upper()
+        if not u or u not in _INDEX_SIGNAL_UNDERLYINGS:
+            return None
+        wl = self.active_watchlist()
+        for ex, items in wl.items():
+            for it in items:
+                if str(it.get("kind") or "").upper() != "INDEX":
+                    continue
+                iu = str(it.get("underlying") or "").strip().upper()
+                if iu == u:
+                    tok = str(it.get("token") or "").strip()
+                    if tok:
+                        return f"{ex.upper()}:{tok}"
+        return None
+
+    def _brain_input_for_row(
+        self,
+        ex: str,
+        tok: str,
+        meta: dict[str, Any],
+        row_last: float | None,
+        spot_by_underlying: dict[str, float],
+    ) -> tuple[CandleAggregator, float | None]:
+        """Regime/scoring inputs: index spot + index candles for major-index options."""
+        kind = str(meta.get("kind") or "EQUITY").upper()
+        und = str(meta.get("underlying") or "").strip().upper()
+        key = f"{ex}:{tok}"
+        if kind == "OPTION" and und in _INDEX_SIGNAL_UNDERLYINGS:
+            idx_key = self._index_agg_key_for_underlying(und)
+            if idx_key is not None:
+                agg = self._aggs.get(idx_key)
+                spot = spot_by_underlying.get(und)
+                if agg is not None and spot is not None and spot > 0:
+                    return agg, spot
+        return self._aggs[key], row_last
+
+    def regime_data_readiness(self) -> dict[str, Any]:
+        """Share of watchlist rows with enough candles/session data for the regime gate.
+
+        Mirrors :func:`angel_bot.strategy.brain.regime_data_inputs_ready` across the last
+        poll's hits. Used by the dashboard warmup indicator (0–100%).
+        """
+        cfg = self.brain.config
+        if not cfg.selective_entry_enabled:
+            n = len(self._last_hits)
+            return {
+                "regime_data_pct": 100,
+                "regime_data_ready": n,
+                "regime_data_total": n,
+                "regime_data_selective": False,
+            }
+        hits = self._last_hits
+        total = len(hits)
+        if total == 0:
+            return {
+                "regime_data_pct": 0,
+                "regime_data_ready": 0,
+                "regime_data_total": 0,
+                "regime_data_selective": True,
+            }
+        ready = 0
+        for h in hits:
+            key = f"{h.exchange.upper()}:{h.token}"
+            agg = self._aggs.get(key)
+            if agg is None:
+                continue
+            if regime_data_inputs_ready(cfg, agg, h.last_price):
+                ready += 1
+        pct = int(round(100.0 * ready / float(total)))
+        return {
+            "regime_data_pct": pct,
+            "regime_data_ready": ready,
+            "regime_data_total": total,
+            "regime_data_selective": True,
+        }
+
     async def poll_once(
         self,
         api: SmartApiClient,
@@ -358,8 +438,7 @@ class ScannerEngine:
 
         now = datetime.now(UTC)
         now_iso = now.isoformat()
-        hits: list[ScannerHit] = []
-        hidden_unaffordable = 0
+        parsed: list[tuple[str, str, dict[str, Any], float | None, float | None]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -374,6 +453,21 @@ class ScannerEngine:
             if last is not None:
                 agg.push_ltp(last, ts=now)
             self._series_count[key] += 1
+            parsed.append((ex, tok, row, last, close))
+
+        spot_by_underlying: dict[str, float] = {}
+        for ex, tok, row, last, close in parsed:
+            m = meta.get((ex, tok), {})
+            if str(m.get("kind") or "").upper() == "INDEX" and last is not None and float(last) > 0:
+                und = str(m.get("underlying") or "").strip().upper()
+                if und:
+                    spot_by_underlying[und] = float(last)
+
+        hits: list[ScannerHit] = []
+        hidden_unaffordable = 0
+        for ex, tok, row, last, close in parsed:
+            key = f"{ex}:{tok}"
+            agg = self._aggs[key]
 
             change_pct = None
             if last is not None and close not in (None, 0):
@@ -420,14 +514,9 @@ class ScannerEngine:
                 is_affordable = False
                 hidden_unaffordable += 1
 
-            regime_blocked = False
-            regime_reason = ""
-            if self.brain.config.selective_entry_enabled and last is not None:
-                regime_blocked, regime_reason = pre_brain_regime_blocks(
-                    self.brain.config, agg, last
-                )
+            eval_agg, eval_price = self._brain_input_for_row(ex, tok, m, last, spot_by_underlying)
             if suppress_brain:
-                score_bd = self.brain.score_instrument(last_price=last, agg=agg)
+                score_bd = self.brain.score_instrument(last_price=eval_price, agg=eval_agg)
                 brain_out = BrainOutput(
                     score_bd,
                     Signal(
@@ -438,20 +527,8 @@ class ScannerEngine:
                     ),
                     {"brain_suppressed": suppress_reason, "score_inputs": score_bd.inputs},
                 )
-            elif regime_blocked:
-                score_bd = self.brain.score_instrument(last_price=last, agg=agg)
-                brain_out = BrainOutput(
-                    score_bd,
-                    Signal(
-                        "NO_TRADE",
-                        regime_reason,
-                        0.0,
-                        [EntryCheck("regime_pre_brain", False, regime_reason)],
-                    ),
-                    {"regime_block": regime_reason, "score_inputs": score_bd.inputs},
-                )
             else:
-                brain_out = self.brain.evaluate(last_price=last, agg=agg)
+                brain_out = self.brain.evaluate(last_price=eval_price, agg=eval_agg)
             c1, c5, c15 = agg.all_candles_including_partial()
 
             try:

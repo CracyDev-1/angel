@@ -460,6 +460,11 @@ export type WarmupBlock = {
   from_history: boolean;
   seeded_aggregators: number;
   warmed_tokens: number;
+  /** 0–100: share of watchlist rows with regime indicators loaded (not thin-history blocked). */
+  regime_data_pct?: number;
+  regime_data_ready?: number;
+  regime_data_total?: number;
+  regime_data_selective?: boolean;
 };
 
 export type LiveExitPlanRow = {

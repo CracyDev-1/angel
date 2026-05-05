@@ -61,12 +61,11 @@ def test_brain_clears_warmup_after_seeding() -> None:
     agg = CandleAggregator()
     brain = BrainEngine(BrainConfig(regime_fail_closed_indicators=False))
     base = datetime(2026, 5, 4, 9, 15, tzinfo=UTC)
-    # Brain warmup gate: ≥5 5m, ≥2 15m, ≥1 1m. Production backfill always
-    # seeds all three timeframes so this is the realistic path.
+    # Warmup gate: ≥10 5m buckets, ≥5 15m buckets, ≥1 1m; seed enough bars.
     agg.seed_history(
         candles_1m=_make_candles(base, 1, 30),
-        candles_5m=_make_candles(base, 5, 8),
-        candles_15m=_make_candles(base, 15, 3),
+        candles_5m=_make_candles(base, 5, 14),
+        candles_15m=_make_candles(base, 15, 6),
     )
     out = brain.evaluate(last_price=100.4, agg=agg)
     assert out.signal.reason != "warmup", (

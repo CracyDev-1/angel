@@ -485,17 +485,59 @@ function WarmupChip({
   botRunning: boolean;
 }) {
   if (!warmup || !botRunning) return null;
-  if (!warmup.from_history) return null;
-  if (warmup.warmed_tokens === 0) {
-    return (
+
+  const pct = warmup.regime_data_pct ?? 0;
+  const ready = warmup.regime_data_ready ?? 0;
+  const total = warmup.regime_data_total ?? 0;
+  const selective = warmup.regime_data_selective !== false;
+  const barColor =
+    pct >= 90 ? "bg-emerald-400/90" : pct >= 50 ? "bg-amber-400/90" : "bg-rose-400/80";
+
+  const historyNote =
+    warmup.from_history && warmup.warmed_tokens === 0 ? (
       <div className="mt-1 text-[10px] uppercase tracking-wider text-amber-300">
         Brain warmup: history fetch pending — collecting live ticks
       </div>
-    );
-  }
+    ) : warmup.from_history && warmup.warmed_tokens > 0 ? (
+      <div className="mt-0.5 text-[10px] uppercase tracking-wider text-slate-500">
+        History seed · {warmup.seeded_aggregators}/{warmup.warmed_tokens} tokens
+      </div>
+    ) : null;
+
   return (
-    <div className="mt-1 text-[10px] uppercase tracking-wider text-emerald-300/80">
-      Brain warmed from broker history · {warmup.seeded_aggregators}/{warmup.warmed_tokens} tokens seeded
+    <div className="mt-2 space-y-1">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-[10px] uppercase tracking-wider text-slate-400">
+          Regime data readiness
+        </span>
+        {!selective ? (
+          <span className="text-[11px] text-slate-500">— selective regime off</span>
+        ) : total === 0 ? (
+          <span className="text-[11px] text-amber-200/90">Waiting for first scan…</span>
+        ) : (
+          <>
+            <span
+              className={`text-xs font-semibold tabular-nums ${
+                pct >= 90 ? "text-emerald-300" : pct >= 50 ? "text-amber-200" : "text-rose-200"
+              }`}
+            >
+              {pct}%
+            </span>
+            <span className="text-[10px] text-slate-500">
+              ({ready}/{total} symbols)
+            </span>
+          </>
+        )}
+      </div>
+      {selective && total > 0 ? (
+        <div className="h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-slate-700/80">
+          <div
+            className={`h-full rounded-full transition-[width] duration-500 ${barColor}`}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      ) : null}
+      {historyNote}
     </div>
   );
 }
