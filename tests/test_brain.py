@@ -31,7 +31,15 @@ def test_brain_warmup_returns_no_trade_until_enough_bars():
 
 def test_brain_calls_on_clean_uptrend_breakout():
     agg = CandleAggregator()
-    brain = BrainEngine(BrainConfig(min_volatility_pct=0.05, min_15m_trend_slope=0.0001))
+    brain = BrainEngine(
+        BrainConfig(
+            min_volatility_pct=0.05,
+            min_15m_trend_slope=0.0001,
+            min_brain_score_0_100=0,
+            reference_max_distance_pct=0.0,
+            enable_breakout_bar_confirmation=False,
+        )
+    )
     base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
 
     # 30 minutes of monotonically rising prices, every 5s.
@@ -46,7 +54,7 @@ def test_brain_calls_on_clean_uptrend_breakout():
     # Should be a CALL or — at minimum — a partial CALL with high confidence.
     assert out.signal.side in ("BUY_CALL", "NO_TRADE")
     if out.signal.side == "NO_TRADE":
-        assert out.signal.reason.startswith("call_partial_")
+        assert "partial" in out.signal.reason
         assert out.signal.confidence >= 0.6
 
 
@@ -72,6 +80,9 @@ def test_scalp_pattern_fires_on_small_5m_push():
             min_15m_trend_slope=0.00005,
             scalp_min_5m_slope=0.0002,
             min_score_to_act=0.0,
+            min_brain_score_0_100=0,
+            enable_scalp_patterns=True,
+            selective_entry_enabled=False,
         )
     )
     base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
@@ -101,6 +112,9 @@ def test_scalp_pattern_skips_when_15m_strongly_against():
             min_15m_trend_slope=0.0003,     # active bias gate
             scalp_min_5m_slope=0.0002,
             min_score_to_act=0.0,
+            min_brain_score_0_100=0,
+            enable_scalp_patterns=True,
+            selective_entry_enabled=False,
         )
     )
     base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)

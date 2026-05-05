@@ -74,11 +74,6 @@ function classify(reason: string): { family: string; hint: string } {
       family: "risk:max_trades_today",
       hint: "RISK_MAX_TRADES_PER_DAY reached for today.",
     };
-  if (r.startsWith("risk:max_trades_hour"))
-    return {
-      family: "risk:max_trades_hour",
-      hint: "RISK_MAX_TRADES_PER_HOUR reached for the rolling 60-minute window.",
-    };
   if (r.startsWith("risk:no_capital"))
     return { family: "risk:no_capital", hint: "Effective capital resolved to 0 — check broker funds." };
   if (r.startsWith("risk:max_daily_loss"))

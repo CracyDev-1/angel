@@ -144,6 +144,12 @@ function Sidebar({ live }: { live: boolean }) {
           <Dot className="bg-emerald-400" /> Live
         </NavLink>
         <NavLink
+          to="/dashboard/analytics"
+          className={({ isActive }) => `${link} ${isActive ? active : inactive}`}
+        >
+          <Dot className="bg-teal-400" /> Analytics
+        </NavLink>
+        <NavLink
           to="/dashboard/history"
           className={({ isActive }) => `${link} ${isActive ? active : inactive}`}
         >

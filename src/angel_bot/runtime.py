@@ -78,7 +78,7 @@ class TradingRuntime:
         self.store = StateStore(self.settings.state_sqlite_path)
         self.scanner = ScannerEngine(self.settings)
         self.decisions = DecisionLog()
-        self.risk = RiskEngine(self.settings, store=self.store)
+        self.risk = RiskEngine(self.settings)
         self._dup_guard = DuplicateOrderGuard(ttl_s=60.0)
         self._tracker = OrderTracker(self.store)
         self.paper = PaperTrader(
@@ -110,6 +110,10 @@ class TradingRuntime:
         self.last_loop_at: str | None = None
         self.last_scan_summary: dict[str, Any] | None = None
         self.bot_started_at: str | None = None
+        self._loss_cooldown_until: datetime | None = None
+        # Last scanner `last_price` (underlying / index / equity) at a
+        # successful open — used to avoid re-entering in a tight band.
+        self._last_trade_anchor_price: float | None = None
         # How many aggregators were successfully seeded from broker history
         # at startup. 0 means we're back to live-tick warmup. Surfaced in
         # the snapshot so the dashboard can show "warmed from history".
@@ -815,18 +819,30 @@ class TradingRuntime:
         positions table and to surface the SL / TP / max-hold the bot will
         enforce on each one. Adopted plans show ``source='adopted'`` so the
         UI can label them as picked up from the Angel One platform.
+        ``initial_stop_price`` / ``peak_premium`` support showing trailing
+        vs fixed stop when ``TRAIL_STOP_ENABLED`` is on.
         """
         try:
             rows = self.store.list_open_live_exit_plans()
         except Exception as e:  # noqa: BLE001
             log.warning("live_exits_snapshot_failed", error=str(e))
-            return {"open": [], "managed_count": 0, "adopted_count": 0}
+            return {
+                "open": [],
+                "managed_count": 0,
+                "adopted_count": 0,
+                "trail_stop_enabled": bool(self.settings.trail_stop_enabled),
+            }
         out: list[dict[str, Any]] = []
         adopted = 0
+        s = self.settings
         for r in rows:
             src = str(r.get("source") or "bot").lower() or "bot"
             if src == "adopted":
                 adopted += 1
+            sp = r.get("stop_price")
+            isp = r.get("initial_stop_price")
+            if isp is None and sp is not None:
+                isp = sp
             out.append(
                 {
                     "plan_id": int(r.get("id") or 0),
@@ -839,7 +855,9 @@ class TradingRuntime:
                     "lot_size": int(r.get("lot_size") or 1),
                     "fill_price": r.get("fill_price"),
                     "planned_entry": r.get("planned_entry"),
-                    "stop_price": r.get("stop_price"),
+                    "stop_price": sp,
+                    "initial_stop_price": isp,
+                    "peak_premium": r.get("peak_premium"),
                     "target_price": r.get("target_price"),
                     "max_hold_minutes": int(r.get("max_hold_minutes") or 0),
                     "opened_at": r.get("opened_at"),
@@ -853,6 +871,7 @@ class TradingRuntime:
             "open": out,
             "managed_count": len(out),
             "adopted_count": adopted,
+            "trail_stop_enabled": bool(s.trail_stop_enabled),
         }
 
     def _deployable_cash(self, live_cash: float) -> float:
@@ -1099,6 +1118,120 @@ class TradingRuntime:
             out["paper_positions"] = self.store.list_recent_paper_positions(orders_limit)
         return out
 
+    def analytics(self, *, mode: str = "live", trades_limit: int = 300) -> dict[str, Any]:
+        """Aggregate daily P&L, per-trade stats, and equity curve for the analytics UI."""
+        m = (mode or "live").lower()
+        if m not in ("live", "dryrun"):
+            m = "live"
+        if m == "live":
+            all_days = self.store.all_mode_daily_stats("live")
+            seen = {d["day"] for d in all_days}
+            for d in self.store.all_daily_stats():
+                if d["day"] not in seen:
+                    all_days.append(d)
+            all_days.sort(key=lambda d: d["day"], reverse=True)
+            raw_closed = self.store.list_closed_live_plans(limit=trades_limit)
+            trades: list[dict[str, Any]] = []
+            for r in raw_closed:
+                trades.append(
+                    {
+                        "id": int(r.get("id") or 0),
+                        "closed_at": r.get("closed_at") or "",
+                        "opened_at": r.get("opened_at") or "",
+                        "tradingsymbol": r.get("tradingsymbol") or "",
+                        "exchange": r.get("exchange") or "",
+                        "symboltoken": r.get("symboltoken") or "",
+                        "side": str(r.get("side") or "").upper(),
+                        "qty": int(r.get("qty") or 0),
+                        "lots": int(r.get("lots") or 0),
+                        "entry_price": float(r.get("fill_price") or r.get("planned_entry") or 0.0),
+                        "exit_price": float(r.get("exit_price") or 0.0),
+                        "exit_reason": r.get("exit_reason") or "",
+                        "realized_pnl": float(r.get("realized_pnl") or 0.0),
+                        "source": str(r.get("source") or "bot").lower(),
+                        "underlying": r.get("underlying") or "",
+                    }
+                )
+        else:
+            all_days = self.store.all_mode_daily_stats("dryrun")
+            raw_closed = self.store.list_closed_paper_positions(limit=trades_limit)
+            trades = []
+            for r in raw_closed:
+                trades.append(
+                    {
+                        "id": int(r.get("id") or 0),
+                        "closed_at": r.get("closed_at") or "",
+                        "opened_at": r.get("opened_at") or "",
+                        "tradingsymbol": r.get("tradingsymbol") or "",
+                        "exchange": r.get("exchange") or "",
+                        "symboltoken": r.get("symboltoken") or "",
+                        "side": str(r.get("side") or "").upper(),
+                        "qty": int(r.get("qty") or 0),
+                        "lots": int(r.get("lots") or 0),
+                        "entry_price": float(r.get("entry_price") or 0.0),
+                        "exit_price": float(r.get("exit_price") or 0.0),
+                        "exit_reason": r.get("exit_reason") or "",
+                        "realized_pnl": float(r.get("realized_pnl") or 0.0),
+                        "source": "paper",
+                        "underlying": "",
+                    }
+                )
+
+        total_pnl = sum(float(d.get("pnl") or 0.0) for d in all_days)
+        total_trades_day = sum(int(d.get("trades") or 0) for d in all_days)
+        daily_asc = sorted(all_days, key=lambda d: str(d.get("day") or ""))
+        cumulative = 0.0
+        equity_curve: list[dict[str, Any]] = []
+        for d in daily_asc:
+            pnl = float(d.get("pnl") or 0.0)
+            cumulative += pnl
+            equity_curve.append(
+                {
+                    "day": d.get("day"),
+                    "pnl": round(pnl, 2),
+                    "cumulative_pnl": round(cumulative, 2),
+                    "trades": int(d.get("trades") or 0),
+                }
+            )
+
+        pnls = [float(t["realized_pnl"]) for t in trades]
+        wins = [p for p in pnls if p > 0.0]
+        losses = [p for p in pnls if p < 0.0]
+        n = len(pnls)
+        win_rate = (len(wins) / n) if n else None
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        profit_factor: float | None
+        if gross_loss > 0:
+            profit_factor = round(gross_profit / gross_loss, 3)
+        elif gross_profit > 0 and gross_loss == 0:
+            profit_factor = None
+        else:
+            profit_factor = 0.0
+
+        summary = {
+            "total_trades_closed": n,
+            "total_trades_daily_counter": int(total_trades_day),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 4) if win_rate is not None else None,
+            "total_pnl": round(total_pnl, 2),
+            "gross_profit": round(gross_profit, 2),
+            "gross_loss": round(-sum(losses), 2) if losses else 0.0,
+            "profit_factor": profit_factor,
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "days_traded": len(all_days),
+        }
+
+        return {
+            "mode": m,
+            "summary": summary,
+            "daily": [dict(d) for d in daily_asc],
+            "equity_curve": equity_curve,
+            "trades": trades,
+        }
+
     def _daily_stats(self) -> dict[str, Any]:
         trades, pnl = self.store.get_daily_stats()
         # Same priority as RiskEngine.effective_capital: explicit override
@@ -1167,6 +1300,7 @@ class TradingRuntime:
                     # daily_stats_mode['dryrun'] inside the paper trader.
                     paper_closures = self.paper.mark_and_close(self.scanner.latest_prices())
                     for ev in paper_closures:
+                        self._arm_loss_cooldown_after_negative_close(float(ev.realized_pnl))
                         self.decisions.add(
                             Decision(
                                 ts=DecisionLog.now_iso(),
@@ -1267,6 +1401,7 @@ class TradingRuntime:
                         live_closures = []
                         log.warning("live_exit_mark_and_close_failed", error=str(e))
                     for lev in live_closures:
+                        self._arm_loss_cooldown_after_negative_close(float(lev.realized_pnl))
                         src_tag = f" ({lev.source})" if lev.source and lev.source != "bot" else ""
                         self.decisions.add(
                             Decision(
@@ -1296,8 +1431,8 @@ class TradingRuntime:
                         )
 
                     # NEW: rank → take TOP-N → process each independently. The
-                    # max-concurrent + per-hour caps inside _consider_trade
-                    # naturally short-circuit further attempts when full.
+                    # max-concurrent gate inside _consider_trade short-circuits
+                    # further attempts when full.
                     candidates = self._select_top_candidates(
                         hits, positions, n=s.llm_top_n_candidates, deployable=deployable
                     )
@@ -1798,6 +1933,22 @@ class TradingRuntime:
             "index_unaffordable": int(self._last_index_unaffordable),
         }
 
+    def _loss_cooldown_active(self) -> bool:
+        until = self._loss_cooldown_until
+        if until is None:
+            return False
+        now = datetime.now(UTC)
+        if now >= until:
+            self._loss_cooldown_until = None
+            return False
+        return True
+
+    def _arm_loss_cooldown_after_negative_close(self, realized_pnl: float) -> None:
+        if realized_pnl >= 0:
+            return
+        n = max(1, int(self.settings.strategy_loss_cooldown_5m_bars))
+        self._loss_cooldown_until = datetime.now(UTC) + timedelta(minutes=5 * n)
+
     async def _consider_trade(self, api: SmartApiClient, hit: ScannerHit | None, deployable: float) -> None:
         s = self.settings
         if hit is None:
@@ -1809,6 +1960,30 @@ class TradingRuntime:
         if signal == "NO_TRADE":
             self._record_skip(hit=hit, signal=signal, reason=reason, price=hit.last_price)
             return
+
+        if self._loss_cooldown_active():
+            self._record_skip(
+                hit=hit, signal=signal, reason="loss_cooldown", price=hit.last_price
+            )
+            return
+
+        cl_pct = float(s.strategy_trade_cluster_pct or 0.0)
+        if (
+            cl_pct > 0
+            and self._last_trade_anchor_price is not None
+            and hit.last_price is not None
+            and self._last_trade_anchor_price > 0
+        ):
+            ref = self._last_trade_anchor_price
+            cur = float(hit.last_price)
+            if abs(cur - ref) / ref < cl_pct:
+                self._record_skip(
+                    hit=hit,
+                    signal=signal,
+                    reason="trade_cluster:near_last_anchor",
+                    price=hit.last_price,
+                )
+                return
 
         # Honor user kind toggles even if a stale candidate slipped through.
         kind_for_check = (hit.kind or "").upper()
@@ -2048,8 +2223,8 @@ class TradingRuntime:
                     "exit_plan": exit_plan_extra,
                 },
             )
-            # Update risk-engine entry count for the per-hour cap.
-            self.risk.record_entry()
+            if hit.last_price is not None and float(hit.last_price) > 0:
+                self._last_trade_anchor_price = float(hit.last_price)
             return
 
         # ------------------------------------------------------------------
@@ -2123,7 +2298,8 @@ class TradingRuntime:
             },
         )
         if oid:
-            self.risk.record_entry()
+            if hit.last_price is not None and float(hit.last_price) > 0:
+                self._last_trade_anchor_price = float(hit.last_price)
 
     # Skip reasons that are *stable* per (instrument, side) — i.e. they will
     # almost certainly fire again on every cycle until something the user
@@ -2139,6 +2315,7 @@ class TradingRuntime:
         "duplicate_order_window",
         "no_execution_price",
         "resolve:",
+        "trade_cluster",
     )
     _DEDUPE_WINDOW_S: float = 300.0
 

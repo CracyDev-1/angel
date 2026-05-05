@@ -142,8 +142,8 @@ class StateStore:
                 CREATE INDEX IF NOT EXISTS idx_live_exit_open
                   ON live_exit_plans(closed_at);
 
-                -- Persistent fragment of RiskState so the per-hour cap
-                -- survives a process restart.
+                -- Legacy table: rolling entry timestamps (historically used for a
+                -- per-hour trade cap; retained for DB compatibility).
                 CREATE TABLE IF NOT EXISTS risk_entries (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   entered_at TEXT NOT NULL
@@ -711,6 +711,34 @@ class StateStore:
                 LIMIT ?
                 """,
                 (str(since_iso), int(limit)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_closed_live_plans(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """All closed live exit plans (newest first), for analytics / dashboards."""
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM live_exit_plans
+                WHERE closed_at IS NOT NULL
+                ORDER BY closed_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_closed_paper_positions(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Closed paper positions (newest first), for analytics / dashboards."""
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT * FROM paper_positions
+                WHERE closed_at IS NOT NULL
+                ORDER BY closed_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
             ).fetchall()
             return [dict(r) for r in rows]
 

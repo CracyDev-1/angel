@@ -1,8 +1,5 @@
-"""Tests for the new risk-engine controls: hourly cap, N concurrent positions,
-and capital effective-source resolution."""
+"""Tests for risk-engine controls: concurrent positions and capital resolution."""
 from __future__ import annotations
-
-from datetime import datetime, timedelta, timezone
 
 from angel_bot.config import Settings
 from angel_bot.risk.engine import RiskEngine, position_size_for_stop
@@ -18,7 +15,6 @@ def _settings(**overrides) -> Settings:
         RISK_MAX_DAILY_LOSS_PCT="2.5",
         RISK_MAX_TRADES_PER_DAY="12",
         RISK_ONE_POSITION_AT_A_TIME="false",
-        RISK_MAX_TRADES_PER_HOUR="3",
         BOT_MAX_CONCURRENT_POSITIONS="3",
     )
     base.update(overrides)
@@ -53,45 +49,6 @@ def test_one_position_at_a_time_overrides_concurrent_cap():
     d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
     assert not d.allowed
     assert d.reason == "open_position"
-
-
-def test_hourly_cap_blocks_after_n_entries():
-    s = _settings(RISK_MAX_TRADES_PER_HOUR="2")
-    e = RiskEngine(s)
-    e.set_broker_cash(100_000)
-    now = datetime.now(timezone.utc)
-    e.record_entry(now - timedelta(minutes=10))
-    e.record_entry(now - timedelta(minutes=2))
-    d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
-    assert not d.allowed
-    assert "max_trades_hour" in d.reason
-
-
-def test_old_entries_drop_out_of_hourly_window():
-    s = _settings(RISK_MAX_TRADES_PER_HOUR="2")
-    e = RiskEngine(s)
-    e.set_broker_cash(100_000)
-    now = datetime.now(timezone.utc)
-    e.record_entry(now - timedelta(minutes=120))   # outside window
-    e.record_entry(now - timedelta(minutes=70))    # outside window
-    e.record_entry(now - timedelta(minutes=5))     # inside
-    d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
-    assert d.allowed
-    # And the bookkeeping list trimmed itself
-    assert e.trades_last_hour() == 1
-
-
-def test_zero_hourly_cap_disables_throttle():
-    """Default behaviour must allow unlimited entries when the cap is 0."""
-    s = _settings(RISK_MAX_TRADES_PER_HOUR="0")
-    e = RiskEngine(s)
-    e.set_broker_cash(100_000)
-    now = datetime.now(timezone.utc)
-    for i in range(20):
-        e.record_entry(now - timedelta(seconds=i))
-    d = e.evaluate_new_trade(entry=100, stop=99, lot_size=50)
-    assert d.allowed
-    assert "max_trades_hour" not in d.reason
 
 
 def test_zero_daily_cap_disables_throttle():

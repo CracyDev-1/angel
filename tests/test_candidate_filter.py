@@ -237,8 +237,8 @@ def test_dedupe_only_applies_to_stable_reason_families() -> None:
 
     rt._record_skip(hit=hit, signal="BUY_CALL", reason="warmup", price=None)
     rt._record_skip(hit=hit, signal="BUY_CALL", reason="warmup", price=None)
-    rt._record_skip(hit=hit, signal="BUY_CALL", reason="risk:max_trades_hour (2/2)", price=None)
-    rt._record_skip(hit=hit, signal="BUY_CALL", reason="risk:max_trades_hour (2/2)", price=None)
+    rt._record_skip(hit=hit, signal="BUY_CALL", reason="risk:max_trades_today", price=None)
+    rt._record_skip(hit=hit, signal="BUY_CALL", reason="risk:max_trades_today", price=None)
 
     assert len(rt.decisions.added) == 4
 

@@ -474,6 +474,10 @@ export type LiveExitPlanRow = {
   fill_price: number | null;
   planned_entry: number | null;
   stop_price: number;
+  /** Fixed stop at open / before trailing; same as stop_price if trail never moved. */
+  initial_stop_price?: number | null;
+  /** Highest option premium seen while managing (long CE/PE); drives trailing stop. */
+  peak_premium?: number | null;
   target_price: number;
   max_hold_minutes: number;
   opened_at: string | null;
@@ -487,6 +491,8 @@ export type LiveExitsBlock = {
   open: LiveExitPlanRow[];
   managed_count: number;
   adopted_count: number;
+  /** When true, bot may raise stop_price toward peak (trail); UI can label vs initial_stop_price. */
+  trail_stop_enabled?: boolean;
 };
 
 export type MarketStatus = {
@@ -516,4 +522,52 @@ export type HistoryResponse = {
   all_days: { day: string; trades: number; pnl: number }[];
   totals: { trades: number; realized_pnl: number; days_traded: number };
   paper_positions?: PaperPosition[];
+};
+
+export type AnalyticsTradeRow = {
+  id: number;
+  closed_at: string;
+  opened_at: string;
+  tradingsymbol: string;
+  exchange: string;
+  symboltoken: string;
+  side: string;
+  qty: number;
+  lots: number;
+  entry_price: number;
+  exit_price: number;
+  exit_reason: string;
+  realized_pnl: number;
+  source: string;
+  underlying: string;
+};
+
+export type AnalyticsEquityPoint = {
+  day: string;
+  pnl: number;
+  cumulative_pnl: number;
+  trades: number;
+};
+
+export type AnalyticsSummary = {
+  total_trades_closed: number;
+  total_trades_daily_counter: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  total_pnl: number;
+  gross_profit: number;
+  gross_loss: number;
+  profit_factor: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  days_traded: number;
+};
+
+export type AnalyticsResponse = {
+  mode: "live" | "dryrun";
+  summary: AnalyticsSummary;
+  daily: { day: string; trades: number; pnl: number }[];
+  equity_curve: AnalyticsEquityPoint[];
+  trades: AnalyticsTradeRow[];
 };

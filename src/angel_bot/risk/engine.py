@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-
-import structlog
+from dataclasses import dataclass
 
 from angel_bot.config import Settings, get_settings
 from angel_bot.state.store import StateStore
-
-log = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -45,60 +40,17 @@ class RiskState:
     # Live broker cash, refreshed by the runtime each loop. Used only when
     # RISK_CAPITAL_RUPEES is 0 (= "use broker cash").
     broker_available_cash: float = 0.0
-    # Rolling list of UTC timestamps of recent ENTRY events (any close type),
-    # used to enforce the per-hour cap. Trimmed on every check.
-    recent_entries: list[datetime] = field(default_factory=list)
 
 
 class RiskEngine:
-    def __init__(self, settings: Settings | None = None, store: StateStore | None = None):
+    def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.state = RiskState()
-        # Optional store reference enables write-through persistence of
-        # ``recent_entries`` so the per-hour cap survives a process restart.
-        self._store: StateStore | None = store
-        self._restored_from_store: bool = False
-
-    def attach_store(self, store: StateStore) -> None:
-        """Wire a SQLite store after construction. Idempotent."""
-        self._store = store
-        # Reset the restore flag so the next ``sync_from_store`` call rehydrates
-        # in-memory state from the freshly-attached store.
-        self._restored_from_store = False
 
     def sync_from_store(self, store: StateStore) -> None:
         trades, pnl = store.get_daily_stats()
         self.state.trades_today = trades
         self.state.realized_pnl_today = pnl
-        # Restore persistent risk fields exactly once per attached store. After
-        # the first call, in-memory state is the source of truth (every write
-        # already goes through the store anyway, so they stay in sync).
-        if not self._restored_from_store:
-            self._restore_persistent(store)
-            self._restored_from_store = True
-
-    def _restore_persistent(self, store: StateStore) -> None:
-        """Rehydrate ``recent_entries`` (within the 1h window) from SQLite."""
-        try:
-            snap = store.get_risk_state()
-        except Exception as e:  # noqa: BLE001
-            log.warning("risk_state_restore_failed", error=str(e))
-            return
-
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
-        loaded: list[datetime] = []
-        for ts in snap.get("recent_entries", []) or []:
-            t = _parse_iso(ts)
-            if t is None:
-                continue
-            if t >= cutoff:
-                loaded.append(t)
-        self.state.recent_entries = loaded
-        # Clean up anything we already filtered out so the table doesn't grow.
-        try:
-            store.trim_risk_entries(cutoff.isoformat())
-        except Exception as e:  # noqa: BLE001
-            log.warning("risk_state_trim_failed", error=str(e))
 
     def set_broker_cash(self, cash: float) -> None:
         """Runtime calls this once per loop with the latest broker cash."""
@@ -108,31 +60,6 @@ class RiskEngine:
         """Live count of currently-open positions (broker or paper)."""
         self.state.open_position_count = max(0, int(count or 0))
         self.state.has_open_position = self.state.open_position_count > 0
-
-    def record_entry(self, when: datetime | None = None) -> None:
-        """Call right after a successful order placement (live or paper).
-
-        Writes through to SQLite when a store is attached so the per-hour cap
-        survives a restart inside the trading session.
-        """
-        now = when or datetime.now(timezone.utc)
-        self.state.recent_entries.append(now)
-        # Trim anything older than 1h to keep the list bounded.
-        cutoff = now - timedelta(hours=1)
-        self.state.recent_entries = [t for t in self.state.recent_entries if t >= cutoff]
-        if self._store is not None:
-            try:
-                self._store.add_risk_entry(now.isoformat())
-                self._store.trim_risk_entries(cutoff.isoformat())
-            except Exception as e:  # noqa: BLE001
-                log.warning("risk_persist_entry_failed", error=str(e))
-
-    def trades_last_hour(self, now: datetime | None = None) -> int:
-        now = now or datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=1)
-        # Trim while we're here so the list doesn't grow unboundedly.
-        self.state.recent_entries = [t for t in self.state.recent_entries if t >= cutoff]
-        return len(self.state.recent_entries)
 
     def effective_capital(self) -> float:
         """Capital base for sizing + daily loss cap.
@@ -162,15 +89,7 @@ class RiskEngine:
         #    switch below is the real safety net).
         if s.risk_max_trades_per_day > 0 and self.state.trades_today >= s.risk_max_trades_per_day:
             return RiskDecision(False, 0, "max_trades_today")
-        # 3) per-hour trade-count cap (0 disables — same rationale).
-        if s.risk_max_trades_per_hour > 0:
-            n_hour = self.trades_last_hour()
-            if n_hour >= s.risk_max_trades_per_hour:
-                return RiskDecision(
-                    False, 0,
-                    f"max_trades_hour ({n_hour}/{s.risk_max_trades_per_hour})",
-                )
-        # 4) capital + daily-loss kill switch
+        # 3) capital + daily-loss kill switch
         capital = self.effective_capital()
         if capital <= 0:
             return RiskDecision(False, 0, "no_capital")
@@ -178,7 +97,7 @@ class RiskEngine:
         if self.state.realized_pnl_today <= loss_cap:
             return RiskDecision(False, 0, "max_daily_loss")
 
-        # 5) position sizing from stop distance
+        # 4) position sizing from stop distance
         qty = position_size_for_stop(
             capital=capital,
             risk_pct=s.risk_per_trade_pct,
@@ -189,17 +108,3 @@ class RiskEngine:
         if qty <= 0:
             return RiskDecision(False, 0, "zero_qty")
         return RiskDecision(True, qty, "ok")
-
-
-def _parse_iso(s: str) -> datetime | None:
-    """Robust ISO-8601 -> aware UTC datetime. Returns None on garbage input."""
-    if not s:
-        return None
-    try:
-        # Python 3.11+ accepts 'Z' suffix; older versions need replacement.
-        t = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=timezone.utc)
-    return t

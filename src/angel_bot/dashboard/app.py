@@ -225,6 +225,14 @@ def create_app() -> FastAPI:
         _check_dashboard_token(x_dashboard_token)
         return TradingRuntime.instance().history(orders_limit=200, mode=mode)
 
+    @app.get("/api/analytics")
+    async def api_analytics(
+        mode: str = "live",
+        x_dashboard_token: str | None = Header(default=None),
+    ) -> Any:
+        _check_dashboard_token(x_dashboard_token)
+        return TradingRuntime.instance().analytics(mode=mode, trades_limit=400)
+
     @app.post("/api/dryrun/capital")
     async def api_set_dryrun_capital(
         request: Request,

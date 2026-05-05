@@ -28,6 +28,12 @@ function planFor(
   );
 }
 
+function trailStopActive(plan: LiveExitPlanRow, trailEnabled: boolean | undefined): boolean {
+  if (!trailEnabled) return false;
+  const init = plan.initial_stop_price ?? plan.stop_price;
+  return Math.abs(plan.stop_price - init) > 1e-4;
+}
+
 export default function PositionsPanel({ positions, liveExits }: Props) {
   const rows = positions?.rows?.filter((r) => r.net_qty !== 0) ?? [];
   const qc = useQueryClient();
@@ -50,6 +56,7 @@ export default function PositionsPanel({ positions, liveExits }: Props) {
 
   const adoptedCount = liveExits?.adopted_count ?? 0;
   const managedCount = liveExits?.managed_count ?? 0;
+  const trailEnabled = liveExits?.trail_stop_enabled === true;
   const totalPnl = rows.reduce((s, r) => s + (r.pnl ?? 0), 0);
   const totalCap = rows.reduce((s, r) => s + (r.capital_used ?? 0), 0);
 
@@ -162,8 +169,34 @@ export default function PositionsPanel({ positions, liveExits }: Props) {
                     <td className="px-2 py-1.5 text-[10px]">
                       {plan ? (
                         <div className="text-slate-400">
-                          <span className="text-rose-300/80">SL </span>
-                          <span className="tabular-nums">{formatINR(plan.stop_price)}</span>{" "}
+                          {trailEnabled ? (
+                            <>
+                              <span className="text-amber-300/90">Trail SL </span>
+                              <span
+                                className="tabular-nums"
+                                title={
+                                  plan.peak_premium != null
+                                    ? `Peak premium ${formatINR(plan.peak_premium)}`
+                                    : "Current stop — ratchets up with peak premium when armed"
+                                }
+                              >
+                                {formatINR(plan.stop_price)}
+                              </span>
+                              {trailStopActive(plan, trailEnabled) ? (
+                                <>
+                                  <span className="text-slate-500"> · init </span>
+                                  <span className="tabular-nums text-slate-500">
+                                    {formatINR(plan.initial_stop_price ?? plan.stop_price)}
+                                  </span>{" "}
+                                </>
+                              ) : null}
+                            </>
+                          ) : (
+                            <>
+                              <span className="text-rose-300/80">SL </span>
+                              <span className="tabular-nums">{formatINR(plan.stop_price)}</span>{" "}
+                            </>
+                          )}
                           <span className="text-emerald-300/80">TP </span>
                           <span className="tabular-nums">{formatINR(plan.target_price)}</span>{" "}
                           <span className="text-slate-500">· {plan.max_hold_minutes}m</span>

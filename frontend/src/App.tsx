@@ -4,7 +4,7 @@ import { apiGet, type StatusResponse } from "./lib/api";
 import LoginPage from "./pages/LoginPage";
 import DashboardLayout from "./pages/DashboardLayout";
 import LivePage from "./pages/LivePage";
-import HistoryPage from "./pages/HistoryPage";
+import AnalyticsPage from "./pages/AnalyticsPage";
 import UniversePage from "./pages/UniversePage";
 
 function useStatus(intervalMs = 4000) {
@@ -58,7 +58,7 @@ export default function App() {
       >
         <Route index element={<Navigate to="live" replace />} />
         <Route path="live" element={<LivePage />} />
-        <Route path="history" element={<HistoryPage />} />
+        <Route path="analytics" element={<AnalyticsPage />} />
         <Route path="universe" element={<UniversePage />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard/live" replace />} />

@@ -6,6 +6,17 @@ from datetime import UTC, datetime
 
 
 @dataclass
+class BreakoutConfirmPending:
+    """5m bar bucket when a raw breakout first qualified; next bar may confirm."""
+
+    candle_bucket_start: datetime
+    side: str  # BUY_CALL | BUY_PUT
+    swing_level: float
+    candle_hi: float
+    candle_lo: float
+
+
+@dataclass
 class Candle:
     ts: datetime
     o: float
@@ -58,6 +69,8 @@ class CandleAggregator:
         self.session_low: float | None = None
         self._twap_sum: float = 0.0
         self._twap_n: int = 0
+        # One-bar-delay confirmation for breakout (see BrainEngine.evaluate).
+        self.breakout_confirm: BreakoutConfirmPending | None = None
 
     # ------------------------------------------------------------------
     # ingest
@@ -75,6 +88,7 @@ class CandleAggregator:
             self.session_low = price
             self._twap_sum = price
             self._twap_n = 1
+            self.breakout_confirm = None
         else:
             self.session_high = price if self.session_high is None else max(self.session_high, price)
             self.session_low = price if self.session_low is None else min(self.session_low, price)
@@ -145,6 +159,7 @@ class CandleAggregator:
         self._cur_1m = None
         self._cur_5m = None
         self._cur_15m = None
+        self.breakout_confirm = None
 
         # Reset session aggregates from the seeded data. Prefer 1m when
         # available (highest resolution), otherwise 5m, otherwise 15m.

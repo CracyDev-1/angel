@@ -93,11 +93,6 @@ class Settings(BaseSettings):
     risk_one_position_at_a_time: bool = Field(
         default=False, validation_alias="RISK_ONE_POSITION_AT_A_TIME"
     )
-    # Trades-per-hour cap (rolling 60-minute window). 0 disables (the
-    # default) — same rationale as the daily count cap.
-    risk_max_trades_per_hour: int = Field(
-        default=0, validation_alias="RISK_MAX_TRADES_PER_HOUR"
-    )
     # Legacy name — still respected for backwards-compat. Prefer
     # INSTRUMENT_MASTER_PATH below (works for JSON + CSV).
     instrument_master_csv: str | None = Field(default=None, validation_alias="INSTRUMENT_MASTER_CSV")
@@ -273,6 +268,32 @@ class Settings(BaseSettings):
     # brain produces lots of candidates → LLM classifier picks the cleanest
     # via LLM_DECISION_THRESHOLD. Brain = scout, LLM = sniper.
     strategy_min_score: float = Field(default=0.30, validation_alias="STRATEGY_MIN_SCORE")
+    strategy_min_brain_score_0_100: float = Field(
+        default=75.0, validation_alias="STRATEGY_MIN_BRAIN_SCORE_0_100"
+    )
+    strategy_reference_min_distance_pct: float = Field(
+        default=0.0015, validation_alias="STRATEGY_REFERENCE_MIN_DISTANCE_PCT"
+    )
+    strategy_reference_max_distance_pct: float = Field(
+        default=0.018, validation_alias="STRATEGY_REFERENCE_MAX_DISTANCE_PCT"
+    )
+    # Unified regime gate (brain selective mode): ADX floor, extension ADX, recent-range vs ATR.
+    strategy_regime_adx_min: float = Field(default=18.0, validation_alias="STRATEGY_REGIME_ADX_MIN")
+    strategy_regime_extension_adx_min: float = Field(
+        default=22.0, validation_alias="STRATEGY_REGIME_EXTENSION_ADX_MIN"
+    )
+    strategy_regime_recent_vol_atr_ratio: float = Field(
+        default=0.5, validation_alias="STRATEGY_REGIME_RECENT_VOL_ATR_RATIO"
+    )
+    strategy_loss_cooldown_5m_bars: int = Field(
+        default=3, validation_alias="STRATEGY_LOSS_COOLDOWN_5M_BARS"
+    )
+    # Block new entries when spot/underlying is within this fractional
+    # distance of the last successful open anchor (stops stop-out re-entry
+    # loops at the same level). 0 disables.
+    strategy_trade_cluster_pct: float = Field(
+        default=0.002, validation_alias="STRATEGY_TRADE_CLUSTER_PCT"
+    )
     # Pullback / continuation / scalp pattern detection thresholds
     strategy_pullback_min_uptrend_bars: int = Field(
         default=2, validation_alias="STRATEGY_PULLBACK_MIN_UPTREND_BARS"

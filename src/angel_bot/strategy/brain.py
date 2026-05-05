@@ -33,9 +33,11 @@ Constraints we are honest about:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
-from angel_bot.market_data.candles import CandleAggregator
+from angel_bot.market_data.candles import BreakoutConfirmPending, Candle, CandleAggregator
+from angel_bot.strategy.indicators import wilder_adx, wilder_atr
 
 
 # ----------------------------------------------------------------------
@@ -49,39 +51,105 @@ class BrainConfig:
     min_volatility_pct: float = 0.10      # was 0.20; 0.10% intraday range = OK
     max_chop_score: float = 0.80          # was 0.70; only the *very* sideways stuff is rejected
 
+    # Master switch: selective gates + weighted tie-break + pattern toggles.
+    # When False, legacy permissive behavior (for tests): loose regime, scalp on.
+    selective_entry_enabled: bool = True
+
     # Entry timing thresholds — 5m PRIMARY, 15m bias-only.
-    # Lowered ~3× so a 100-200pt NIFTY push (≈ 0.04-0.08%) actually qualifies.
-    min_15m_trend_slope: float = 0.0002          # was 0.0003 — bias gate, very loose
-    min_5m_trend_slope: float = 0.0003           # was 0.0008 — PRIMARY gate, fires on small pushes
-    min_5m_breakout_clearance: float = 0.0003    # was 0.0006 — accept tiny clean break
-    near_breakout_clearance: float = 0.0030      # was 0.0020 — wider near-breakout band
-    max_late_entry_pct: float = 0.0200           # was 0.0080 — allow 2% late, exits do the protecting
+    min_15m_trend_slope: float = 0.0002
+    min_5m_trend_slope: float = 0.0003
+    min_5m_breakout_clearance: float = 0.0003
+    near_breakout_clearance: float = 0.0030
+    max_late_entry_pct: float = 0.0200
     min_above_twap_pct: float = 0.0
 
-    # Pullback (uptrend retracement) — easier to satisfy
-    pullback_min_uptrend_bars: int = 2            # was 3
-    pullback_max_retracement_pct: float = 0.020   # was 0.012 — allow deeper pullbacks
+    # --- Regime gate (sideways chop + weak trend strength) ---
+    # If both |5m| and |15m| slopes are below these (fractional per bar window), NO_TRADE.
+    # Set to 0.0 to disable that branch.
+    regime_min_abs_slope_5m: float = 0.00008
+    regime_min_abs_slope_15m: float = 0.00006
+    # ADX on closed 5m bars (Wilder). If None from insufficient data, gate skipped.
+    # Set regime_adx_min to 0.0 to disable ADX gate.
+    regime_adx_period: int = 14
+    regime_adx_min: float = 18.0
+    # When |price−TWAP|/TWAP exceeds reference_max_distance_pct, allow only if trend strong + fresh leg.
+    regime_extension_adx_min: float = 22.0
+    # Block when last-N 5m range is below this fraction of ATR(14) (dead tape).
+    regime_recent_vol_atr_ratio: float = 0.5
 
-    # Continuation (consolidation after breakout) — easier to satisfy
+    # TWAP is session mean of polled LTPs (not exchange VWAP — see module docstring).
+    # If price is within this fractional distance of TWAP, NO_TRADE (chop zone).
+    # 0.0 disables.
+    min_twap_deviation_pct: float = 0.0004
+    # TWAP distance band (vs TWAP): too close = chop, too far = exhaustion.
+    reference_min_distance_pct: float = 0.0015
+    reference_max_distance_pct: float = 0.018
+
+    # Directional enforcement for selective mode: require 15m slope sign, TWAP side, structure.
+    directional_bias_enabled: bool = True
+    directional_15m_eps: float = 0.00005  # must be clearly positive/negative
+
+    # Strict structure: breakout/breakdown beyond prior swing (additional fractional clearance).
+    strict_swing_break_eps: float = 0.00015
+
+    # Pattern toggles (selective mode defaults: structural only, no scalp).
+    enable_pullback_patterns: bool = False
+    enable_scalp_patterns: bool = False
+    enable_continuation_patterns: bool = False
+
+    # Pullback / continuation params (unchanged semantics)
+    pullback_min_uptrend_bars: int = 2
+    pullback_max_retracement_pct: float = 0.020
     continuation_consolidation_bars: int = 2
-    continuation_max_range_pct: float = 0.006     # was 0.004 — looser consolidation
+    continuation_max_range_pct: float = 0.006
 
-    # SCALP / MOMENTUM — the high-frequency path. Only 3 checks:
-    # 5m up-slope (any), 1m close in direction, 15m not against.
-    # Designed to catch 100-200pt NIFTY-style pushes without waiting for
-    # full breakout structure. The LLM classifier acts as the quality gate.
     scalp_min_5m_slope: float = 0.0003
 
     # score weights — 5m focused. volume_w stays 0 until WS quote.
     w_volatility: float = 0.25
     w_momentum: float = 0.45
-    w_breakout: float = 0.30      # 5m STRUCTURE slot
+    w_breakout: float = 0.30
     w_volume: float = 0.00
 
     # ranking gate (used by runtime). 0..1 scale.
-    # Lowered to 0.30 so brain produces many candidates → LLM classifier
-    # then decides which actually trade (LLM_DECISION_THRESHOLD enforces quality).
     min_score_to_act: float = 0.30
+
+    # Weighted checklist quality (tie-break and optional partial threshold)
+    pattern_weight_trend: float = 0.45
+    pattern_weight_structure: float = 0.35
+    pattern_weight_vol_proxy: float = 0.15
+    pattern_weight_momentum: float = 0.05
+    # Minimum weighted checklist score to accept a pattern (0..1).
+    min_pattern_score: float = 0.72
+    # If no pattern reaches min_pattern_score with all checks True, allow best partial
+    # only if fraction of passing checks >= this AND weighted score >= min_pattern_score.
+    min_pattern_check_ratio: float = 0.85
+
+    # --- Breakout quality (extension / spike / confirm bar / HTF / score floor) ---
+    breakout_max_extension_pct: float = 0.0035
+    breakout_max_distance_from_level_pct: float = 0.004
+    breakout_spike_range_mult: float = 1.8
+    breakout_spike_avg_bars: int = 10
+    breakout_confirm_max_retrace_of_range: float = 0.30
+    enable_breakout_bar_confirmation: bool = True
+    require_strict_htf_trend: bool = True
+    min_htf_slope_eps: float = 0.0
+    # Minimum brain ranking score on 0..100 scale before any trade (0 = disabled).
+    min_brain_score_0_100: float = 75.0
+    # Reject when session range %% of price below this (low-volatility days). 0 disables.
+    min_session_range_pct_breakout: float = 0.0
+
+    # ATR(14) on 5m vs distance from swing (weak move / exhaustion). Disabled if atr None.
+    atr_period: int = 14
+    breakout_atr_min_multiple: float = 0.5
+    breakout_atr_max_multiple: float = 2.0
+
+    # Penalties applied to ranking score (0..1): reduce weight of late / spike candles.
+    rank_penalty_move_scale: float = 25.0
+    rank_penalty_spike_scale: float = 0.12
+
+    # Global regime: reject when |15m slope| below this (too flat). 0 disables.
+    regime_global_flat_slope_eps: float = 0.00005
 
 
 # ----------------------------------------------------------------------
@@ -173,10 +241,294 @@ def _chop(closes: list[float]) -> float | None:
     return flips / max(1, len(dirs) - 1)
 
 
-def _scale(value: float, lo: float, hi: float) -> float:
-    if hi <= lo:
+def _check_weight_category(name: str) -> str:
+    n = name.lower()
+    if n.startswith("trend_") or "uptrend" in n or "downtrend" in n:
+        return "trend"
+    if any(
+        x in n
+        for x in (
+            "breakout",
+            "breakdown",
+            "pullback",
+            "consolidation",
+            "broke_out",
+            "resume",
+            "volatility_ok",
+            "chop_ok",
+        )
+    ):
+        return "structure"
+    if "volatility" in n or "chop" in n:
+        return "vol"
+    return "momentum"
+
+
+def _weighted_checklist_score(checks: list[EntryCheck], cfg: BrainConfig) -> float:
+    wt = cfg.pattern_weight_trend
+    ws = cfg.pattern_weight_structure
+    wv = cfg.pattern_weight_vol_proxy
+    wm = cfg.pattern_weight_momentum
+    num = 0.0
+    den = 0.0
+    for c in checks:
+        cat = _check_weight_category(c.name)
+        w = wt if cat == "trend" else ws if cat == "structure" else wv if cat == "vol" else wm
+        num += w * (1.0 if c.ok else 0.0)
+        den += w
+    return num / den if den > 0 else 0.0
+
+
+def _pick_rank_tuple(wscore: float, chase_pct: float, pattern: str) -> tuple[float, float, str]:
+    """Prefer higher weighted score, then less extension past structure (lower chase_pct)."""
+    return (wscore, -chase_pct, pattern)
+
+
+def _avg_candle_range_5m(c5_closed: list[Candle], last_n: int) -> float | None:
+    if len(c5_closed) < 2 or last_n < 1:
+        return None
+    tail = c5_closed[-(last_n + 1) : -1]
+    if not tail:
+        return None
+    ranges = [max(1e-12, b.h - b.low) for b in tail]
+    return sum(ranges) / len(ranges)
+
+
+def _recent_high_low_range_5m(c5_closed: list[Candle], *, last_n: int = 5) -> float | None:
+    """Absolute high-low span of the last ``last_n`` closed 5m bars (price units)."""
+    if len(c5_closed) < last_n or last_n < 1:
+        return None
+    tail = c5_closed[-last_n:]
+    hi = max(b.h for b in tail)
+    lo = min(b.low for b in tail)
+    return float(hi - lo)
+
+
+def unified_regime_gate(
+    cfg: BrainConfig,
+    agg: CandleAggregator,
+    last_price: float | None,
+) -> tuple[bool, str]:
+    """STEP 1–7 unified regime (selective mode).
+
+    Returns (True, reason) when entries should be blocked, else (False, "").
+
+    Basic guards (bad price or thin candles) intentionally do **not** block —
+    the scanner/brain will surface warmup/no-data elsewhere.
+    """
+    if not cfg.selective_entry_enabled:
+        return False, ""
+    if last_price is None or last_price <= 0:
+        return False, ""
+
+    c1, c5, c15 = agg.all_candles_including_partial()
+    # STEP 1: insufficient structure → do not regime-block here
+    if len(c5) < 5 or len(c15) < 3:
+        return False, ""
+
+    # STEP 2: slope on last 8–10 fifteen-minute closes (requires ≥3 bars).
+    n15 = min(10, len(c15))
+    if n15 < 3:
+        return False, ""
+    m15_closes = [b.c for b in c15[-n15:]]
+    slope_15m = _slope(m15_closes) or 0.0
+
+    c5_closed = agg.snapshot_lists()[1]
+    adx_5m = wilder_adx(c5_closed, period=cfg.regime_adx_period)
+    atr_5m = wilder_atr(c5_closed, period=cfg.atr_period)
+    recent_range = _recent_high_low_range_5m(c5_closed, last_n=5)
+
+    twap = agg.session_twap
+    dist: float | None = None
+    if twap is not None and twap > 0:
+        dist = abs(float(last_price) - twap) / twap
+
+    # STEP 3 — hard rejection
+    if cfg.regime_global_flat_slope_eps > 0 and abs(slope_15m) < cfg.regime_global_flat_slope_eps:
+        return True, "regime:flat_htf"
+    if cfg.regime_adx_min > 0 and adx_5m is not None and adx_5m < cfg.regime_adx_min:
+        return True, "regime:low_adx"
+    if (
+        atr_5m is not None
+        and atr_5m > 0
+        and recent_range is not None
+        and recent_range < cfg.regime_recent_vol_atr_ratio * atr_5m
+    ):
+        return True, "regime:low_volatility"
+
+    chop_frac = cfg.reference_min_distance_pct  # spec: ~0.0015 TWAP chop zone
+    if dist is not None and chop_frac > 0 and dist < chop_frac:
+        return True, "regime:twap_chop"
+
+    # STEP 4–6 — extension (dist beyond reference_max): smart filter, not instant hard block
+    max_ref = cfg.reference_max_distance_pct
+    if dist is not None and max_ref > 0 and float(dist) > float(max_ref):
+        sw5 = _swing([b.h for b in c5[-20:-1]], [b.low for b in c5[-20:-1]])
+        if sw5 is None:
+            return True, "regime:twap_extended_weak"
+        prev_hi, prev_lo = sw5
+        chase_hi = _breakout_chase_pct("BUY_CALL", float(last_price), prev_hi)
+        chase_lo = _breakout_chase_pct("BUY_PUT", float(last_price), prev_lo)
+
+        if twap is not None:
+            if float(last_price) > twap:
+                move_pct = chase_hi
+            elif float(last_price) < twap:
+                move_pct = chase_lo
+            else:
+                move_pct = max(chase_hi, chase_lo)
+        else:
+            move_pct = min(chase_hi, chase_lo)
+
+        spike_ok = True
+        if len(c5_closed) >= cfg.breakout_spike_avg_bars + 1:
+            lb = c5_closed[-1]
+            rng_last = lb.h - lb.low
+            avg_r = _avg_candle_range_5m(c5_closed, cfg.breakout_spike_avg_bars)
+            if avg_r is not None and avg_r > 0:
+                spike_ok = rng_last <= cfg.breakout_spike_range_mult * avg_r
+
+        fresh = move_pct < cfg.breakout_max_extension_pct
+        adx_strong = adx_5m is not None and adx_5m > cfg.regime_extension_adx_min
+        if not (fresh and spike_ok and adx_strong):
+            return True, "regime:twap_extended_weak"
+
+    return False, ""
+
+
+def pre_brain_regime_blocks(
+    cfg: BrainConfig,
+    agg: CandleAggregator,
+    last_price: float | None,
+) -> tuple[bool, str]:
+    """Scanner-side regime veto — mirrors :func:`unified_regime_gate`."""
+    return unified_regime_gate(cfg, agg, last_price)
+
+
+def _breakout_chase_pct(side: str, last_price: float, level: float) -> float:
+    if level <= 0:
         return 0.0
-    return max(0.0, min(1.0, (value - lo) / (hi - lo)))
+    return abs(last_price - level) / level
+
+
+def _breakout_confirm_allow(
+    cfg: BrainConfig,
+    agg: CandleAggregator,
+    *,
+    side: str,
+    swing_hi: float,
+    swing_lo: float,
+    last_price: float,
+    cur_bucket_start: datetime,
+    bo_bar_hi: float,
+    bo_bar_lo: float,
+) -> tuple[bool, str | None]:
+    """One 5m-bar confirmation delay after raw breakout. Mutates agg.breakout_confirm."""
+    if not cfg.enable_breakout_bar_confirmation or not cfg.selective_entry_enabled:
+        return True, None
+
+    pend = agg.breakout_confirm
+    cur = cur_bucket_start
+    level = swing_hi if side == "BUY_CALL" else swing_lo
+
+    if pend is not None and pend.side != side:
+        agg.breakout_confirm = None
+        pend = None
+
+    if pend is None:
+        agg.breakout_confirm = BreakoutConfirmPending(
+            candle_bucket_start=cur,
+            side=side,
+            swing_level=level,
+            candle_hi=bo_bar_hi,
+            candle_lo=bo_bar_lo,
+        )
+        return False, "breakout:pending_confirm"
+
+    if pend.candle_bucket_start == cur:
+        return False, "breakout:on_breakout_bar"
+
+    next_ts = pend.candle_bucket_start + timedelta(minutes=5)
+    if cur == next_ts:
+        R = max(1e-12, pend.candle_hi - pend.candle_lo)
+        if side == "BUY_CALL":
+            retrace = (
+                max(0.0, (pend.candle_hi - last_price) / R)
+                if last_price < pend.candle_hi
+                else 0.0
+            )
+        else:
+            retrace = (
+                max(0.0, (last_price - pend.candle_lo) / R)
+                if last_price > pend.candle_lo
+                else 0.0
+            )
+        ok_rt = retrace <= cfg.breakout_confirm_max_retrace_of_range
+        agg.breakout_confirm = None
+        if ok_rt:
+            return True, None
+        return False, "breakout:retrace_too_deep"
+
+    if cur > next_ts:
+        agg.breakout_confirm = BreakoutConfirmPending(
+            candle_bucket_start=cur,
+            side=side,
+            swing_level=level,
+            candle_hi=bo_bar_hi,
+            candle_lo=bo_bar_lo,
+        )
+        return False, "breakout:pending_confirm"
+
+    return False, "breakout:pending_confirm"
+
+
+def _penalized_rank_score(
+    base: ScoreBreakdown,
+    cfg: BrainConfig,
+    *,
+    chase_hi: float,
+    chase_lo: float,
+    rng_last5: float,
+    avg_r: float | None,
+) -> ScoreBreakdown:
+    """Lower ranking score when extension/spike vs avg range is large (anti-chase)."""
+    move = max(chase_hi, chase_lo)
+    pen_m = cfg.rank_penalty_move_scale * move
+    pen_s = 0.0
+    if avg_r and avg_r > 0 and rng_last5 >= 0:
+        pen_s = cfg.rank_penalty_spike_scale * max(0.0, rng_last5 / avg_r - 1.0)
+    pen = min(0.95, pen_m + pen_s)
+    adj = max(0.0, min(1.0, base.total - pen))
+    inp = dict(base.inputs)
+    inp["ranking_penalty"] = round(pen, 4)
+    inp["raw_score_total"] = base.total
+    return ScoreBreakdown(
+        total=round(adj, 4),
+        volatility=base.volatility,
+        momentum=base.momentum,
+        breakout=base.breakout,
+        volume=base.volume,
+        inputs=inp,
+    )
+
+
+def _entry_check_atr_breakout(
+    cfg: BrainConfig,
+    atr: float | None,
+    last_price: float,
+    level: float,
+    label: str,
+) -> EntryCheck:
+    if atr is None or atr <= 0:
+        return EntryCheck("breakout_atr_band", True, "ATR n/a — band skipped")
+    sz = abs(last_price - level)
+    ok = (sz >= cfg.breakout_atr_min_multiple * atr) and (sz <= cfg.breakout_atr_max_multiple * atr)
+    return EntryCheck(
+        "breakout_atr_band",
+        ok,
+        f"{label}: |price−level|={sz:.4f} ATR={atr:.4f} "
+        f"(band {cfg.breakout_atr_min_multiple:.1f}–{cfg.breakout_atr_max_multiple:.1f}×)",
+    )
 
 
 # ----------------------------------------------------------------------
@@ -204,6 +556,13 @@ class BrainEngine:
         Structure = max(breakout proximity, pullback bounce, continuation tightness).
         """
         cfg = self.config
+
+        def norm_band(x: float, lo: float, hi: float) -> float:
+            """Linear map x from [lo, hi] to [0, 1], clamped (module-safe)."""
+            if hi <= lo:
+                return 0.0
+            return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
         if last_price is None or last_price <= 0:
             return ScoreBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, {"reason": "no_price"})
 
@@ -213,12 +572,12 @@ class BrainEngine:
         sess_range_pct = 0.0
         if agg.session_high is not None and agg.session_low is not None and last_price:
             sess_range_pct = (agg.session_high - agg.session_low) / last_price
-        vol_norm = _scale(sess_range_pct * 100.0, 0.10, 1.50)  # 0.1% .. 1.5%
+        vol_norm = norm_band(sess_range_pct * 100.0, 0.10, 1.50)  # 0.1% .. 1.5%
 
         # 2) momentum — 5m close-to-close slope is now PRIMARY
         m5_closes = [b.c for b in c5[-5:]]
         slope5 = abs(_slope(m5_closes) or 0.0)
-        mom_norm = _scale(slope5 * 100.0, 0.05, 1.20)        # 0.05% .. 1.2%
+        mom_norm = norm_band(slope5 * 100.0, 0.05, 1.20)  # 0.05% .. 1.2%
 
         # 15m kept around as bias only — included in inputs, NOT in score.
         m15_closes = [b.c for b in c15[-5:]]
@@ -317,7 +676,7 @@ class BrainEngine:
         # least one 1m bar because the pattern-detection block below indexes
         # ``c1[-1]`` for the last 1m candle — historical-candle backfill
         # may seed only 5m + 15m for instruments with no 1m history.
-        if len(c5) < 5 or len(c15) < 2 or len(c1) < 1:
+        if len(c5) < 5 or len(c15) < 3 or len(c1) < 1:
             return BrainOutput(
                 score,
                 Signal(
@@ -328,7 +687,7 @@ class BrainEngine:
                         EntryCheck(
                             "warmup",
                             False,
-                            f"need>=5 5m, >=2 15m, >=1 1m (have {len(c5)}/{len(c15)}/{len(c1)})",
+                            f"need>=5 5m, >=3 15m, >=1 1m (have {len(c5)}/{len(c15)}/{len(c1)})",
                         )
                     ],
                 ),
@@ -366,6 +725,51 @@ class BrainEngine:
                 diag,
             )
 
+        # Optional: reject dead sessions with tiny intraday range (% of price).
+        if (
+            cfg.min_session_range_pct_breakout > 0
+            and sess_range_pct * 100.0 < cfg.min_session_range_pct_breakout
+        ):
+            return BrainOutput(
+                score,
+                Signal(
+                    "NO_TRADE",
+                    "regime:low_session_range",
+                    0.0,
+                    [
+                        EntryCheck(
+                            "session_range_ok",
+                            False,
+                            f"range {sess_range_pct * 100.0:.3f}% < min "
+                            f"{cfg.min_session_range_pct_breakout:.3f}%",
+                        )
+                    ],
+                ),
+                diag,
+            )
+
+        # ---- unified regime gate (same logic as scanner pre_brain / STEP 1–7) ----
+        if cfg.selective_entry_enabled:
+            regime_block, regime_reason = unified_regime_gate(cfg, agg, last_price)
+            if regime_block:
+                return BrainOutput(
+                    score,
+                    Signal(
+                        "NO_TRADE",
+                        regime_reason,
+                        0.0,
+                        filters
+                        + [
+                            EntryCheck(
+                                "unified_regime_gate",
+                                False,
+                                regime_reason,
+                            )
+                        ],
+                    ),
+                    diag,
+                )
+
         # ---- multi-timeframe context ----
         m15_closes = [b.c for b in c15[-5:]]
         m5_closes = [b.c for b in c5[-5:]]
@@ -387,26 +791,158 @@ class BrainEngine:
         bullish_1m = body > 0 and (body / rng_1m) >= 0.45
         bearish_1m = body < 0 and (-body / rng_1m) >= 0.45
 
+        c5_closed = agg.snapshot_lists()[1]
+        adx_5m = wilder_adx(c5_closed, period=cfg.regime_adx_period)
+        twap_dev = None
+        twap_dist_vs_twap: float | None = None
+        if twap is not None and last_price and last_price > 0:
+            twap_dev = abs(last_price - twap) / last_price
+            if twap > 0:
+                twap_dist_vs_twap = abs(last_price - twap) / twap
+
         diag.update(
             {
                 "slope_15m": round(slope_15m * 100.0, 4),
                 "slope_5m": round(slope_5m * 100.0, 4),
                 "ret_1": round(ret_1 * 100.0, 4),
                 "twap": twap,
+                "twap_deviation_pct": round((twap_dev or 0.0) * 100.0, 5) if twap_dev is not None else None,
+                "twap_distance_vs_twap_pct": round((twap_dist_vs_twap or 0.0) * 100.0, 5)
+                if twap_dist_vs_twap is not None
+                else None,
+                "adx_5m": round(adx_5m, 3) if adx_5m is not None else None,
                 "swing_hi_5m": prev_swing_hi,
                 "swing_lo_5m": prev_swing_lo,
                 "chop": chop,
             }
         )
 
-        # ---- pattern detection (CALL side) -------------------------------
         # 5m PRIMARY trend gate; 15m bias-only ("not against").
         c5_recent = c5[-(cfg.pullback_min_uptrend_bars + 1) :]
         uptrend_bars = sum(1 for b in c5_recent[:-1] if b.c > b.o)
         downtrend_bars = sum(1 for b in c5_recent[:-1] if b.c < b.o)
 
-        # CALL — breakout (now allows near-breakout, not just strict cross)
+        retracement = (
+            (prev_swing_hi - last_price) / prev_swing_hi if prev_swing_hi else 0.0
+        )
+        retracement_dn = (
+            (last_price - prev_swing_lo) / prev_swing_lo if prev_swing_lo else 0.0
+        )
+
+        cont_recent = c5[-cfg.continuation_consolidation_bars :]
+        if cont_recent:
+            cons_hi = max(b.h for b in cont_recent)
+            cons_lo = min(b.low for b in cont_recent)
+            cons_range_pct = (cons_hi - cons_lo) / cons_hi if cons_hi else 0.0
+        else:
+            cons_hi = cons_lo = 0.0
+            cons_range_pct = 0.0
+
+        dir_eps = cfg.directional_15m_eps
+        if cfg.selective_entry_enabled and cfg.directional_bias_enabled:
+            # Strict TWAP side (STEP 5): calls only above TWAP, puts only below; 15m slope must align.
+            if twap is not None and twap > 0:
+                allow_call = last_price > twap and slope_15m >= dir_eps
+                allow_put = last_price < twap and slope_15m <= -dir_eps
+            else:
+                allow_call = slope_15m >= dir_eps
+                allow_put = slope_15m <= -dir_eps
+        else:
+            allow_call = allow_put = True
+        diag["allow_call"] = allow_call
+        diag["allow_put"] = allow_put
+
+        chase_hi = _breakout_chase_pct("BUY_CALL", last_price, prev_swing_hi)
+        chase_lo = _breakout_chase_pct("BUY_PUT", last_price, prev_swing_lo)
+
+        avg_r_spike: float | None = None
+        rng_last5 = 0.0
+        spike_vs_avg_ok = True
+        spike_detail = "need more 5m history for spike filter"
+        if len(c5_closed) >= cfg.breakout_spike_avg_bars + 1:
+            lb = c5_closed[-1]
+            rng_last5 = lb.h - lb.low
+            avg_r_spike = _avg_candle_range_5m(c5_closed, cfg.breakout_spike_avg_bars)
+            if avg_r_spike and avg_r_spike > 0:
+                spike_vs_avg_ok = rng_last5 <= cfg.breakout_spike_range_mult * avg_r_spike
+                spike_detail = (
+                    f"last 5m range {rng_last5:.4f} vs avg({cfg.breakout_spike_avg_bars}) "
+                    f"{avg_r_spike:.4f} (reject if range > {cfg.breakout_spike_range_mult}x avg)"
+                )
+
+        atr_last = wilder_atr(c5_closed, period=cfg.atr_period)
+        score_out = _penalized_rank_score(
+            score,
+            cfg,
+            chase_hi=chase_hi,
+            chase_lo=chase_lo,
+            rng_last5=rng_last5,
+            avg_r=avg_r_spike,
+        )
+        diag["ranking_total"] = score_out.total
+        if atr_last is not None:
+            diag["atr_5m"] = round(atr_last, 4)
+
+        if cfg.min_brain_score_0_100 > 0 and score_out.total * 100.0 < cfg.min_brain_score_0_100:
+            return BrainOutput(
+                score_out,
+                Signal(
+                    "NO_TRADE",
+                    "score:below_min",
+                    0.0,
+                    [
+                        EntryCheck(
+                            "min_brain_score",
+                            False,
+                            f"ranking score {score_out.total * 100.0:.1f} < {cfg.min_brain_score_0_100:.0f}",
+                        )
+                    ],
+                ),
+                diag,
+            )
+
+        eps_htf = cfg.min_htf_slope_eps
+        if cfg.require_strict_htf_trend:
+            call_15m_entry = EntryCheck(
+                "htf_trend_align",
+                slope_15m > eps_htf,
+                f"15m slope {slope_15m * 100.0:.4f}% must be > 0 for CALL breakout",
+            )
+            put_15m_entry = EntryCheck(
+                "htf_trend_align",
+                slope_15m < -eps_htf,
+                f"15m slope {slope_15m * 100.0:.4f}% must be < 0 for PUT breakout",
+            )
+        else:
+            call_15m_entry = EntryCheck(
+                "trend_15m_not_against",
+                slope_15m >= -cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+            )
+            put_15m_entry = EntryCheck(
+                "trend_15m_not_against",
+                slope_15m <= cfg.min_15m_trend_slope,
+                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+            )
+
         breakout_floor_call = prev_swing_hi * (1.0 - cfg.near_breakout_clearance)
+        strict_call = (
+            cfg.selective_entry_enabled
+            and cfg.strict_swing_break_eps > 0
+            and last_price >= prev_swing_hi * (1.0 + cfg.strict_swing_break_eps)
+        )
+        loose_call = last_price >= breakout_floor_call
+        call_breakout_ok = strict_call if (cfg.selective_entry_enabled and cfg.strict_swing_break_eps > 0) else loose_call
+        if cfg.selective_entry_enabled and cfg.strict_swing_break_eps > 0:
+            br_detail = (
+                f"strict break {last_price:.2f} vs swingHi {prev_swing_hi:.2f} "
+                f"(>= {(1.0 + cfg.strict_swing_break_eps) * 100.0:.3f}% hi)"
+            )
+        else:
+            br_detail = (
+                f"price {last_price:.2f} vs swingHi {prev_swing_hi:.2f} (near-breakout band)"
+            )
+
         call_breakout_checks = [
             *filters,
             EntryCheck(
@@ -414,15 +950,29 @@ class BrainEngine:
                 slope_5m >= cfg.min_5m_trend_slope,
                 f"5m slope {slope_5m * 100.0:.3f}% (min {cfg.min_5m_trend_slope * 100.0:.3f}%)",
             ),
+            call_15m_entry,
             EntryCheck(
-                "trend_15m_not_against",
-                slope_15m >= -cfg.min_15m_trend_slope,
-                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+                "breakout_extension_ok",
+                chase_hi <= cfg.breakout_max_extension_pct,
+                f"extension from swingHi {chase_hi * 100.0:.3f}% (max "
+                f"{cfg.breakout_max_extension_pct * 100.0:.3f}%)",
             ),
             EntryCheck(
+                "breakout_distance_ok",
+                chase_hi <= cfg.breakout_max_distance_from_level_pct,
+                f"distance from swingHi {chase_hi * 100.0:.3f}% (max "
+                f"{cfg.breakout_max_distance_from_level_pct * 100.0:.3f}%)",
+            ),
+            EntryCheck(
+                "breakout_spike_candle_ok",
+                spike_vs_avg_ok,
+                spike_detail,
+            ),
+            _entry_check_atr_breakout(cfg, atr_last, last_price, prev_swing_hi, "CALL"),
+            EntryCheck(
                 "breakout_5m",
-                last_price >= breakout_floor_call,
-                f"price {last_price:.2f} vs swingHi {prev_swing_hi:.2f} (near-breakout band)",
+                call_breakout_ok,
+                br_detail,
             ),
             EntryCheck("bullish_1m_close", bullish_1m, "last 1m candle bullish + body>=45%"),
             EntryCheck(
@@ -432,10 +982,6 @@ class BrainEngine:
             ),
         ]
 
-        # CALL — pullback (entering on a bounce within an established uptrend)
-        retracement = (
-            (prev_swing_hi - last_price) / prev_swing_hi if prev_swing_hi else 0.0
-        )
         call_pullback_checks = [
             *filters,
             EntryCheck(
@@ -461,17 +1007,6 @@ class BrainEngine:
             ),
         ]
 
-        # CALL — continuation (consolidation above prior swing high then resume)
-        cont_recent = c5[-cfg.continuation_consolidation_bars :]
-        if cont_recent:
-            cons_hi = max(b.h for b in cont_recent)
-            cons_lo = min(b.low for b in cont_recent)
-            cons_range_pct = (
-                (cons_hi - cons_lo) / cons_hi if cons_hi else 0.0
-            )
-        else:
-            cons_hi = cons_lo = 0.0
-            cons_range_pct = 0.0
         call_continuation_checks = [
             *filters,
             EntryCheck(
@@ -497,8 +1032,24 @@ class BrainEngine:
             ),
         ]
 
-        # PUT — breakdown (mirror; now allows near-breakdown band too)
         breakdown_ceiling_put = prev_swing_lo * (1.0 + cfg.near_breakout_clearance)
+        strict_put = (
+            cfg.selective_entry_enabled
+            and cfg.strict_swing_break_eps > 0
+            and last_price <= prev_swing_lo * (1.0 - cfg.strict_swing_break_eps)
+        )
+        loose_put = last_price <= breakdown_ceiling_put
+        put_breakdown_ok = strict_put if (cfg.selective_entry_enabled and cfg.strict_swing_break_eps > 0) else loose_put
+        if cfg.selective_entry_enabled and cfg.strict_swing_break_eps > 0:
+            bd_detail = (
+                f"strict break {last_price:.2f} vs swingLo {prev_swing_lo:.2f} "
+                f"(<= lo * {1.0 - cfg.strict_swing_break_eps:.5f})"
+            )
+        else:
+            bd_detail = (
+                f"price {last_price:.2f} vs swingLo {prev_swing_lo:.2f} (near-breakdown band)"
+            )
+
         put_breakdown_checks = [
             *filters,
             EntryCheck(
@@ -506,15 +1057,29 @@ class BrainEngine:
                 slope_5m <= -cfg.min_5m_trend_slope,
                 f"5m slope {slope_5m * 100.0:.3f}% (max -{cfg.min_5m_trend_slope * 100.0:.3f}%)",
             ),
+            put_15m_entry,
             EntryCheck(
-                "trend_15m_not_against",
-                slope_15m <= cfg.min_15m_trend_slope,
-                f"15m slope {slope_15m * 100.0:.3f}% (bias gate)",
+                "breakout_extension_ok",
+                chase_lo <= cfg.breakout_max_extension_pct,
+                f"extension from swingLo {chase_lo * 100.0:.3f}% (max "
+                f"{cfg.breakout_max_extension_pct * 100.0:.3f}%)",
             ),
             EntryCheck(
+                "breakout_distance_ok",
+                chase_lo <= cfg.breakout_max_distance_from_level_pct,
+                f"distance from swingLo {chase_lo * 100.0:.3f}% (max "
+                f"{cfg.breakout_max_distance_from_level_pct * 100.0:.3f}%)",
+            ),
+            EntryCheck(
+                "breakout_spike_candle_ok",
+                spike_vs_avg_ok,
+                spike_detail,
+            ),
+            _entry_check_atr_breakout(cfg, atr_last, last_price, prev_swing_lo, "PUT"),
+            EntryCheck(
                 "breakdown_5m",
-                last_price <= breakdown_ceiling_put,
-                f"price {last_price:.2f} vs swingLo {prev_swing_lo:.2f} (near-breakdown band)",
+                put_breakdown_ok,
+                bd_detail,
             ),
             EntryCheck("bearish_1m_close", bearish_1m, "last 1m candle bearish + body>=45%"),
             EntryCheck(
@@ -524,10 +1089,6 @@ class BrainEngine:
             ),
         ]
 
-        # PUT — pullback (rally back to resistance in a downtrend)
-        retracement_dn = (
-            (last_price - prev_swing_lo) / prev_swing_lo if prev_swing_lo else 0.0
-        )
         put_pullback_checks = [
             *filters,
             EntryCheck(
@@ -553,9 +1114,6 @@ class BrainEngine:
             ),
         ]
 
-        # SCALP / MOMENTUM — fastest path. Just 3 checks, designed to catch
-        # 100-200pt index pushes (or proportional move on stocks/commodities).
-        # Survival relies on tight stop + quick target in PaperConfig / live exits.
         call_scalp_checks = [
             EntryCheck(
                 "trend_5m_up_any",
@@ -591,72 +1149,204 @@ class BrainEngine:
             ),
         ]
 
-        # Build the candidate set of (pattern, side, checks, reason).
-        # NOTE order matters as a tiebreaker — structural setups first
-        # (breakout > pullback > continuation > scalp) so when multiple fire
-        # we prefer the cleaner setup, but the scalp keeps the bot active
-        # when nothing structural is happening.
-        candidates: list[tuple[str, str, list[EntryCheck], str]] = [
-            ("breakout",     "BUY_CALL", call_breakout_checks,     "uptrend_breakout_confirmed"),
-            ("pullback",     "BUY_CALL", call_pullback_checks,     "uptrend_pullback_bounce"),
-            ("continuation", "BUY_CALL", call_continuation_checks, "uptrend_continuation_resume"),
-            ("scalp",        "BUY_CALL", call_scalp_checks,        "scalp_call_5m_momentum"),
-            ("breakout",     "BUY_PUT",  put_breakdown_checks,     "downtrend_breakdown_confirmed"),
-            ("pullback",     "BUY_PUT",  put_pullback_checks,      "downtrend_pullback_rejection"),
-            ("scalp",        "BUY_PUT",  put_scalp_checks,         "scalp_put_5m_momentum"),
-        ]
+        candidates: list[tuple[str, str, list[EntryCheck], str]] = []
+        if allow_call:
+            candidates.append(
+                ("breakout", "BUY_CALL", call_breakout_checks, "uptrend_breakout_confirmed")
+            )
+            if cfg.enable_pullback_patterns:
+                candidates.append(
+                    ("pullback", "BUY_CALL", call_pullback_checks, "uptrend_pullback_bounce")
+                )
+            if cfg.enable_continuation_patterns:
+                candidates.append(
+                    (
+                        "continuation",
+                        "BUY_CALL",
+                        call_continuation_checks,
+                        "uptrend_continuation_resume",
+                    )
+                )
+            if cfg.enable_scalp_patterns:
+                candidates.append(
+                    ("scalp", "BUY_CALL", call_scalp_checks, "scalp_call_5m_momentum")
+                )
+        if allow_put:
+            candidates.append(
+                ("breakout", "BUY_PUT", put_breakdown_checks, "downtrend_breakdown_confirmed")
+            )
+            if cfg.enable_pullback_patterns:
+                candidates.append(
+                    ("pullback", "BUY_PUT", put_pullback_checks, "downtrend_pullback_rejection")
+                )
+            if cfg.enable_scalp_patterns:
+                candidates.append(
+                    ("scalp", "BUY_PUT", put_scalp_checks, "scalp_put_5m_momentum")
+                )
 
-        # Rank each candidate by # of passing checks; require ALL to fire.
-        scored = []
+        if not candidates:
+            return BrainOutput(
+                score_out,
+                Signal(
+                    "NO_TRADE",
+                    "directional:no_side",
+                    0.0,
+                    filters,
+                    "other",
+                    {"allow_call": allow_call, "allow_put": allow_put},
+                ),
+                diag,
+            )
+
+        structure_common: dict[str, Any] = {
+            "uptrend_bars_5m": uptrend_bars,
+            "downtrend_bars_5m": downtrend_bars,
+            "retracement_pct": round(retracement * 100.0, 3),
+            "consolidation_range_pct": round(cons_range_pct * 100.0, 3),
+            "near_breakout": last_price > prev_swing_hi * (1.0 - cfg.near_breakout_clearance)
+            and last_price <= prev_swing_hi * (1.0 + cfg.min_5m_breakout_clearance),
+            "late_entry_1m_pct": round(ret_1 * 100.0, 3),
+            "twap": twap,
+            "swing_hi": prev_swing_hi,
+            "swing_lo": prev_swing_lo,
+            "weighted_pattern_score": None,
+            "allow_call": allow_call,
+            "allow_put": allow_put,
+        }
+
+        scored_rows: list[tuple[str, str, list[EntryCheck], str, int, float, float]] = []
         for pat, side, checks, reason in candidates:
             passed = sum(1 for c in checks if c.ok)
-            scored.append((pat, side, checks, reason, passed))
-        scored.sort(key=lambda t: (-t[4], t[0]))   # most-passes first, stable
+            wscore = _weighted_checklist_score(checks, cfg)
+            chase = (
+                chase_hi
+                if pat == "breakout" and side == "BUY_CALL"
+                else chase_lo
+                if pat == "breakout" and side == "BUY_PUT"
+                else 0.0
+            )
+            scored_rows.append((pat, side, checks, reason, passed, wscore, chase))
 
-        for pat, side, checks, reason, passed in scored:
-            if passed == len(checks):
-                structure_blob = {
-                    "pattern": pat,
-                    "uptrend_bars_5m": uptrend_bars,
-                    "downtrend_bars_5m": downtrend_bars,
-                    "retracement_pct": round(retracement * 100.0, 3),
-                    "consolidation_range_pct": round(cons_range_pct * 100.0, 3),
-                    "near_breakout": last_price > prev_swing_hi * (1.0 - cfg.near_breakout_clearance)
-                    and last_price <= prev_swing_hi * (1.0 + cfg.min_5m_breakout_clearance),
-                    "late_entry_1m_pct": round(ret_1 * 100.0, 3),
-                    "twap": twap,
-                    "swing_hi": prev_swing_hi,
-                    "swing_lo": prev_swing_lo,
-                }
+        if not cfg.selective_entry_enabled:
+            scored_rows.sort(key=lambda t: (-t[4], -t[5], -t[6]))
+            for pat, side, checks, reason, passed, _w, _ch in scored_rows:
+                if passed == len(checks):
+                    blob = {**structure_common, "pattern": pat, "weighted_pattern_score": 1.0}
+                    return BrainOutput(
+                        score_out,
+                        Signal(side, reason, 1.0, checks, pat, blob),
+                        diag,
+                    )
+            best = scored_rows[0]
+            pat, side, checks, reason, passed, wsc, _ch = best
+            return BrainOutput(
+                score_out,
+                Signal(
+                    "NO_TRADE",
+                    f"setup_quality_partial_{passed}_of_{len(checks)}",
+                    passed / max(1, len(checks)),
+                    checks,
+                    pat,
+                    {
+                        "uptrend_bars_5m": uptrend_bars,
+                        "downtrend_bars_5m": downtrend_bars,
+                        "retracement_pct": round(retracement * 100.0, 3),
+                        "late_entry_1m_pct": round(ret_1 * 100.0, 3),
+                    },
+                ),
+                diag,
+            )
+
+        full_pool = [
+            t
+            for t in scored_rows
+            if t[4] == len(t[2]) and t[5] >= cfg.min_pattern_score
+        ]
+        partial_pool = [
+            t
+            for t in scored_rows
+            if t[0] != "breakout"
+            and t[4] < len(t[2])
+            and (t[4] / max(1, len(t[2]))) >= cfg.min_pattern_check_ratio
+            and t[5] >= cfg.min_pattern_score
+        ]
+
+        cur_bar = c5[-1]
+        cur_bucket_start = cur_bar.ts
+        bo_bar_hi = c5_closed[-1].h if c5_closed else cur_bar.h
+        bo_bar_lo = c5_closed[-1].low if c5_closed else cur_bar.low
+
+        confirmed_full: list[tuple[str, str, list[EntryCheck], str, int, float, float]] = []
+        for t in full_pool:
+            pat, side, checks, reason, passed, wsc, chase = t
+            if pat != "breakout":
+                confirmed_full.append(t)
+                continue
+            allow, msg = _breakout_confirm_allow(
+                cfg,
+                agg,
+                side=side,
+                swing_hi=prev_swing_hi,
+                swing_lo=prev_swing_lo,
+                last_price=last_price,
+                cur_bucket_start=cur_bucket_start,
+                bo_bar_hi=bo_bar_hi,
+                bo_bar_lo=bo_bar_lo,
+            )
+            if msg in ("breakout:pending_confirm", "breakout:on_breakout_bar"):
                 return BrainOutput(
-                    score,
+                    score_out,
                     Signal(
-                        side=side,
-                        reason=reason,
-                        confidence=1.0,
-                        checks=checks,
-                        pattern=pat,
-                        structure=structure_blob,
+                        "NO_TRADE",
+                        msg,
+                        0.0,
+                        checks,
+                        pat,
+                        {
+                            **structure_common,
+                            "pattern": pat,
+                            "breakout_confirm": msg,
+                        },
                     ),
                     diag,
                 )
+            if allow:
+                confirmed_full.append(t)
 
-        # Nothing fired — surface the closest candidate so the UI shows progress.
-        best = scored[0]
-        pat, side, checks, reason, passed = best
+        full_pool = confirmed_full
+
+        pick_pool = full_pool if full_pool else partial_pool
+
+        if pick_pool:
+            pat, side, checks, reason, passed, wsc, chase = max(
+                pick_pool,
+                key=lambda t: _pick_rank_tuple(t[5], t[6], t[0]),
+            )
+            conf = 1.0 if passed == len(checks) else passed / max(1, len(checks))
+            blob = {**structure_common, "pattern": pat, "weighted_pattern_score": round(wsc, 4)}
+            return BrainOutput(
+                score_out,
+                Signal(side, reason, conf, checks, pat, blob),
+                diag,
+            )
+
+        scored_rows.sort(key=lambda t: (-t[4], -t[5], -t[6]))
+        best = scored_rows[0]
+        pat, side, checks, reason, passed, wsc, _chx = best
         return BrainOutput(
-            score,
+            score_out,
             Signal(
-                side="NO_TRADE",
-                reason=f"{pat}_{side.lower()}_partial_{passed}/{len(checks)}",
-                confidence=passed / max(1, len(checks)),
-                checks=checks,
-                pattern=pat,
-                structure={
+                "NO_TRADE",
+                f"setup_quality_partial_{passed}_of_{len(checks)}",
+                passed / max(1, len(checks)),
+                checks,
+                pat,
+                {
                     "uptrend_bars_5m": uptrend_bars,
                     "downtrend_bars_5m": downtrend_bars,
                     "retracement_pct": round(retracement * 100.0, 3),
                     "late_entry_1m_pct": round(ret_1 * 100.0, 3),
+                    "weighted_pattern_score": round(wsc, 4),
                 },
             ),
             diag,

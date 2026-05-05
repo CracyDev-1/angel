@@ -20,7 +20,14 @@ import structlog
 from angel_bot.config import Settings, get_settings
 from angel_bot.market_data.candles import Candle, CandleAggregator
 from angel_bot.smart_client import SmartApiClient
-from angel_bot.strategy.brain import BrainConfig, BrainEngine, BrainOutput
+from angel_bot.strategy.brain import (
+    BrainConfig,
+    BrainEngine,
+    BrainOutput,
+    EntryCheck,
+    Signal,
+    pre_brain_regime_blocks,
+)
 
 # Asia/Kolkata is UTC+5:30 with no DST. Angel's historical-candle API expects
 # both ``fromdate`` / ``todate`` and the returned timestamps in IST so we
@@ -386,7 +393,26 @@ class ScannerEngine:
                 is_affordable = False
                 hidden_unaffordable += 1
 
-            brain_out: BrainOutput = self.brain.evaluate(last_price=last, agg=agg)
+            regime_blocked = False
+            regime_reason = ""
+            if self.brain.config.selective_entry_enabled and last is not None:
+                regime_blocked, regime_reason = pre_brain_regime_blocks(
+                    self.brain.config, agg, last
+                )
+            if regime_blocked:
+                score_bd = self.brain.score_instrument(last_price=last, agg=agg)
+                brain_out = BrainOutput(
+                    score_bd,
+                    Signal(
+                        "NO_TRADE",
+                        regime_reason,
+                        0.0,
+                        [EntryCheck("regime_pre_brain", False, regime_reason)],
+                    ),
+                    {"regime_block": regime_reason, "score_inputs": score_bd.inputs},
+                )
+            else:
+                brain_out = self.brain.evaluate(last_price=last, agg=agg)
             c1, c5, c15 = agg.all_candles_including_partial()
 
             try:
@@ -453,6 +479,11 @@ class ScannerEngine:
             near_breakout_clearance=s.strategy_near_breakout_clearance,
             max_late_entry_pct=s.strategy_max_late_entry_pct,
             min_above_twap_pct=s.strategy_min_above_twap_pct,
+            reference_min_distance_pct=s.strategy_reference_min_distance_pct,
+            reference_max_distance_pct=s.strategy_reference_max_distance_pct,
+            regime_adx_min=s.strategy_regime_adx_min,
+            regime_extension_adx_min=s.strategy_regime_extension_adx_min,
+            regime_recent_vol_atr_ratio=s.strategy_regime_recent_vol_atr_ratio,
             pullback_min_uptrend_bars=s.strategy_pullback_min_uptrend_bars,
             pullback_max_retracement_pct=s.strategy_pullback_max_retracement_pct,
             continuation_consolidation_bars=s.strategy_continuation_consolidation_bars,
@@ -463,6 +494,7 @@ class ScannerEngine:
             w_breakout=s.score_w_breakout,
             w_volume=s.score_w_volume,
             min_score_to_act=s.strategy_min_score,
+            min_brain_score_0_100=s.strategy_min_brain_score_0_100,
         )
 
 
