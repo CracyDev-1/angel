@@ -57,6 +57,8 @@ class PaperOpenRequest:
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     max_hold_minutes: int | None = None
+    # Optional (INDEX / equity identifier for restart-safety / dedupe context).
+    underlying: str | None = None
 
 
 @dataclass
@@ -121,6 +123,7 @@ class PaperTrader:
                 "max_hold_minutes": mh,
                 "initial_stop_price": stop,
                 "peak_premium": req.entry_price,
+                "underlying": req.underlying,
             }
         )
         log.info(

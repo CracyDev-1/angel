@@ -33,10 +33,10 @@ Constraints we are honest about:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
-from angel_bot.market_data.candles import BreakoutConfirmPending, Candle, CandleAggregator
+from angel_bot.market_data.candles import Candle, CandleAggregator, RetestBreakoutSetup
 from angel_bot.strategy.indicators import wilder_adx, wilder_atr
 
 
@@ -71,7 +71,7 @@ class BrainConfig:
     # ADX on closed 5m bars (Wilder). If None from insufficient data, gate skipped.
     # Set regime_adx_min to 0.0 to disable ADX gate.
     regime_adx_period: int = 14
-    regime_adx_min: float = 18.0
+    regime_adx_min: float = 20.0
     # When |price−TWAP|/TWAP exceeds reference_max_distance_pct, allow only if trend strong + fresh leg.
     regime_extension_adx_min: float = 22.0
     # Block when last-N 5m range is below this fraction of ATR(14) (dead tape).
@@ -150,6 +150,19 @@ class BrainConfig:
 
     # Global regime: reject when |15m slope| below this (too flat). 0 disables.
     regime_global_flat_slope_eps: float = 0.00005
+
+    # --- Retest-after-breakout (5m closed bars; one setup per CandleAggregator) ---
+    retest_zone_tolerance_pct: float = 0.0015   # ±0.15% around breakout_level
+    retest_max_post_breakout_bars: int = 3      # retest touch must occur within N bars after breakout
+    retest_confirm_max_bars: int = 3             # confirmation candle after first touch
+    retest_max_retrace_fraction: float = 0.50    # vs breakout candle range
+    retest_engulf_body_min: float = 0.45         # body/range for engulfing rejection
+
+    # Fail-closed regime: treat missing ADX/ATR/slope/TWAP as NO_TRADE (see unified_regime_gate).
+    regime_fail_closed_indicators: bool = True
+    regime_require_twap: bool = True
+    # Global staleness: abort pending retest/setup when closed-bar age exceeds this (0 = disabled).
+    signal_max_age_closed_bars: int = 3
 
 
 # ----------------------------------------------------------------------
@@ -313,8 +326,8 @@ def unified_regime_gate(
 
     Returns (True, reason) when entries should be blocked, else (False, "").
 
-    Basic guards (bad price or thin candles) intentionally do **not** block —
-    the scanner/brain will surface warmup/no-data elsewhere.
+    When ``regime_fail_closed_indicators`` is True, missing ADX/ATR/15m slope/TWAP
+    blocks trading (fail-closed). Thin candle history uses ``regime:data_missing``.
     """
     if not cfg.selective_entry_enabled:
         return False, ""
@@ -322,18 +335,47 @@ def unified_regime_gate(
         return False, ""
 
     c1, c5, c15 = agg.all_candles_including_partial()
-    # STEP 1: insufficient structure → do not regime-block here
+    c5_closed = agg.snapshot_lists()[1]
+    need_hist = max(cfg.regime_adx_period * 2, cfg.atr_period + 1)
+
+    # STEP 1: insufficient *closed* 5m structure for indicators
     if len(c5) < 5 or len(c15) < 3:
+        if cfg.regime_fail_closed_indicators:
+            return True, "regime:data_missing"
         return False, ""
+
+    if cfg.regime_fail_closed_indicators:
+        if len(c5_closed) < need_hist:
+            return True, "regime:data_missing"
+        adx_fc = wilder_adx(c5_closed, period=cfg.regime_adx_period)
+        atr_fc = wilder_atr(c5_closed, period=cfg.atr_period)
+        if adx_fc is None:
+            return True, "indicator:adx_missing"
+        if atr_fc is None:
+            return True, "indicator:atr_missing"
+        n15_fc = min(10, len(c15))
+        if n15_fc < 3:
+            return True, "indicator:slope_missing"
+        m15_fc = [b.c for b in c15[-n15_fc:]]
+        if _slope(m15_fc) is None:
+            return True, "indicator:slope_missing"
+        if cfg.regime_require_twap:
+            tw_fc = agg.session_twap
+            if tw_fc is None or tw_fc <= 0:
+                return True, "regime:data_missing"
 
     # STEP 2: slope on last 8–10 fifteen-minute closes (requires ≥3 bars).
     n15 = min(10, len(c15))
     if n15 < 3:
+        if cfg.regime_fail_closed_indicators:
+            return True, "indicator:slope_missing"
         return False, ""
     m15_closes = [b.c for b in c15[-n15:]]
-    slope_15m = _slope(m15_closes) or 0.0
+    slope_15m_raw = _slope(m15_closes)
+    if cfg.regime_fail_closed_indicators and slope_15m_raw is None:
+        return True, "indicator:slope_missing"
+    slope_15m = float(slope_15m_raw or 0.0)
 
-    c5_closed = agg.snapshot_lists()[1]
     adx_5m = wilder_adx(c5_closed, period=cfg.regime_adx_period)
     atr_5m = wilder_atr(c5_closed, period=cfg.atr_period)
     recent_range = _recent_high_low_range_5m(c5_closed, last_n=5)
@@ -346,11 +388,17 @@ def unified_regime_gate(
     # STEP 3 — hard rejection
     if cfg.regime_global_flat_slope_eps > 0 and abs(slope_15m) < cfg.regime_global_flat_slope_eps:
         return True, "regime:flat_htf"
-    if cfg.regime_adx_min > 0 and adx_5m is not None and adx_5m < cfg.regime_adx_min:
-        return True, "regime:low_adx"
-    if (
-        atr_5m is not None
-        and atr_5m > 0
+    if cfg.regime_adx_min > 0:
+        if adx_5m is None:
+            if cfg.regime_fail_closed_indicators:
+                return True, "indicator:adx_missing"
+        elif adx_5m < cfg.regime_adx_min:
+            return True, "regime:low_adx"
+    if atr_5m is None:
+        if cfg.regime_fail_closed_indicators:
+            return True, "indicator:atr_missing"
+    elif (
+        atr_5m > 0
         and recent_range is not None
         and recent_range < cfg.regime_recent_vol_atr_ratio * atr_5m
     ):
@@ -405,81 +453,212 @@ def pre_brain_regime_blocks(
     return unified_regime_gate(cfg, agg, last_price)
 
 
-def _breakout_chase_pct(side: str, last_price: float, level: float) -> float:
-    if level <= 0:
-        return 0.0
-    return abs(last_price - level) / level
+def _fail_retest_breakout_state(agg: CandleAggregator) -> None:
+    """Invalidate retest FSM + global signal anchor (failed / rolled forward)."""
+    agg.active_retest_setup = None
+    agg.last_retest_entry_meta = None
+    agg.signal_created_closed_index = None
 
 
-def _breakout_confirm_allow(
+def _bar_index_for_ts(closed: list[Candle], ts: datetime) -> int | None:
+    for i, c in enumerate(closed):
+        if c.ts == ts:
+            return i
+    return None
+
+
+def _strong_bearish_engulf(prev: Candle, cur: Candle, body_frac: float) -> bool:
+    rng_p = max(1e-12, prev.h - prev.low)
+    rng_c = max(1e-12, cur.h - cur.low)
+    if prev.c <= prev.o or cur.c >= cur.o:
+        return False
+    pb = prev.c - prev.o
+    cb = cur.o - cur.c
+    return (
+        cur.o >= prev.c
+        and cur.c <= prev.o
+        and cb / rng_c >= body_frac
+        and pb / rng_p >= body_frac * 0.5
+    )
+
+
+def _strong_bullish_engulf(prev: Candle, cur: Candle, body_frac: float) -> bool:
+    rng_p = max(1e-12, prev.h - prev.low)
+    rng_c = max(1e-12, cur.h - cur.low)
+    if prev.c >= prev.o or cur.c <= cur.o:
+        return False
+    pb = prev.o - prev.c
+    cb = cur.c - cur.o
+    return (
+        cur.o <= prev.c
+        and cur.c >= prev.o
+        and cb / rng_c >= body_frac
+        and pb / rng_p >= body_frac * 0.5
+    )
+
+
+def _retest_breakout_allow(
     cfg: BrainConfig,
     agg: CandleAggregator,
     *,
     side: str,
     swing_hi: float,
     swing_lo: float,
-    last_price: float,
-    cur_bucket_start: datetime,
-    bo_bar_hi: float,
-    bo_bar_lo: float,
-) -> tuple[bool, str | None]:
-    """One 5m-bar confirmation delay after raw breakout. Mutates agg.breakout_confirm."""
-    if not cfg.enable_breakout_bar_confirmation or not cfg.selective_entry_enabled:
-        return True, None
+    c5_closed: list[Candle],
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """Retest + confirmation on closed 5m bars only; mutates ``agg.active_retest_setup``."""
+    extras: dict[str, Any] = {}
+    if not cfg.selective_entry_enabled:
+        return True, None, extras
+    if len(c5_closed) < 2:
+        return False, "retest:need_history", extras
 
-    pend = agg.breakout_confirm
-    cur = cur_bucket_start
     level = swing_hi if side == "BUY_CALL" else swing_lo
+    if level <= 0:
+        return False, "retest:bad_level", extras
 
-    if pend is not None and pend.side != side:
-        agg.breakout_confirm = None
-        pend = None
+    tol = cfg.retest_zone_tolerance_pct
+    max_rw = cfg.retest_max_post_breakout_bars
+    max_cf = cfg.retest_confirm_max_bars
+    mx_rt = cfg.retest_max_retrace_fraction
+    eb = cfg.retest_engulf_body_min
 
-    if pend is None:
-        agg.breakout_confirm = BreakoutConfirmPending(
-            candle_bucket_start=cur,
-            side=side,
-            swing_level=level,
-            candle_hi=bo_bar_hi,
-            candle_lo=bo_bar_lo,
-        )
-        return False, "breakout:pending_confirm"
+    st = agg.active_retest_setup
+    if st is not None and st.side != side:
+        return False, "retest:active_other_side", extras
 
-    if pend.candle_bucket_start == cur:
-        return False, "breakout:on_breakout_bar"
+    prev_b, last_b = c5_closed[-2], c5_closed[-1]
 
-    next_ts = pend.candle_bucket_start + timedelta(minutes=5)
-    if cur == next_ts:
-        R = max(1e-12, pend.candle_hi - pend.candle_lo)
+    def crosses_now() -> bool:
         if side == "BUY_CALL":
-            retrace = (
-                max(0.0, (pend.candle_hi - last_price) / R)
-                if last_price < pend.candle_hi
-                else 0.0
+            return last_b.c > level and prev_b.c <= level
+        return last_b.c < level and prev_b.c >= level
+
+    if st is None:
+        if crosses_now():
+            br = max(1e-12, last_b.h - last_b.low)
+            agg.last_retest_entry_meta = None
+            agg.active_retest_setup = RetestBreakoutSetup(
+                side=side,
+                breakout_level=float(level),
+                breakout_bucket_start=last_b.ts,
+                breakout_range=br,
+                breakout_hi=last_b.h,
+                breakout_lo=last_b.low,
             )
+            agg.signal_created_closed_index = len(c5_closed) - 1
+            return False, "retest:breakout_armed", extras
+        return False, "retest:no_setup_yet", extras
+
+    bi = _bar_index_for_ts(c5_closed, st.breakout_bucket_start)
+    if bi is None:
+        _fail_retest_breakout_state(agg)
+        return False, "retest:stale_rollforward", extras
+
+    last_i = len(c5_closed) - 1
+    age = last_i - bi
+    R = max(1e-12, st.breakout_range)
+
+    if age == 0:
+        return False, "retest:on_breakout_bar", extras
+
+    touch_seen = st.retest_touch_seen
+    ext_lo = st.retest_extreme_lo
+    ext_hi = st.retest_extreme_hi
+    ft_idx = st.first_touch_index
+
+    for j in range(bi + 1, last_i + 1):
+        b = c5_closed[j]
+        in_win = j <= bi + max_rw
+
+        if side == "BUY_CALL":
+            ext_lo = b.low if ext_lo is None else min(ext_lo, b.low)
+            if b.c < st.breakout_level:
+                _fail_retest_breakout_state(agg)
+                return False, "retest:fake_breakout_close", extras
+            if in_win:
+                deep = (st.breakout_hi - b.low) / R
+                if deep > mx_rt:
+                    _fail_retest_breakout_state(agg)
+                    return False, "retest:pullback_too_deep", extras
+                if j > bi + 1:
+                    if _strong_bearish_engulf(c5_closed[j - 1], b, eb):
+                        _fail_retest_breakout_state(agg)
+                        return False, "retest:bearish_engulfing", extras
+            near = abs(b.low - st.breakout_level) / st.breakout_level <= tol
+            if near and b.low < c5_closed[bi].c:
+                touch_seen = True
+                if ft_idx is None:
+                    ft_idx = j
         else:
-            retrace = (
-                max(0.0, (last_price - pend.candle_lo) / R)
-                if last_price > pend.candle_lo
-                else 0.0
-            )
-        ok_rt = retrace <= cfg.breakout_confirm_max_retrace_of_range
-        agg.breakout_confirm = None
-        if ok_rt:
-            return True, None
-        return False, "breakout:retrace_too_deep"
+            ext_hi = b.h if ext_hi is None else max(ext_hi, b.h)
+            if b.c > st.breakout_level:
+                _fail_retest_breakout_state(agg)
+                return False, "retest:fake_breakout_close", extras
+            if in_win:
+                deep = (b.h - st.breakout_lo) / R
+                if deep > mx_rt:
+                    _fail_retest_breakout_state(agg)
+                    return False, "retest:rally_too_deep", extras
+                if j > bi + 1:
+                    if _strong_bullish_engulf(c5_closed[j - 1], b, eb):
+                        _fail_retest_breakout_state(agg)
+                        return False, "retest:bullish_engulfing", extras
+            near = abs(b.h - st.breakout_level) / st.breakout_level <= tol
+            if near and b.h > c5_closed[bi].c:
+                touch_seen = True
+                if ft_idx is None:
+                    ft_idx = j
 
-    if cur > next_ts:
-        agg.breakout_confirm = BreakoutConfirmPending(
-            candle_bucket_start=cur,
-            side=side,
-            swing_level=level,
-            candle_hi=bo_bar_hi,
-            candle_lo=bo_bar_lo,
-        )
-        return False, "breakout:pending_confirm"
+    st.retest_touch_seen = touch_seen
+    st.retest_extreme_lo = ext_lo
+    st.retest_extreme_hi = ext_hi
+    st.first_touch_index = ft_idx
 
-    return False, "breakout:pending_confirm"
+    if not touch_seen:
+        if last_i > bi + max_rw:
+            _fail_retest_breakout_state(agg)
+            return False, "retest:expired_no_touch", extras
+        return False, "retest:await_touch", extras
+
+    assert ft_idx is not None
+    if last_i > ft_idx + max_cf:
+        _fail_retest_breakout_state(agg)
+        return False, "retest:expired_no_confirm", extras
+
+    if last_i < bi + 2:
+        return False, "retest:await_confirm", extras
+
+    cur = c5_closed[last_i]
+    prv = c5_closed[last_i - 1]
+    if side == "BUY_CALL":
+        ok_go = cur.c > prv.h and cur.c > cur.o
+        anchor = ext_lo if ext_lo is not None else cur.low
+        extras["underlying_stop_anchor"] = anchor
+        extras["underlying_stop_side"] = "below"
+    else:
+        ok_go = cur.c < prv.low and cur.c < cur.o
+        anchor = ext_hi if ext_hi is not None else cur.h
+        extras["underlying_stop_anchor"] = anchor
+        extras["underlying_stop_side"] = "above"
+
+    if not ok_go:
+        return False, "retest:await_confirm", extras
+
+    if ft_idx is not None and c5_closed[ft_idx].v > 0 and cur.v > 0 and cur.v >= c5_closed[ft_idx].v:
+        extras["retest_volume_note"] = "confirm_vol_ge_retest"
+
+    extras["retest_flow"] = "breakout_retest_v1"
+    agg.last_retest_entry_meta = dict(extras)
+    agg.active_retest_setup = None
+    agg.signal_created_closed_index = None
+    return True, None, extras
+
+
+def _breakout_chase_pct(side: str, last_price: float, level: float) -> float:
+    if level <= 0:
+        return 0.0
+    return abs(last_price - level) / level
 
 
 def _penalized_rank_score(
@@ -520,6 +699,12 @@ def _entry_check_atr_breakout(
     label: str,
 ) -> EntryCheck:
     if atr is None or atr <= 0:
+        if cfg.regime_fail_closed_indicators:
+            return EntryCheck(
+                "breakout_atr_band",
+                False,
+                "indicator:atr_missing",
+            )
         return EntryCheck("breakout_atr_band", True, "ATR n/a — band skipped")
     sz = abs(last_price - level)
     ok = (sz >= cfg.breakout_atr_min_multiple * atr) and (sz <= cfg.breakout_atr_max_multiple * atr)
@@ -664,10 +849,11 @@ class BrainEngine:
         agg: CandleAggregator,
     ) -> BrainOutput:
         cfg = self.config
-        score = self.score_instrument(last_price=last_price, agg=agg)
-        diag: dict[str, Any] = {"score_inputs": score.inputs}
+        diag: dict[str, Any] = {}
 
         if last_price is None or last_price <= 0:
+            score = self.score_instrument(last_price=last_price, agg=agg)
+            diag["score_inputs"] = score.inputs
             return BrainOutput(score, Signal("NO_TRADE", "no_price", 0.0, []), diag)
 
         c1, c5, c15 = agg.all_candles_including_partial()
@@ -677,6 +863,8 @@ class BrainEngine:
         # ``c1[-1]`` for the last 1m candle — historical-candle backfill
         # may seed only 5m + 15m for instruments with no 1m history.
         if len(c5) < 5 or len(c15) < 3 or len(c1) < 1:
+            score = self.score_instrument(last_price=last_price, agg=agg)
+            diag["score_inputs"] = score.inputs
             return BrainOutput(
                 score,
                 Signal(
@@ -688,6 +876,28 @@ class BrainEngine:
                             "warmup",
                             False,
                             f"need>=5 5m, >=3 15m, >=1 1m (have {len(c5)}/{len(c15)}/{len(c1)})",
+                        )
+                    ],
+                ),
+                diag,
+            )
+
+        c5_closed = agg.snapshot_lists()[1]
+        need_rb = max(cfg.regime_adx_period * 2, cfg.atr_period + 1)
+        if cfg.selective_entry_enabled and cfg.regime_fail_closed_indicators and len(c5_closed) < need_rb:
+            score = self.score_instrument(last_price=last_price, agg=agg)
+            diag["score_inputs"] = score.inputs
+            return BrainOutput(
+                score,
+                Signal(
+                    "NO_TRADE",
+                    "warmup",
+                    0.0,
+                    [
+                        EntryCheck(
+                            "warmup",
+                            False,
+                            f"need>={need_rb} closed 5m bars for regime indicators (have {len(c5_closed)})",
                         )
                     ],
                 ),
@@ -719,6 +929,8 @@ class BrainEngine:
 
         if any(not f.ok for f in filters):
             failed = next(f for f in filters if not f.ok)
+            score = self.score_instrument(last_price=last_price, agg=agg)
+            diag["score_inputs"] = score.inputs
             return BrainOutput(
                 score,
                 Signal("NO_TRADE", f"filter:{failed.name}", 0.0, filters),
@@ -730,6 +942,8 @@ class BrainEngine:
             cfg.min_session_range_pct_breakout > 0
             and sess_range_pct * 100.0 < cfg.min_session_range_pct_breakout
         ):
+            score = self.score_instrument(last_price=last_price, agg=agg)
+            diag["score_inputs"] = score.inputs
             return BrainOutput(
                 score,
                 Signal(
@@ -752,6 +966,8 @@ class BrainEngine:
         if cfg.selective_entry_enabled:
             regime_block, regime_reason = unified_regime_gate(cfg, agg, last_price)
             if regime_block:
+                score = self.score_instrument(last_price=last_price, agg=agg)
+                diag["score_inputs"] = score.inputs
                 return BrainOutput(
                     score,
                     Signal(
@@ -770,13 +986,79 @@ class BrainEngine:
                     diag,
                 )
 
+        sw5 = _swing([b.h for b in c5[-20:-1]], [b.low for b in c5[-20:-1]])
+        if sw5 is None:
+            score = self.score_instrument(last_price=last_price, agg=agg)
+            diag["score_inputs"] = score.inputs
+            return BrainOutput(score, Signal("NO_TRADE", "no_swing", 0.0, filters), diag)
+        prev_swing_hi, prev_swing_lo = sw5
+
+        chase_hi_pre = _breakout_chase_pct("BUY_CALL", float(last_price), prev_swing_hi)
+        chase_lo_pre = _breakout_chase_pct("BUY_PUT", float(last_price), prev_swing_lo)
+        if max(chase_hi_pre, chase_lo_pre) > cfg.breakout_max_extension_pct:
+            score = ScoreBreakdown(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                {
+                    "reason": "entry:late",
+                    "extension_precheck_max_pct": max(chase_hi_pre, chase_lo_pre) * 100.0,
+                },
+            )
+            diag["score_inputs"] = score.inputs
+            return BrainOutput(
+                score,
+                Signal(
+                    "NO_TRADE",
+                    "entry:late",
+                    0.0,
+                    filters
+                    + [
+                        EntryCheck(
+                            "extension_precheck",
+                            False,
+                            f"max extension {max(chase_hi_pre, chase_lo_pre) * 100.0:.4f}% "
+                            f"> cap {cfg.breakout_max_extension_pct * 100.0:.4f}%",
+                        )
+                    ],
+                ),
+                diag,
+            )
+
+        if cfg.signal_max_age_closed_bars > 0 and agg.signal_created_closed_index is not None:
+            cur_i = len(c5_closed) - 1
+            age_bars = cur_i - int(agg.signal_created_closed_index)
+            if age_bars > cfg.signal_max_age_closed_bars:
+                _fail_retest_breakout_state(agg)
+                score = self.score_instrument(last_price=last_price, agg=agg)
+                diag["score_inputs"] = score.inputs
+                return BrainOutput(
+                    score,
+                    Signal(
+                        "NO_TRADE",
+                        "signal:expired",
+                        0.0,
+                        filters
+                        + [
+                            EntryCheck(
+                                "signal_age",
+                                False,
+                                f"pending signal age {age_bars} closed bars "
+                                f"> max {cfg.signal_max_age_closed_bars}",
+                            )
+                        ],
+                    ),
+                    diag,
+                )
+
+        score = self.score_instrument(last_price=last_price, agg=agg)
+        diag["score_inputs"] = score.inputs
+
         # ---- multi-timeframe context ----
         m15_closes = [b.c for b in c15[-5:]]
         m5_closes = [b.c for b in c5[-5:]]
-        sw5 = _swing([b.h for b in c5[-20:-1]], [b.low for b in c5[-20:-1]])
-        if sw5 is None:
-            return BrainOutput(score, Signal("NO_TRADE", "no_swing", 0.0, filters), diag)
-        prev_swing_hi, prev_swing_lo = sw5
 
         slope_15m = _slope(m15_closes) or 0.0
         slope_5m = _slope(m5_closes) or 0.0
@@ -791,7 +1073,6 @@ class BrainEngine:
         bullish_1m = body > 0 and (body / rng_1m) >= 0.45
         bearish_1m = body < 0 and (-body / rng_1m) >= 0.45
 
-        c5_closed = agg.snapshot_lists()[1]
         adx_5m = wilder_adx(c5_closed, period=cfg.regime_adx_period)
         twap_dev = None
         twap_dist_vs_twap: float | None = None
@@ -1271,47 +1552,39 @@ class BrainEngine:
             and t[5] >= cfg.min_pattern_score
         ]
 
-        cur_bar = c5[-1]
-        cur_bucket_start = cur_bar.ts
-        bo_bar_hi = c5_closed[-1].h if c5_closed else cur_bar.h
-        bo_bar_lo = c5_closed[-1].low if c5_closed else cur_bar.low
-
         confirmed_full: list[tuple[str, str, list[EntryCheck], str, int, float, float]] = []
         for t in full_pool:
             pat, side, checks, reason, passed, wsc, chase = t
             if pat != "breakout":
                 confirmed_full.append(t)
                 continue
-            allow, msg = _breakout_confirm_allow(
+            allow, msg, retest_x = _retest_breakout_allow(
                 cfg,
                 agg,
                 side=side,
                 swing_hi=prev_swing_hi,
                 swing_lo=prev_swing_lo,
-                last_price=last_price,
-                cur_bucket_start=cur_bucket_start,
-                bo_bar_hi=bo_bar_hi,
-                bo_bar_lo=bo_bar_lo,
+                c5_closed=c5_closed,
             )
-            if msg in ("breakout:pending_confirm", "breakout:on_breakout_bar"):
+            if not allow:
                 return BrainOutput(
                     score_out,
                     Signal(
                         "NO_TRADE",
-                        msg,
+                        msg or "retest:blocked",
                         0.0,
                         checks,
                         pat,
                         {
                             **structure_common,
+                            **retest_x,
                             "pattern": pat,
-                            "breakout_confirm": msg,
+                            "retest_gate": msg,
                         },
                     ),
                     diag,
                 )
-            if allow:
-                confirmed_full.append(t)
+            confirmed_full.append(t)
 
         full_pool = confirmed_full
 
@@ -1323,7 +1596,11 @@ class BrainEngine:
                 key=lambda t: _pick_rank_tuple(t[5], t[6], t[0]),
             )
             conf = 1.0 if passed == len(checks) else passed / max(1, len(checks))
-            blob = {**structure_common, "pattern": pat, "weighted_pattern_score": round(wsc, 4)}
+            rex: dict[str, Any] = {}
+            if pat == "breakout" and agg.last_retest_entry_meta:
+                rex = dict(agg.last_retest_entry_meta)
+            agg.last_retest_entry_meta = None
+            blob = {**structure_common, **rex, "pattern": pat, "weighted_pattern_score": round(wsc, 4)}
             return BrainOutput(
                 score_out,
                 Signal(side, reason, conf, checks, pat, blob),

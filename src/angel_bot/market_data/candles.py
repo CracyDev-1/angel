@@ -3,17 +3,28 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 
 @dataclass
-class BreakoutConfirmPending:
-    """5m bar bucket when a raw breakout first qualified; next bar may confirm."""
+class RetestBreakoutSetup:
+    """5m retest-after-breakout state (one active setup per symbol / aggregator)."""
 
-    candle_bucket_start: datetime
     side: str  # BUY_CALL | BUY_PUT
-    swing_level: float
-    candle_hi: float
-    candle_lo: float
+    breakout_level: float
+    breakout_bucket_start: datetime
+    breakout_range: float
+    breakout_hi: float
+    breakout_lo: float
+    retest_touch_seen: bool = False
+    # Extreme during retest window (for SL anchor on underlying — CALL: lowest low).
+    retest_extreme_lo: float | None = None  # CALL: min low after breakout bar
+    retest_extreme_hi: float | None = None  # PUT: max high after breakout bar
+    first_touch_index: int | None = None  # closed-array index when ±zone touch first seen
+
+
+# Back-compat alias (legacy one-bar delay); prefer RetestBreakoutSetup.
+BreakoutConfirmPending = RetestBreakoutSetup
 
 
 @dataclass
@@ -69,8 +80,21 @@ class CandleAggregator:
         self.session_low: float | None = None
         self._twap_sum: float = 0.0
         self._twap_n: int = 0
-        # One-bar-delay confirmation for breakout (see BrainEngine.evaluate).
-        self.breakout_confirm: BreakoutConfirmPending | None = None
+        # Retest-after-breakout FSM state (see BrainEngine.evaluate).
+        self.active_retest_setup: RetestBreakoutSetup | None = None
+        # Index into closed 5m array when a retest/breakout setup is armed (global signal age).
+        self.signal_created_closed_index: int | None = None
+        # Populated when retest FSM returns entry OK (underlying SL hints for UI / exits).
+        self.last_retest_entry_meta: dict[str, Any] | None = None
+
+    @property
+    def breakout_confirm(self) -> RetestBreakoutSetup | None:
+        """Deprecated: use ``active_retest_setup``."""
+        return self.active_retest_setup
+
+    @breakout_confirm.setter
+    def breakout_confirm(self, v: RetestBreakoutSetup | None) -> None:
+        self.active_retest_setup = v
 
     # ------------------------------------------------------------------
     # ingest
@@ -89,6 +113,8 @@ class CandleAggregator:
             self._twap_sum = price
             self._twap_n = 1
             self.breakout_confirm = None
+            self.last_retest_entry_meta = None
+            self.signal_created_closed_index = None
         else:
             self.session_high = price if self.session_high is None else max(self.session_high, price)
             self.session_low = price if self.session_low is None else min(self.session_low, price)
@@ -160,6 +186,8 @@ class CandleAggregator:
         self._cur_5m = None
         self._cur_15m = None
         self.breakout_confirm = None
+        self.last_retest_entry_meta = None
+        self.signal_created_closed_index = None
 
         # Reset session aggregates from the seeded data. Prefer 1m when
         # available (highest resolution), otherwise 5m, otherwise 15m.

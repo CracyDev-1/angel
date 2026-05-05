@@ -38,6 +38,9 @@ def test_brain_calls_on_clean_uptrend_breakout():
             min_brain_score_0_100=0,
             reference_max_distance_pct=0.0,
             enable_breakout_bar_confirmation=False,
+            selective_entry_enabled=False,
+            regime_fail_closed_indicators=False,
+            breakout_max_extension_pct=0.02,
         )
     )
     base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
@@ -60,7 +63,7 @@ def test_brain_calls_on_clean_uptrend_breakout():
 
 def test_brain_no_trade_in_chop():
     agg = CandleAggregator()
-    brain = BrainEngine(BrainConfig(min_volatility_pct=0.05))
+    brain = BrainEngine(BrainConfig(min_volatility_pct=0.05, regime_fail_closed_indicators=False))
     base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
     # 30 minutes of zigzag around 100 — should chop-filter out.
     n = 360
@@ -83,12 +86,14 @@ def test_scalp_pattern_fires_on_small_5m_push():
             min_brain_score_0_100=0,
             enable_scalp_patterns=True,
             selective_entry_enabled=False,
+            regime_fail_closed_indicators=False,
+            breakout_max_extension_pct=0.02,
         )
     )
     base = datetime(2026, 4, 30, 9, 15, tzinfo=UTC)
-    # 25 minutes of *very* gentle drift up, then a clean bullish 1m candle.
-    # Total move ~ 0.3% — not big enough for a swing-high breakout.
-    n = 300
+    # Need enough session length for ≥3 closed 15m bars (brain warmup gate).
+    # 45+ minutes at 5s per tick → n ≥ 540.
+    n = 540
     prices = [100.0 + (0.30 * i / n) for i in range(n)]   # 100.00 → 100.30
     # Final bullish 1m candle: dip then sharp close.
     prices += [100.28, 100.27, 100.32, 100.36, 100.40, 100.42]

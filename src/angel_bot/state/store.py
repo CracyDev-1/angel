@@ -220,6 +220,7 @@ class StateStore:
                     "peak_premium",
                     "ALTER TABLE paper_positions ADD COLUMN peak_premium REAL",
                 ),
+                ("underlying", "ALTER TABLE paper_positions ADD COLUMN underlying TEXT"),
             ]
             for name, ddl in paper_migrations:
                 if name not in paper_cols:
@@ -531,8 +532,8 @@ class StateStore:
                   capital_used, capital_at_open, opened_at,
                   last_price, last_marked_at, reason_at_open,
                   max_hold_minutes,
-                  initial_stop_price, peak_premium
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  initial_stop_price, peak_premium, underlying
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     p["exchange"],
@@ -556,6 +557,7 @@ class StateStore:
                     p.get("max_hold_minutes"),
                     p.get("initial_stop_price", p.get("stop_price")),
                     p.get("peak_premium", p.get("entry_price")),
+                    p.get("underlying"),
                 ),
             )
             return int(cur.lastrowid or 0)

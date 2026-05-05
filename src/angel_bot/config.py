@@ -288,6 +288,15 @@ class Settings(BaseSettings):
     strategy_loss_cooldown_5m_bars: int = Field(
         default=3, validation_alias="STRATEGY_LOSS_COOLDOWN_5M_BARS"
     )
+    strategy_regime_fail_closed: bool = Field(
+        default=True, validation_alias="STRATEGY_REGIME_FAIL_CLOSED"
+    )
+    strategy_regime_require_twap: bool = Field(
+        default=True, validation_alias="STRATEGY_REGIME_REQUIRE_TWAP"
+    )
+    strategy_signal_max_age_closed_bars: int = Field(
+        default=3, validation_alias="STRATEGY_SIGNAL_MAX_AGE_CLOSED_BARS"
+    )
     # Block new entries when spot/underlying is within this fractional
     # distance of the last successful open anchor (stops stop-out re-entry
     # loops at the same level). 0 disables.

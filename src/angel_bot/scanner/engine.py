@@ -37,6 +37,28 @@ IST = timezone(timedelta(hours=5, minutes=30))
 log = structlog.get_logger(__name__)
 
 
+def _dedupe_buy_signals_one_per_underlying(hits: list[ScannerHit]) -> None:
+    """After ranking: keep at most one BUY_CALL/BUY_PUT per underlying key."""
+    seen: set[str] = set()
+    for h in hits:
+        if h.signal_side not in ("BUY_CALL", "BUY_PUT"):
+            continue
+        key = (h.underlying or h.name or "").strip().upper() or f"{h.exchange}:{h.token}"
+        if key in seen:
+            h.signal_side = "NO_TRADE"
+            h.signal_reason = "scanner:duplicate_underlying_signal"
+            h.signal_confidence = 0.0
+            h.checks = [
+                {
+                    "name": "one_signal_per_underlying",
+                    "ok": False,
+                    "detail": f"secondary signal for {key}",
+                }
+            ]
+        else:
+            seen.add(key)
+
+
 @dataclass
 class ScannerHit:
     name: str
@@ -307,7 +329,12 @@ class ScannerEngine:
         return out
 
     async def poll_once(
-        self, api: SmartApiClient, available_funds: float | None
+        self,
+        api: SmartApiClient,
+        available_funds: float | None,
+        *,
+        suppress_brain: bool = False,
+        suppress_reason: str = "loss_cooldown",
     ) -> list[ScannerHit]:
         wl = self.active_watchlist()
         if not wl:
@@ -399,7 +426,19 @@ class ScannerEngine:
                 regime_blocked, regime_reason = pre_brain_regime_blocks(
                     self.brain.config, agg, last
                 )
-            if regime_blocked:
+            if suppress_brain:
+                score_bd = self.brain.score_instrument(last_price=last, agg=agg)
+                brain_out = BrainOutput(
+                    score_bd,
+                    Signal(
+                        "NO_TRADE",
+                        suppress_reason,
+                        0.0,
+                        [EntryCheck("brain_suppressed", False, suppress_reason)],
+                    ),
+                    {"brain_suppressed": suppress_reason, "score_inputs": score_bd.inputs},
+                )
+            elif regime_blocked:
                 score_bd = self.brain.score_instrument(last_price=last, agg=agg)
                 brain_out = BrainOutput(
                     score_bd,
@@ -463,6 +502,7 @@ class ScannerEngine:
             key=lambda h: (h.score, abs(h.change_pct or 0)),
             reverse=True,
         )
+        _dedupe_buy_signals_one_per_underlying(hits)
         self._last_hits = hits
         self.last_hidden_unaffordable = hidden_unaffordable
         return hits
@@ -484,6 +524,9 @@ class ScannerEngine:
             regime_adx_min=s.strategy_regime_adx_min,
             regime_extension_adx_min=s.strategy_regime_extension_adx_min,
             regime_recent_vol_atr_ratio=s.strategy_regime_recent_vol_atr_ratio,
+            regime_fail_closed_indicators=s.strategy_regime_fail_closed,
+            regime_require_twap=s.strategy_regime_require_twap,
+            signal_max_age_closed_bars=s.strategy_signal_max_age_closed_bars,
             pullback_min_uptrend_bars=s.strategy_pullback_min_uptrend_bars,
             pullback_max_retracement_pct=s.strategy_pullback_max_retracement_pct,
             continuation_consolidation_bars=s.strategy_continuation_consolidation_bars,
@@ -535,7 +578,10 @@ def _parse_candle_rows(rows: list[Any]) -> list[Candle]:
             ts = ts.replace(tzinfo=IST)
         ts_utc = ts.astimezone(UTC)
         try:
-            o = float(r[1]); h = float(r[2]); lo = float(r[3]); c = float(r[4])
+            o = float(r[1])
+            h = float(r[2])
+            lo = float(r[3])
+            c = float(r[4])
         except (TypeError, ValueError):
             continue
         try:

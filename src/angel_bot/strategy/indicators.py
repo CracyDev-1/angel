@@ -1,4 +1,9 @@
-"""Technical indicators derived from OHLC candles (used by BrainEngine)."""
+"""Technical indicators derived from OHLC candles (used by BrainEngine).
+
+Wilder functions return ``None`` when history is insufficient or the series
+is degenerate. With ``BrainConfig.regime_fail_closed_indicators`` enabled,
+callers must treat ``None`` as no-trade, not "skip the check".
+"""
 
 from __future__ import annotations
 

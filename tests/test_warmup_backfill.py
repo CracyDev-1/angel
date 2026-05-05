@@ -25,7 +25,7 @@ import pytest
 from angel_bot.config import get_settings
 from angel_bot.market_data.candles import Candle, CandleAggregator
 from angel_bot.scanner.engine import ScannerEngine, WarmupResult
-from angel_bot.strategy.brain import BrainEngine
+from angel_bot.strategy.brain import BrainConfig, BrainEngine
 
 
 def _make_candles(start: datetime, step_min: int, n: int, base: float = 100.0) -> list[Candle]:
@@ -59,7 +59,7 @@ def test_seed_history_populates_all_three_deques() -> None:
 
 def test_brain_clears_warmup_after_seeding() -> None:
     agg = CandleAggregator()
-    brain = BrainEngine()
+    brain = BrainEngine(BrainConfig(regime_fail_closed_indicators=False))
     base = datetime(2026, 5, 4, 9, 15, tzinfo=UTC)
     # Brain warmup gate: ≥5 5m, ≥2 15m, ≥1 1m. Production backfill always
     # seeds all three timeframes so this is the realistic path.

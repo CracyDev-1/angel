@@ -1292,8 +1292,30 @@ class TradingRuntime:
                     # live (or dry-run without override), this is the live cash.
                     deployable = self._deployable_cash(available)
 
-                    hits = await self.scanner.poll_once(api, available_funds=deployable)
+                    cooldown_active = self._loss_cooldown_active()
+                    hits = await self.scanner.poll_once(
+                        api,
+                        available_funds=deployable,
+                        suppress_brain=cooldown_active,
+                    )
                     self.last_scanner = hits
+                    log.info(
+                        "decision_cycle_snapshot",
+                        n_hits=len(hits),
+                        loss_cooldown_active=cooldown_active,
+                        rows=[
+                            {
+                                "symbol": h.name,
+                                "underlying": h.underlying,
+                                "signal": h.signal_side,
+                                "reason": h.signal_reason,
+                                "score": round(float(h.score), 4),
+                                "diag_adx": (h.diagnostics or {}).get("adx_5m"),
+                                "diag_slope15": (h.diagnostics or {}).get("slope_15m"),
+                            }
+                            for h in hits[:24]
+                        ],
+                    )
 
                     # Mark every open paper position to market using the freshly
                     # fetched LTPs. Closures (stop/target/timeout) update
@@ -1949,6 +1971,27 @@ class TradingRuntime:
         n = max(1, int(self.settings.strategy_loss_cooldown_5m_bars))
         self._loss_cooldown_until = datetime.now(UTC) + timedelta(minutes=5 * n)
 
+    def _underlying_book_key(self, hit: ScannerHit) -> str:
+        u = (hit.underlying or "").strip().upper()
+        if u:
+            return u
+        return (hit.name or "").strip().upper()
+
+    def _has_open_position_for_underlying(self, hit: ScannerHit) -> bool:
+        """Block a second entry on the same underlying while a bot position is open."""
+        key = self._underlying_book_key(hit)
+        if not key:
+            return False
+        for r in self.store.list_open_paper_positions():
+            ru = (r.get("underlying") or "").strip().upper()
+            if ru and ru == key:
+                return True
+        for r in self.store.list_open_live_exit_plans():
+            ru = (r.get("underlying") or "").strip().upper()
+            if ru and ru == key:
+                return True
+        return False
+
     async def _consider_trade(self, api: SmartApiClient, hit: ScannerHit | None, deployable: float) -> None:
         s = self.settings
         if hit is None:
@@ -1964,6 +2007,12 @@ class TradingRuntime:
         if self._loss_cooldown_active():
             self._record_skip(
                 hit=hit, signal=signal, reason="loss_cooldown", price=hit.last_price
+            )
+            return
+
+        if self._has_open_position_for_underlying(hit):
+            self._record_skip(
+                hit=hit, signal=signal, reason="position_exists:underlying", price=hit.last_price
             )
             return
 
@@ -2168,6 +2217,19 @@ class TradingRuntime:
             if not self.paper.has_capacity():
                 self._record_skip(hit=hit, signal=signal, reason="paper_book_full", price=exec_price)
                 return
+            paper_payload_pre = build_order_payload(
+                exec_inst,
+                variety=s.bot_default_variety,
+                transactiontype="BUY",
+                ordertype="MARKET",
+                producttype=s.bot_default_product,
+                quantity=chosen_qty,
+            )
+            if not self._dup_guard.check_and_remember(paper_payload_pre):
+                self._record_skip(
+                    hit=hit, signal=signal, reason="duplicate:paper", price=exec_price
+                )
+                return
             try:
                 pid = self.paper.open(
                     PaperOpenRequest(
@@ -2185,6 +2247,7 @@ class TradingRuntime:
                         stop_loss_pct=paper_sl,
                         take_profit_pct=paper_tp,
                         max_hold_minutes=paper_mh,
+                        underlying=(hit.underlying or hit.name or "") or None,
                     )
                 )
             except Exception as e:  # noqa: BLE001
